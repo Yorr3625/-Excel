@@ -1,0 +1,7 @@
+{
+  "open_file_after_processing": true,
+  "open_folder_after_processing": false,
+  "create_logs": true,
+  "save_backup": true,
+  "show_errors": true
+}
