@@ -1,10 +1,13 @@
 import os
 
 
+LOGS_FOLDER = "logs"
+
+
 def write_log(date_folder, now, input_file, output_file, stats):
     """Дописывает информацию об обработке в лог-файл logs/ДД.ММ.ГГ/лог.txt"""
 
-    log_folder = os.path.join("logs", date_folder)
+    log_folder = os.path.join(LOGS_FOLDER, date_folder)
     os.makedirs(log_folder, exist_ok=True)
 
     log_file = os.path.join(log_folder, "лог.txt")

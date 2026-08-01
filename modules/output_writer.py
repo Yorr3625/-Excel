@@ -1,13 +1,16 @@
 import os
 
 
+PROCESSED_FOLDER = "processed_orders"
+
+
 def build_output_path(now):
     """Строит путь для сохранения обработанного файла: processed_orders/ДД.ММ.ГГ/заказ_обработан_ЧЧ-ММ-СС.xlsx"""
 
     date_folder = now.strftime("%d.%m.%y")
     time_file = now.strftime("%H-%M-%S")
 
-    output_folder = os.path.join("processed_orders", date_folder)
+    output_folder = os.path.join(PROCESSED_FOLDER, date_folder)
     os.makedirs(output_folder, exist_ok=True)
 
     output_file = os.path.join(

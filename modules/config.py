@@ -15,6 +15,20 @@ def load_stores(path="stores.json"):
         return json.load(file)
 
 
+def save_settings(data, path="settings.json"):
+    """Сохраняет настройки в settings.json."""
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+
+
+def save_stores(data, path="stores.json"):
+    """Сохраняет список магазинов по маршрутам в stores.json."""
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+
+
 def build_groups(stores, fills):
     """
     Собирает список групп маршрутов вида:
