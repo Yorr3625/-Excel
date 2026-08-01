@@ -15,8 +15,8 @@ echo        ОБРАБОТКА ЗАКАЗОВ v1.0
 echo =====================================
 echo.
 echo 1. Запустить обработку заказа
-echo 2. Открыть папку Заказы
-echo 3. Открыть готовые_заказы
+echo 2. Открыть папку orders
+echo 3. Открыть processed_orders
 echo 4. Открыть настройки
 echo 5. Выход
 echo.
@@ -80,14 +80,14 @@ goto menu
 
 :orders
 
-if not exist "%~dp0Заказы" (
+if not exist "%~dp0orders" (
 
-    mkdir "%~dp0Заказы"
+    mkdir "%~dp0orders"
 
 )
 
 
-explorer "%~dp0Заказы"
+explorer "%~dp0orders"
 
 
 goto menu
@@ -96,14 +96,14 @@ goto menu
 
 :ready
 
-if not exist "%~dp0готовые_заказы" (
+if not exist "%~dp0processed_orders" (
 
-    mkdir "%~dp0готовые_заказы"
+    mkdir "%~dp0processed_orders"
 
 )
 
 
-explorer "%~dp0готовые_заказы"
+explorer "%~dp0processed_orders"
 
 
 goto menu

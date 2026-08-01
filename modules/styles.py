@@ -39,3 +39,4 @@ conflict_fill = PatternFill(
     start_color="FF0000",
     end_color="FF0000"
 )
+
