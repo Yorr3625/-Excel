@@ -52,7 +52,7 @@ class App:
 
         self.root = root
         self.root.title("Обработка заказов")
-        self.root.geometry("900x600")
+        self.root.geometry("1300x900")
 
         self.result_queue = queue.Queue()
         self.selected_file = tk.StringVar()
