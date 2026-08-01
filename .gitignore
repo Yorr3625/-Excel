@@ -1,7 +1,25 @@
 __pycache__/
 *.pyc
+
 build/
 dist/
 *.spec
+
+# Игнорировать только Excel
+*.xlsx
+*.xls
+
+# Не игнорировать папки заказов
+# orders/
+# processed_orders/
+
 logs/
-processed_orders/
+
+venv/
+.venv/
+
+.vscode/
+.idea/
+
+Thumbs.db
+.DS_Store

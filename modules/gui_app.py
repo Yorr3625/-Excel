@@ -472,5 +472,17 @@ def _parse_value(text):
 def run_app():
 
     root = tk.Tk()
+    _apply_dpi_scaling(root)
     App(root)
     root.mainloop()
+
+
+def _apply_dpi_scaling(root):
+    """Подгоняет масштаб tkinter под реальный DPI экрана (актуально для Windows)."""
+
+    try:
+        dpi = root.winfo_fpixels("1i")  # физических пикселей на дюйм
+        root.tk.call("tk", "scaling", dpi / 72.0)
+
+    except Exception:
+        pass
