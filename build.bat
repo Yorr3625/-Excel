@@ -1,32 +1,32 @@
 @echo off
 chcp 65001 > nul
-title РЎР±РѕСЂРєР° .exe
+title Сборка .exe
 
 cd /d "%~dp0"
 
 echo =====================================
-echo   РЎР±РѕСЂРєР° РћР±СЂР°Р±РѕС‚РєР°Р—Р°РєР°Р·РѕРІ.exe
+echo   Сборка ОбработкаЗаказов.exe
 echo =====================================
 echo.
 
-echo РЈСЃС‚Р°РЅР°РІР»РёРІР°СЋ PyInstaller (РµСЃР»Рё РµС‰С‘ РЅРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅ)...
+echo Устанавливаю PyInstaller (если ещё не установлен)...
 pip install pyinstaller openpyxl
 
 echo.
-echo РЎРѕР±РёСЂР°СЋ exe РёР· gui.py...
-pyinstaller --onefile --windowed --name "РћР±СЂР°Р±РѕС‚РєР°Р—Р°РєР°Р·РѕРІ" gui.py
+echo Собираю exe из gui.py...
+pyinstaller --onefile --windowed --name "ОбработкаЗаказов" gui.py
 
 echo.
 echo =====================================
-echo Р“РѕС‚РѕРІРѕ!
+echo Готово!
 echo.
-echo Р¤Р°Р№Р»: dist\РћР±СЂР°Р±РѕС‚РєР°Р—Р°РєР°Р·РѕРІ.exe
+echo Файл: dist\ОбработкаЗаказов.exe
 echo.
-echo РџРµСЂРµРґ Р·Р°РїСѓСЃРєРѕРј РїРѕР»РѕР¶РёС‚Рµ СЂСЏРґРѕРј СЃ exe:
+echo Перед запуском положите рядом с exe:
 echo   - settings.json
 echo   - stores.json
-echo РџР°РїРєРё orders, processed_orders Рё logs
-echo СЃРѕР·РґР°РґСѓС‚СЃСЏ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РїСЂРё РїРµСЂРІРѕРј Р·Р°РїСѓСЃРєРµ.
+echo Папки orders, processed_orders и logs
+echo создадутся автоматически при первом запуске.
 echo =====================================
 echo.
 
