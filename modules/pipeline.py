@@ -4,7 +4,7 @@ from openpyxl import load_workbook
 
 from modules.excel_cleaner import remove_unused_rows_and_cols, delete_columns_by_text
 from modules.route_finder import find_and_mark_routes
-from modules.route_sheets import create_route_sheets
+from modules.route_sheets import create_route_sheets, add_sum_column_to_all_sheets
 from modules.output_writer import build_output_path, open_result
 from modules.logger import write_log
 
@@ -36,6 +36,7 @@ def process_order(input_file, settings, groups, conflict_fill):
     output_file, date_folder = build_output_path(now)
 
     create_route_sheets(wb, ws, groups)
+    add_sum_column_to_all_sheets(wb)
     wb.save(output_file)
 
     open_result(output_file, settings)
