@@ -32,3 +32,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+KEYWORDS = [
+    "итого",
+    "итог",
+    "всего",
+    "итого:",
+    "итог:"
+]
+
+rows_to_delete = []
+

@@ -1,5 +1,4 @@
 import re
-
 from openpyxl.utils import get_column_letter
 
 
@@ -70,17 +69,39 @@ def _add_sum_column(ws):
     ws.cell(row=1, column=2, value=SUM_HEADER)
 
     last_col = _last_used_column(ws)
+    _delete_rows_without_orders(ws, last_col)
+    last_col = _last_used_column(ws)
 
     for row in range(2, ws.max_row + 1):
 
-        if last_col >= 3:
-            ws.cell(
-                row=row,
-                column=2,
-                value=f"=SUM(C{row}:{get_column_letter(last_col)}{row})",
-            )
-        else:
-            ws.cell(row=row, column=2, value=None)
+        ws.cell(
+            row=row,
+            column=2,
+            value=f"=SUM(C{row}:{get_column_letter(last_col)}{row})",
+        )
+
+
+def _delete_rows_without_orders(ws, last_col):
+    """Deletes rows that have no order values in store columns."""
+
+    rows_to_delete = []
+
+    for row in range(2, ws.max_row + 1):
+        if not _row_has_data(ws, row, 3, last_col):
+            rows_to_delete.append(row)
+
+    for row in reversed(rows_to_delete):
+        ws.delete_rows(row)
+
+
+def _row_has_data(ws, row, start_col, end_col):
+    """Checks whether a row has at least one non-empty cell in a column range."""
+
+    for col in range(start_col, end_col + 1):
+        if ws.cell(row=row, column=col).value not in (None, ""):
+            return True
+
+    return False
 
 
 def _has_sum_column(ws):
@@ -105,7 +126,7 @@ def _last_used_column(ws):
 
     for col in range(ws.max_column, 2, -1):
         for row in range(1, ws.max_row + 1):
-            if ws.cell(row=row, column=col).value is not None:
+            if ws.cell(row=row, column=col).value not in (None, ""):
                 return col
 
     return 2

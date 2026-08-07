@@ -4,6 +4,32 @@ def remove_unused_rows_and_cols(ws):
     ws.delete_rows(2)
     ws.delete_cols(2, 2)
 
+def delete_total_rows(ws):
+    """Удаляет строки Итого / Итог / Всего."""
+
+    rows_to_delete = []
+
+    keywords = [
+        "итого",
+        "итог",
+        "всего",
+    ]
+
+    for row in range(1, ws.max_row + 1):
+
+        for cell in ws[row]:
+
+            if not cell.value:
+                continue
+
+            text = str(cell.value).strip().lower()
+
+            if any(text.startswith(word) for word in keywords):
+                rows_to_delete.append(row)
+                break
+
+    for row in reversed(rows_to_delete):
+        ws.delete_rows(row)
 
 def delete_columns_by_text(ws, texts):
     """
