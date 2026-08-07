@@ -1,8 +1,17 @@
 import re
+from copy import copy
+
+from openpyxl.styles import Border, Side
 from openpyxl.utils import get_column_letter
 
 
 SUM_HEADER = "Сумма"
+DEFAULT_BORDER = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin"),
+)
 
 
 def create_route_sheets(wb, ws, groups):
@@ -66,19 +75,22 @@ def _add_sum_column(ws):
     if not _has_sum_column(ws):
         ws.insert_cols(2)
 
-    ws.cell(row=1, column=2, value=SUM_HEADER)
+    header_cell = ws.cell(row=1, column=2, value=SUM_HEADER)
 
     last_col = _last_used_column(ws)
     _delete_rows_without_orders(ws, last_col)
     last_col = _last_used_column(ws)
 
+    header_cell.border = _border_for_row(ws, 1, last_col)
+
     for row in range(2, ws.max_row + 1):
 
-        ws.cell(
+        sum_cell = ws.cell(
             row=row,
             column=2,
             value=f"=SUM(C{row}:{get_column_letter(last_col)}{row})",
         )
+        sum_cell.border = _border_for_row(ws, row, last_col)
 
 
 def _delete_rows_without_orders(ws, last_col):
@@ -102,6 +114,35 @@ def _row_has_data(ws, row, start_col, end_col):
             return True
 
     return False
+
+
+def _border_for_row(ws, row, last_col):
+    """Returns an existing row border, or a plain fallback border."""
+
+    for col in [1, *range(3, last_col + 1)]:
+        border = ws.cell(row=row, column=col).border
+
+        if _has_visible_border(border):
+            return copy(border)
+
+    return copy(DEFAULT_BORDER)
+
+
+def _has_visible_border(border):
+    """Checks whether a border has at least one visible side."""
+
+    return any(
+        side is not None and side.style is not None
+        for side in [
+            border.left,
+            border.right,
+            border.top,
+            border.bottom,
+            border.diagonal,
+            border.vertical,
+            border.horizontal,
+        ]
+    )
 
 
 def _has_sum_column(ws):
