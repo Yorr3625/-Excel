@@ -74,8 +74,29 @@ def main():
         if confirm != "y":
             print("Обработка отменена.")
             return
+    print("\n========================")
+    print(" Выберите вариант")
+    print("========================")
+    print("1 - Город")
+    print("2 - Область")
 
-    stores = load_stores()
+    mode = input("\nВаш выбор: ").strip()
+
+    if mode == "1":
+        stores_file = "stores_city.json"
+        mode_name = "Город"
+    elif mode == "2":
+        stores_file = "stores_region.json"
+        mode_name = "Область"
+    else:
+        print("Неверный выбор!")
+        return
+
+    print(f"\nВыбран режим: {mode_name}")
+    print(f"Файл магазинов: {stores_file}")
+
+    print(f"\nВыбран режим: {mode_name}")
+    stores = load_stores(stores_file)
     fills = [green_fill, yellow_fill, blue_fill, purple_fill]
     groups = build_groups(stores, fills)
 
