@@ -38,18 +38,18 @@ def select_order_file():
 
     while True:
 
+        choice = input(
+            "\nВыберите номер файла: "
+        ).strip()
+
+        if not choice:
+            continue
+
         try:
 
-            choice = int(
-                input(
-                    "\nВыберите номер файла: "
-                )
-            )
+            choice = int(choice)
 
-            if (
-                1 <= choice
-                <= len(files)
-            ):
+            if 1 <= choice <= len(files):
 
                 selected = files[
                     choice - 1
@@ -61,7 +61,6 @@ def select_order_file():
                 )
 
         except ValueError:
-
             pass
 
         print(

@@ -110,9 +110,6 @@ def main():
     print_summary(output_file, stats, log_file)
     save_processed_file(filename)
 
-if __name__ == "__main__":
-    main()
-
 KEYWORDS = [
     "итого",
     "итог",
@@ -123,3 +120,11 @@ KEYWORDS = [
 
 rows_to_delete = []
 
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+
+        print("\nОШИБКА:")
+        traceback.print_exc()
