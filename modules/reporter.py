@@ -17,21 +17,31 @@ def format_summary(output_file, stats, log_file):
     if "route_totals" in stats:
 
         lines.append("")
-        lines.append("Суммы маршрутов:")
+        lines.append("=" * 35)
+        lines.append("      ИТОГИ ПО МАРШРУТАМ")
+        lines.append("=" * 35)
 
         grand_total = 0
 
         grand_total = 0
 
-        for route, total in stats["route_totals"].items():
+        grand_total = sum(stats["route_totals"].values())
 
-            if route == "Лист1":
-                continue
+    for route, total in stats["route_totals"].items():
 
-            lines.append(f"{route}: {total:,.0f}".replace(",", " "))
-            grand_total += total
+        percent = (
+            total / grand_total * 100
+            if grand_total > 0
+            else 0
+        )
 
-        lines.append("-" * 30)
+        lines.append(
+            f"{route}: "
+            f"{total:,.0f}".replace(",", " ")
+            + f" ({percent:.1f}%)"
+        )
+
+        lines.append("=" * 35)
         lines.append(
             f"Общий итог: {grand_total:,.0f}".replace(",", " ")
         )
