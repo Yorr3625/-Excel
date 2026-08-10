@@ -41,7 +41,8 @@ def process_order(input_file, settings, groups, conflict_fill):
     output_file, date_folder = build_output_path(now)
 
     create_route_sheets(wb, ws, groups)
-    add_sum_column_to_all_sheets(wb)
+    route_totals = add_sum_column_to_all_sheets(wb)
+    stats["route_totals"] = route_totals
     wb.save(output_file)
 
     open_result(output_file, settings)

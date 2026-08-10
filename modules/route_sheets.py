@@ -3,7 +3,7 @@ from copy import copy
 
 from openpyxl.styles import Border, Side
 from openpyxl.utils import get_column_letter
-
+from openpyxl.styles import Border, Side, Font
 
 SUM_HEADER = "Сумма"
 DEFAULT_BORDER = Border(
@@ -63,11 +63,17 @@ def _find_columns_to_delete(ws, stores):
 
 
 def add_sum_column_to_all_sheets(wb):
-    """Adds or updates the row sum column on every worksheet."""
+
+    route_totals = {}
 
     for ws in wb.worksheets:
-        _add_sum_column(ws)
 
+        total = _add_sum_column(ws)
+
+        if ws.title.startswith("Маршрут №"):
+            route_totals[ws.title] = total
+
+    return route_totals
 
 def _add_sum_column(ws):
     """Adds or updates the row sum column as the second worksheet column."""
@@ -83,7 +89,20 @@ def _add_sum_column(ws):
 
     header_cell.border = _border_for_row(ws, 1, last_col)
 
+    route_total = 0
+
     for row in range(2, ws.max_row + 1):
+
+        row_total = 0
+
+        for col in range(3, last_col + 1):
+
+            value = ws.cell(row=row, column=col).value
+
+            if isinstance(value, (int, float)):
+                row_total += value
+
+        route_total += row_total
 
         sum_cell = ws.cell(
             row=row,
@@ -91,6 +110,24 @@ def _add_sum_column(ws):
             value=f"=SUM(C{row}:{get_column_letter(last_col)}{row})",
         )
         sum_cell.border = _border_for_row(ws, row, last_col)
+    # Запоминаем последнюю строку с товаром
+    data_last_row = ws.max_row
+
+    # Итог по листу через 3 пустые строки
+    total_row = data_last_row + 4
+
+    ws.cell(total_row, 1, "ИТОГО")
+
+    ws.cell(
+        total_row,
+        2,
+        f"=SUM(B2:B{data_last_row})"
+    ) 
+    ws.cell(total_row, 1).font = Font(bold=True)
+    ws.cell(total_row, 2).font = Font(bold=True) 
+    ws.column_dimensions["B"].width = 10
+
+    return route_total
 
 
 def _delete_rows_without_orders(ws, last_col):

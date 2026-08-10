@@ -14,6 +14,28 @@ def format_summary(output_file, stats, log_file):
     for route, count in stats["route_count"].items():
         lines.append(f"{route}: {count}")
 
+    if "route_totals" in stats:
+
+        lines.append("")
+        lines.append("Суммы маршрутов:")
+
+        grand_total = 0
+
+        grand_total = 0
+
+        for route, total in stats["route_totals"].items():
+
+            if route == "Лист1":
+                continue
+
+            lines.append(f"{route}: {total:,.0f}".replace(",", " "))
+            grand_total += total
+
+        lines.append("-" * 30)
+        lines.append(
+            f"Общий итог: {grand_total:,.0f}".replace(",", " ")
+        )
+
     lines.append("")
     lines.append(f"Конфликтов найдено: {stats['conflict_count']}")
     lines.append(f"Неизвестных магазинов: {len(stats['unknown_stores'])}")
