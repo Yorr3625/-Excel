@@ -10,7 +10,7 @@ import reflex as rx
 # папкой проекта без фильтра по расширениям и перезапускает бэкенд на
 # каждую такую запись, из-за чего сбрасывается состояние открытой
 # страницы (пропадает сводка обработки, сбрасываются переключатели).
-_RUNTIME_DIRS = ["orders", "processed_orders", "logs"]
+_RUNTIME_DIRS = ["orders", "processed_orders", "logs", "tracking_data"]
 _RUNTIME_FILES = [
     "processed_files.json",
     "settings.json",

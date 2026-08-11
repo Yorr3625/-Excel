@@ -10,6 +10,7 @@ dist/
 reflex.lock/
 .states/
 uploaded_files/
+tracking_data/
 
 # Ignore Excel files
 *.xlsx

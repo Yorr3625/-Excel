@@ -5,12 +5,18 @@ import json
 import traceback
 
 import reflex as rx
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
+from modules import driver_data
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 from modules.tracking_sim import (
     ROUTE_COLORS,
+    ROUTE_KEYS,
     ROUTE_LABELS,
     advance_tick,
     build_map_svg,
@@ -18,9 +24,24 @@ from modules.tracking_sim import (
 )
 
 
+async def gps_ping(request: Request):
+    payload = await request.json()
+    driver_data.append_gps(
+        payload.get("vehicle", ""),
+        payload.get("lat"),
+        payload.get("lon"),
+        payload.get("speed"),
+    )
+    return JSONResponse({"ok": True})
+
+
+custom_api = Starlette(routes=[Route("/api/gps-ping", gps_ping, methods=["POST"])])
+
+
 ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
 UPLOAD_ID = "order_upload"
+INVOICE_UPLOAD_ID = "invoice_upload"
 PROCESSED_FILES = Path("processed_files.json")
 
 NAV_ITEMS = [
@@ -131,6 +152,10 @@ class State(rx.State):
     tracking_running: bool = False
     vehicles: list[dict] = []
     tracking_event_log: list[str] = []
+
+    tracking_view: str = "Симуляция"
+    real_vehicles: list[dict] = []
+    real_watching: bool = False
 
     settings_data: dict[str, bool] = {
         "open_file_after_processing": True,
@@ -301,6 +326,54 @@ class State(rx.State):
         if not self.vehicles:
             return 100
         return round(sum(v["score"] for v in self.vehicles) / len(self.vehicles))
+
+    def set_tracking_view(self, value: str):
+        self.tracking_view = value
+
+        if value == "Реальные данные":
+            self.refresh_real_data()
+        else:
+            self.real_watching = False
+
+    def refresh_real_data(self):
+        items = []
+
+        for index, key in enumerate(ROUTE_KEYS):
+            data = driver_data.load_today(key)
+            stops = data["stops"] if data else []
+            last = data.get("last_position") if data else None
+
+            items.append({
+                "route_index": index,
+                "label": ROUTE_LABELS[index],
+                "color": ROUTE_COLORS[index],
+                "stops": stops,
+                "done_count": sum(1 for s in stops if s["status"] == "done"),
+                "total_count": len(stops),
+                "has_position": last is not None,
+                "last_lat": last["lat"] if last else 0,
+                "last_lon": last["lon"] if last else 0,
+                "last_ts": last["ts"] if last else "",
+            })
+
+        self.real_vehicles = items
+
+    @rx.event(background=True)
+    async def watch_real_data(self):
+        async with self:
+            if self.real_watching:
+                return
+            self.real_watching = True
+
+        while True:
+            await asyncio.sleep(5.0)
+
+            async with self:
+                if not self.real_watching or self.tracking_view != "Реальные данные":
+                    self.real_watching = False
+                    return
+
+                self.refresh_real_data()
 
     def load_history(self):
         data = load_processed_files()
@@ -1278,12 +1351,27 @@ def event_log_panel():
     )
 
 
-def tracking_page():
-    return page_shell(
-        topbar(
-            "Трекинг",
-            "Симуляция движения машин по маршрутам: резкий газ/тормоз, расход топлива, рейтинг водителей.",
+def tracking_view_toggle():
+    return rx.hstack(
+        segment_button(
+            "Симуляция", State.tracking_view,
+            State.set_tracking_view("Симуляция"),
         ),
+        segment_button(
+            "Реальные данные", State.tracking_view,
+            [State.set_tracking_view("Реальные данные"), State.watch_real_data],
+        ),
+        spacing="1",
+        padding="4px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+        width="fit-content",
+    )
+
+
+def simulation_section():
+    return rx.vstack(
         tracking_controls(),
         rx.grid(
             stat_card(
@@ -1319,6 +1407,131 @@ def tracking_page():
             spacing="4",
             width="100%",
             align_items="start",
+        ),
+        spacing="4",
+        width="100%",
+    )
+
+
+def real_stop_row(stop):
+    return rx.hstack(
+        rx.icon(
+            tag=rx.cond(stop["status"] == "done", "circle_check", "circle"),
+            size=14,
+            color=rx.cond(stop["status"] == "done", ACCENT, muted()),
+        ),
+        rx.text(stop["name"], color=text(), font_size="13px"),
+        rx.spacer(),
+        rx.cond(
+            stop["status"] == "done",
+            rx.text(stop["done_at"], color=muted(), font_size="11px"),
+            rx.text("ожидание", color=muted(), font_size="11px"),
+        ),
+        width="100%",
+        align="center",
+        spacing="2",
+        padding="6px 10px",
+        border_radius="7px",
+        background=surface_alt(),
+    )
+
+
+def real_vehicle_map(v):
+    lat = v["last_lat"].to(float)
+    lon = v["last_lon"].to(float)
+    map_src = (
+        f"https://www.openstreetmap.org/export/embed.html?bbox="
+        f"{lon - 0.01}%2C{lat - 0.01}%2C{lon + 0.01}%2C{lat + 0.01}"
+        f"&marker={lat}%2C{lon}"
+    )
+
+    return rx.cond(
+        v["has_position"],
+        rx.vstack(
+            rx.text("Последний сигнал: ", v["last_ts"], color=muted(), font_size="12px"),
+            rx.el.iframe(
+                src=map_src,
+                width="100%",
+                height="200px",
+                style={"border": "0", "borderRadius": "10px"},
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.text("GPS ещё не поступал с планшета водителя.", color=muted(), font_size="12px"),
+    )
+
+
+def real_vehicle_card(v):
+    return rx.vstack(
+        rx.hstack(
+            rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=v["color"]),
+            rx.text(v["label"], color=text(), font_size="15px", font_weight="800"),
+            rx.spacer(),
+            rx.text(v["done_count"], color=text(), font_size="13px", font_weight="700"),
+            rx.text(" / ", color=muted(), font_size="13px"),
+            rx.text(v["total_count"], color=muted(), font_size="13px"),
+            width="100%",
+            align="center",
+            spacing="1",
+        ),
+        real_vehicle_map(v),
+        rx.cond(
+            v["total_count"].to(int) > 0,
+            rx.vstack(
+                rx.foreach(v["stops"].to(list[dict]), real_stop_row),
+                spacing="2",
+                width="100%",
+                max_height="200px",
+                overflow_y="auto",
+            ),
+            rx.text("Водитель ещё не открывал чек-лист сегодня.", color=muted(), font_size="12px"),
+        ),
+        align="start",
+        spacing="3",
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def real_data_section():
+    return rx.vstack(
+        rx.hstack(
+            rx.text(
+                "Данные от водителей за сегодня — открывается на /driver, обновляется каждые ~5 сек.",
+                color=muted(), font_size="13px",
+            ),
+            rx.spacer(),
+            secondary_button("Обновить", on_click=State.refresh_real_data, width="120px"),
+            width="100%",
+            align="center",
+        ),
+        rx.grid(
+            rx.foreach(State.real_vehicles, real_vehicle_card),
+            columns="2",
+            spacing="4",
+            width="100%",
+        ),
+        spacing="4",
+        width="100%",
+    )
+
+
+def tracking_page():
+    return page_shell(
+        topbar(
+            "Трекинг",
+            "Симуляция движения машин по маршрутам либо реальные данные от водителей.",
+            actions=[tracking_view_toggle()],
+        ),
+        rx.cond(
+            State.tracking_view == "Симуляция",
+            simulation_section(),
+            real_data_section(),
         ),
     )
 
@@ -1390,5 +1603,289 @@ def dashboard():
     )
 
 
-app = rx.App()
+DRIVER_VEHICLES = list(zip(ROUTE_KEYS, ROUTE_LABELS, ROUTE_COLORS))
+
+GPS_WATCH_JS = """
+(function () {
+    if (!navigator.geolocation || window.__driverGpsWatching) { return; }
+    window.__driverGpsWatching = true;
+
+    function send(pos) {
+        var meta = document.getElementById('driver-vehicle-meta');
+        var vehicle = meta ? meta.getAttribute('data-vehicle') : '';
+        if (!vehicle) { return; }
+
+        fetch('/api/gps-ping', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                vehicle: vehicle,
+                lat: pos.coords.latitude,
+                lon: pos.coords.longitude,
+                speed: pos.coords.speed
+            })
+        }).catch(function () {});
+    }
+
+    navigator.geolocation.watchPosition(send, function () {}, {
+        enableHighAccuracy: true,
+        maximumAge: 10000,
+        timeout: 15000
+    });
+})();
+"""
+
+
+class DriverState(rx.State):
+    vehicle_key: str = ""
+    vehicle_label: str = ""
+    source: str = "Область"
+    stops: list[dict] = []
+    active_stop: str = ""
+    upload_status: str = ""
+
+    def _stores_file(self) -> str:
+        return "stores_city.json" if self.source == "Город" else "stores_region.json"
+
+    def select_vehicle(self, key: str, label: str):
+        self.vehicle_key = key
+        self.vehicle_label = label
+        self.active_stop = ""
+        self.upload_status = ""
+        data = driver_data.load_or_init_day(key, self._stores_file())
+        self.stops = data["stops"]
+
+    def set_source(self, value: str):
+        self.source = value
+
+        if self.vehicle_key:
+            data = driver_data.load_or_init_day(self.vehicle_key, self._stores_file())
+            self.stops = data["stops"]
+
+    def change_vehicle(self):
+        self.vehicle_key = ""
+        self.vehicle_label = ""
+        self.stops = []
+        self.active_stop = ""
+
+    def open_upload(self, name: str):
+        self.active_stop = name
+        self.upload_status = ""
+
+    def cancel_upload(self):
+        self.active_stop = ""
+
+    async def handle_invoice_upload(self, files: list[rx.UploadFile]):
+        if not files or not self.active_stop:
+            self.upload_status = "Сначала сделайте фото накладной"
+            return
+
+        file = files[0]
+        data = await file.read()
+        safe_stop = "".join(ch if ch.isalnum() else "_" for ch in self.active_stop)
+        filename = f"{datetime.now():%Y%m%d_%H%M%S}_{safe_stop}.jpg"
+
+        vehicle_upload_dir = rx.get_upload_dir() / "invoices" / self.vehicle_key
+        vehicle_upload_dir.mkdir(parents=True, exist_ok=True)
+        (vehicle_upload_dir / filename).write_bytes(data)
+
+        photo_rel_path = f"invoices/{self.vehicle_key}/{filename}"
+        updated = driver_data.mark_stop_done(
+            self.vehicle_key, self._stores_file(), self.active_stop, photo_rel_path,
+        )
+        self.stops = updated["stops"]
+        self.active_stop = ""
+        self.upload_status = "Накладная сохранена"
+
+
+def driver_vehicle_button(key, label, color):
+    return rx.button(
+        rx.icon(tag="truck", size=22, color="white"),
+        rx.text(label, font_size="17px", font_weight="800", color="white"),
+        on_click=DriverState.select_vehicle(key, label),
+        width="100%",
+        height="76px",
+        border_radius="14px",
+        background=color,
+        _hover={"opacity": 0.9},
+        cursor="pointer",
+    )
+
+
+def driver_select_screen():
+    return rx.vstack(
+        rx.heading("Выберите машину", color=text(), size="6"),
+        segmented_control(["Город", "Область"], DriverState.source, DriverState.set_source),
+        rx.vstack(
+            *[driver_vehicle_button(key, label, color) for key, label, color in DRIVER_VEHICLES],
+            spacing="3",
+            width="100%",
+        ),
+        spacing="5",
+        width="100%",
+        max_width="420px",
+        padding="24px",
+    )
+
+
+def driver_upload_box():
+    return rx.vstack(
+        rx.upload(
+            rx.vstack(
+                rx.icon(tag="camera", size=22, color=ACCENT),
+                rx.text(
+                    "Нажмите, чтобы сфотографировать накладную",
+                    color=muted(), font_size="13px", text_align="center",
+                ),
+                align="center",
+                spacing="2",
+            ),
+            id=INVOICE_UPLOAD_ID,
+            accept={"image/*": [".jpg", ".jpeg", ".png"]},
+            max_files=1,
+            border=f"1px dashed {border()}",
+            border_radius="10px",
+            background=surface_alt(),
+            padding="18px",
+            width="100%",
+            cursor="pointer",
+        ),
+        rx.hstack(
+            rx.button(
+                "Сохранить",
+                on_click=DriverState.handle_invoice_upload(rx.upload_files(upload_id=INVOICE_UPLOAD_ID)),
+                height="42px",
+                width="100%",
+                border_radius="9px",
+                background=ACCENT,
+                color="white",
+                font_weight="700",
+                cursor="pointer",
+            ),
+            rx.button(
+                "Отмена",
+                on_click=DriverState.cancel_upload,
+                height="42px",
+                width="120px",
+                border_radius="9px",
+                background=surface_alt(),
+                color=text(),
+                cursor="pointer",
+            ),
+            width="100%",
+            spacing="2",
+        ),
+        rx.cond(
+            DriverState.upload_status != "",
+            rx.text(DriverState.upload_status, color=muted(), font_size="12px"),
+            rx.box(),
+        ),
+        spacing="3",
+        width="100%",
+        padding="12px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface(),
+    )
+
+
+def driver_stop_card(stop):
+    return rx.vstack(
+        rx.hstack(
+            rx.icon(
+                tag=rx.cond(stop["status"] == "done", "circle_check", "circle"),
+                size=20,
+                color=rx.cond(stop["status"] == "done", ACCENT, muted()),
+            ),
+            rx.text(stop["name"], color=text(), font_size="16px", font_weight="700"),
+            rx.spacer(),
+            rx.cond(
+                stop["status"] == "done",
+                rx.text(stop["done_at"], color=muted(), font_size="12px"),
+                rx.box(),
+            ),
+            width="100%",
+            align="center",
+            spacing="3",
+        ),
+        rx.cond(
+            stop["status"] == "done",
+            rx.image(
+                src=f"/_upload/{stop['photo']}",
+                width="100%", max_height="160px",
+                object_fit="cover", border_radius="8px",
+            ),
+            rx.cond(
+                DriverState.active_stop == stop["name"],
+                driver_upload_box(),
+                rx.button(
+                    "Закрыть магазин",
+                    on_click=DriverState.open_upload(stop["name"]),
+                    width="100%",
+                    height="46px",
+                    border_radius="9px",
+                    background=ACCENT,
+                    color="white",
+                    font_weight="700",
+                    cursor="pointer",
+                ),
+            ),
+        ),
+        align="start",
+        spacing="3",
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface(),
+        width="100%",
+    )
+
+
+def driver_stops_screen():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading(DriverState.vehicle_label, color=text(), size="6"),
+                rx.text("Список магазинов на сегодня", color=muted(), font_size="13px"),
+                align="start",
+                spacing="1",
+            ),
+            rx.spacer(),
+            secondary_button("Сменить машину", on_click=DriverState.change_vehicle, width="170px"),
+            width="100%",
+            align="center",
+        ),
+        rx.box(
+            id="driver-vehicle-meta",
+            custom_attrs={"data-vehicle": DriverState.vehicle_key},
+            display="none",
+        ),
+        rx.script(GPS_WATCH_JS),
+        rx.vstack(
+            rx.foreach(DriverState.stops, driver_stop_card),
+            spacing="3",
+            width="100%",
+        ),
+        spacing="4",
+        width="100%",
+        max_width="480px",
+        padding="20px",
+    )
+
+
+def driver_page():
+    return rx.center(
+        rx.cond(
+            DriverState.vehicle_key == "",
+            driver_select_screen(),
+            driver_stops_screen(),
+        ),
+        width="100%",
+        min_height="100vh",
+        background=page_bg(),
+    )
+
+
+app = rx.App(api_transformer=custom_api)
 app.add_page(dashboard, route="/", title="Обработка заказов", on_load=State.load_history)
+app.add_page(driver_page, route="/driver", title="Водитель")
