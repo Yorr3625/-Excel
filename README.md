@@ -52,8 +52,20 @@ python gui.py
 
 Веб-дашборд (Reflex):
 
+На новом ПК проще всего запустить `start_dashboard.bat` — он сам
+создаст виртуальное окружение (`.venv`), поставит зависимости из
+`requirements.txt` и запустит дашборд. Нужен только установленный
+Python 3.10+ (с галочкой "Add python.exe to PATH" при установке) и
+интернет при самом первом запуске (Reflex докачивает свой
+frontend-тулчейн).
+
+Вручную это те же шаги:
+
 ```
-reflex run
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python -m reflex run
 ```
 
 Откроется на `http://localhost:3000` (бэкенд — на `:8000`). Внутри:
@@ -72,6 +84,20 @@ reflex run
   обработанных файлов;
 - редактировать настройки (`settings.json`) без ручной правки JSON;
 - редактировать списки магазинов по каждому маршруту (`stores.json`).
+
+## Тесты
+
+Покрыты тестами модули обработки заказа (`modules/excel_cleaner.py`,
+`route_finder.py`, `route_sheets.py`, `pipeline.py`, `config.py`,
+`output_writer.py`, `logger.py`, `reporter.py`) — то есть весь путь от
+очистки исходного файла до сохранения результата и лога. GUI
+(`gui_app.py`) и веб-дашборд (`orders_dashboard/`) тестами пока не
+покрыты.
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
 
 ## Сборка отдельного .exe
 
