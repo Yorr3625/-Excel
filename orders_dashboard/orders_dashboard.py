@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import datetime
+import asyncio
 import json
 import traceback
 
@@ -8,6 +9,13 @@ import reflex as rx
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
+from modules.tracking_sim import (
+    ROUTE_COLORS,
+    ROUTE_LABELS,
+    advance_tick,
+    build_map_svg,
+    init_vehicles,
+)
 
 
 ACCENT = "#1f883d"
@@ -19,6 +27,7 @@ NAV_ITEMS = [
     ("Dashboard", "layout_dashboard"),
     ("Заказы", "package"),
     ("Маршруты", "route"),
+    ("Трекинг", "truck"),
     ("История", "history"),
     ("Настройки", "settings"),
 ]
@@ -118,6 +127,11 @@ class State(rx.State):
     new_store_4: str = ""
     routes_status: str = ""
 
+    tracking_source: str = "Область"
+    tracking_running: bool = False
+    vehicles: list[dict] = []
+    tracking_event_log: list[str] = []
+
     settings_data: dict[str, bool] = {
         "open_file_after_processing": True,
         "open_folder_after_processing": False,
@@ -134,6 +148,8 @@ class State(rx.State):
             self.load_routes()
         elif page == "Настройки":
             self.load_settings_form()
+        elif page == "Трекинг" and not self.vehicles:
+            self.init_tracking()
 
     def load_routes(self):
         stores_file = "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
@@ -218,6 +234,73 @@ class State(rx.State):
     def save_settings_form(self):
         save_settings(dict(self.settings_data))
         self.settings_status = "Настройки сохранены"
+
+    def init_tracking(self):
+        stores_file = "stores_city.json" if self.tracking_source == "Город" else "stores_region.json"
+        self.vehicles = init_vehicles(stores_file)
+        self.tracking_event_log = []
+
+    def set_tracking_source(self, value: str):
+        self.tracking_running = False
+        self.tracking_source = value
+        self.init_tracking()
+
+    def reset_tracking(self):
+        self.tracking_running = False
+        self.init_tracking()
+
+    def stop_tracking(self):
+        self.tracking_running = False
+
+    @rx.event(background=True)
+    async def start_tracking(self):
+        async with self:
+            if self.tracking_running or not self.vehicles:
+                return
+            self.tracking_running = True
+
+        while True:
+            await asyncio.sleep(1.0)
+
+            async with self:
+                if not self.tracking_running:
+                    return
+
+                updated, events = advance_tick(self.vehicles)
+                self.vehicles = updated
+
+                if events:
+                    self.tracking_event_log = (events + self.tracking_event_log)[:40]
+
+    @rx.var
+    def map_svg(self) -> str:
+        return build_map_svg(self.vehicles)
+
+    @rx.var
+    def ranked_vehicles(self) -> list[dict]:
+        return sorted(self.vehicles, key=lambda v: v["score"], reverse=True)
+
+    @rx.var
+    def tracking_total_distance(self) -> str:
+        return format_number(sum(v["distance_km"] for v in self.vehicles))
+
+    @rx.var
+    def tracking_total_fuel(self) -> str:
+        return format_number(sum(v["fuel_l"] for v in self.vehicles))
+
+    @rx.var
+    def tracking_total_cost(self) -> str:
+        return format_number(sum(v["cost"] for v in self.vehicles))
+
+    @rx.var
+    def tracking_total_harsh(self) -> int:
+        return sum(v["harsh_count"] for v in self.vehicles)
+
+    @rx.var
+    def tracking_avg_score(self) -> int:
+        if not self.vehicles:
+            return 100
+        return round(sum(v["score"] for v in self.vehicles) / len(self.vehicles))
 
     def load_history(self):
         data = load_processed_files()
@@ -528,29 +611,6 @@ def sidebar_logo():
     )
 
 
-def future_teaser_card():
-    return rx.vstack(
-        rx.hstack(
-            rx.icon(tag="truck", size=16, color=ICON_TINTS["blue"][0]),
-            rx.text("Скоро: трекинг машин", color=text(), font_size="12px", font_weight="700"),
-            spacing="2",
-            align="center",
-        ),
-        rx.text(
-            "GPS, расход топлива и экономичность вождения по каждой машине.",
-            color=muted(),
-            font_size="11px",
-        ),
-        align="start",
-        spacing="2",
-        padding="12px",
-        border=f"1px solid {border()}",
-        border_radius="12px",
-        background=surface_alt(),
-        width="100%",
-    )
-
-
 def theme_switch_row():
     return rx.hstack(
         rx.icon(tag=rx.cond(State.theme == "light", "sun", "moon"), size=16, color=muted()),
@@ -586,7 +646,6 @@ def sidebar():
             width="100%",
         ),
         rx.spacer(),
-        future_teaser_card(),
         theme_switch_row(),
         align="start",
         spacing="6",
@@ -1020,6 +1079,250 @@ def routes_page():
     )
 
 
+def start_pause_button():
+    return rx.cond(
+        State.tracking_running,
+        secondary_button("Пауза", on_click=State.stop_tracking, width="130px"),
+        primary_button("Старт симуляции", on_click=State.start_tracking, width="180px"),
+    )
+
+
+def tracking_controls():
+    return rx.hstack(
+        segmented_control(["Город", "Область"], State.tracking_source, State.set_tracking_source),
+        rx.spacer(),
+        start_pause_button(),
+        secondary_button("Сброс", on_click=State.reset_tracking, width="110px"),
+        spacing="3",
+        align="center",
+        width="100%",
+    )
+
+
+def tracking_legend_dot(color, label):
+    return rx.hstack(
+        rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=color),
+        rx.text(label, color=muted(), font_size="12px"),
+        spacing="2",
+        align="center",
+    )
+
+
+def tracking_legend():
+    return rx.hstack(
+        *[tracking_legend_dot(color, label) for label, color in zip(ROUTE_LABELS, ROUTE_COLORS)],
+        tracking_legend_dot("#f5a623", "Резкий разгон"),
+        tracking_legend_dot("#e5484d", "Резкое торможение"),
+        spacing="5",
+        wrap="wrap",
+        width="100%",
+    )
+
+
+def tracking_map_panel():
+    return rx.vstack(
+        rx.hstack(
+            rx.icon(tag="map", size=17, color=text()),
+            rx.heading("Карта маршрутов", color=text(), size="4"),
+            spacing="2",
+            align="center",
+        ),
+        rx.box(
+            rx.html(State.map_svg),
+            width="100%",
+            border_radius="10px",
+            background=surface_alt(),
+            padding="12px",
+            overflow="hidden",
+        ),
+        tracking_legend(),
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def event_badge(flag):
+    return rx.cond(
+        flag == "harsh_brake",
+        rx.text("Резкое торможение", color="#e5484d", font_size="11px", font_weight="700"),
+        rx.cond(
+            flag == "harsh_accel",
+            rx.text("Резкий разгон", color="#f5a623", font_size="11px", font_weight="700"),
+            rx.text("Плавно", color=muted(), font_size="11px"),
+        ),
+    )
+
+
+def tracking_progress_bar(percent, color):
+    return rx.box(
+        rx.box(
+            width=f"{percent}%",
+            height="100%",
+            border_radius="6px",
+            background=color,
+            transition="width 400ms ease",
+        ),
+        width="100%",
+        height="8px",
+        border_radius="6px",
+        background=surface_alt(),
+        overflow="hidden",
+    )
+
+
+def vehicle_card(v):
+    return rx.vstack(
+        rx.hstack(
+            rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=v["color"]),
+            rx.text(v["label"], color=text(), font_size="14px", font_weight="800"),
+            rx.spacer(),
+            event_badge(v["event_flag"]),
+            width="100%",
+            align="center",
+            spacing="2",
+        ),
+        rx.text(v["status"], color=muted(), font_size="12px"),
+        tracking_progress_bar(v["progress_percent"], v["color"]),
+        route_result("Скорость", f"{v['speed_kmh']} км/ч"),
+        route_result("Рейтинг", v["score"]),
+        route_result("Пробег", f"{v['distance_km']} км"),
+        route_result("Резкие манёвры", v["harsh_count"]),
+        align="start",
+        spacing="2",
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def rating_row(v):
+    return rx.hstack(
+        rx.box(width="8px", height="8px", min_width="8px", border_radius="50%", background=v["color"]),
+        rx.text(v["label"], color=text(), font_size="13px", font_weight="700"),
+        rx.spacer(),
+        rx.text(v["harsh_count"], color=muted(), font_size="12px"),
+        rx.text(" рывков", color=muted(), font_size="12px"),
+        rx.text(v["score"], color=text(), font_size="14px", font_weight="800"),
+        spacing="2",
+        align="center",
+        width="100%",
+        padding="10px 12px",
+        border_radius="9px",
+        background=surface_alt(),
+    )
+
+
+def rating_panel():
+    return rx.vstack(
+        rx.hstack(
+            rx.icon(tag="award", size=17, color=text()),
+            rx.heading("Рейтинг водителей", color=text(), size="4"),
+            spacing="2",
+            align="center",
+        ),
+        rx.vstack(
+            rx.foreach(State.ranked_vehicles, rating_row),
+            spacing="2",
+            width="100%",
+        ),
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def event_log_panel():
+    return rx.vstack(
+        rx.hstack(
+            rx.icon(tag="list", size=17, color=text()),
+            rx.heading("Журнал событий", color=text(), size="4"),
+            spacing="2",
+            align="center",
+        ),
+        rx.cond(
+            State.tracking_event_log.length() == 0,
+            rx.text("Событий пока нет — запустите симуляцию.", color=muted(), font_size="13px"),
+            rx.vstack(
+                rx.foreach(
+                    State.tracking_event_log,
+                    lambda entry: rx.text(entry, color=text(), font_size="12px"),
+                ),
+                spacing="2",
+                width="100%",
+                max_height="260px",
+                overflow_y="auto",
+            ),
+        ),
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def tracking_page():
+    return page_shell(
+        topbar(
+            "Трекинг",
+            "Симуляция движения машин по маршрутам: резкий газ/тормоз, расход топлива, рейтинг водителей.",
+        ),
+        tracking_controls(),
+        rx.grid(
+            stat_card(
+                "route", "green",
+                "Общий пробег", f"{State.tracking_total_distance} км",
+                muted_text("за сессию симуляции"),
+            ),
+            stat_card(
+                "fuel", "blue",
+                "Расход топлива", f"{State.tracking_total_fuel} л",
+                muted_text("≈ ", State.tracking_total_cost, " ₽"),
+            ),
+            stat_card(
+                "triangle_alert", "violet",
+                "Резкие манёвры", State.tracking_total_harsh,
+                muted_text("средний рейтинг: ", State.tracking_avg_score),
+            ),
+            columns="3",
+            spacing="4",
+            width="100%",
+        ),
+        tracking_map_panel(),
+        rx.grid(
+            rx.foreach(State.vehicles, vehicle_card),
+            columns="2",
+            spacing="4",
+            width="100%",
+        ),
+        rx.grid(
+            rating_panel(),
+            event_log_panel(),
+            columns="2",
+            spacing="4",
+            width="100%",
+            align_items="start",
+        ),
+    )
+
+
 def settings_toggle_row(label, hint, value, on_change):
     return rx.hstack(
         rx.vstack(
@@ -1069,6 +1372,7 @@ def main_content():
         State.current_page,
         ("Заказы", orders_page()),
         ("Маршруты", routes_page()),
+        ("Трекинг", tracking_page()),
         ("История", history_page()),
         ("Настройки", settings_page()),
         overview_page(),
