@@ -5,11 +5,17 @@ build/
 dist/
 *.spec
 
-# Игнорировать только Excel
+# Reflex (веб-дашборд orders_dashboard)
+.web/
+reflex.lock/
+.states/
+uploaded_files/
+
+# Ignore Excel files
 *.xlsx
 *.xls
 
-# Не игнорировать папки заказов
+# Keep order folders visible if needed
 # orders/
 # processed_orders/
 

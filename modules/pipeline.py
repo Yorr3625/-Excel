@@ -19,6 +19,33 @@ DELETE_TEXT = [
 ]
 
 
+def detect_mode(input_file, mode_groups, conflict_fill):
+    """
+    Определяет, какой набор маршрутов (например, {"Город": groups, "Область": groups})
+    даёт больше совпадений с содержимым файла заказа.
+
+    Возвращает (лучший_режим, {режим: количество_найденных_адресов}).
+    """
+
+    scores = {}
+
+    for mode, groups in mode_groups.items():
+
+        wb = load_workbook(input_file)
+        ws = wb.active
+
+        remove_unused_rows_and_cols(ws)
+        delete_columns_by_text(ws, DELETE_TEXT)
+        delete_total_rows(ws)
+
+        stats = find_and_mark_routes(ws, groups, conflict_fill)
+        scores[mode] = stats["total_found"]
+
+    best_mode = max(scores, key=scores.get)
+
+    return best_mode, scores
+
+
 def process_order(input_file, settings, groups, conflict_fill):
     """
     Выполняет полный цикл обработки одного файла заказа:
