@@ -36,24 +36,26 @@ data/                  — рабочие данные (не в git, созда�
 modules/
   paths.py             — все пути проекта в одном месте
   config.py             — загрузка/сохранение config/*.json
-  styles.py              — цвета заливки маршрутов
-  file_selector.py        — выбор файла заказа в консоли
-  excel_cleaner.py         — очистка исходного файла
-  route_finder.py           — поиск и раскраска адресов
-  route_sheets.py            — создание листов по маршрутам
-  output_writer.py            — сохранение результата
-  logger.py                    — запись лога
-  reporter.py                   — вывод сводки (консоль/tkinter GUI)
-  pipeline.py                    — полный цикл обработки + автоопределение
-                                    режима Город/Область (detect_mode)
-  gui_app.py                      — само окно приложения (tkinter)
-  tracking_sim.py                  — симуляция движения машин
-  driver_data.py                    — данные от мобильной страницы водителя
+  history.py             — история обработок и объёма по маршрутам
+                           (общая для консоли, tkinter и дашборда)
+  styles.py               — цвета заливки маршрутов
+  file_selector.py         — выбор файла заказа в консоли
+  excel_cleaner.py          — очистка исходного файла
+  route_finder.py            — поиск и раскраска адресов
+  route_sheets.py             — создание листов по маршрутам
+  output_writer.py             — сохранение результата
+  logger.py                     — запись лога
+  reporter.py                    — вывод сводки (консоль/tkinter GUI)
+  pipeline.py                     — полный цикл обработки + автоопределение
+                                     режима Город/Область (detect_mode)
+  gui_app.py                       — само окно приложения (tkinter)
+  tracking_sim.py                   — симуляция движения машин
+  driver_data.py                     — данные от мобильной страницы водителя
 
 orders_dashboard/
   orders_dashboard.py  — веб-дашборд обработки заказов (Reflex)
 
-tests/                 — тесты пайплайна обработки
+tests/                 — тесты обработки, истории и данных водителя
 ```
 
 Пути нигде не дублируются: если понадобится перенести папку, правится
@@ -114,12 +116,19 @@ python -m reflex run
 
 ## Тесты
 
-Покрыты тестами модули обработки заказа (`modules/excel_cleaner.py`,
-`route_finder.py`, `route_sheets.py`, `pipeline.py`, `config.py`,
-`output_writer.py`, `logger.py`, `reporter.py`) — то есть весь путь от
-очистки исходного файла до сохранения результата и лога. GUI
-(`gui_app.py`) и веб-дашборд (`orders_dashboard/`) тестами пока не
-покрыты.
+Покрыты:
+- обработка заказа целиком — от очистки исходного файла до сохранения
+  результата и лога (`excel_cleaner.py`, `route_finder.py`,
+  `route_sheets.py`, `pipeline.py`, `config.py`, `output_writer.py`,
+  `logger.py`, `reporter.py`);
+- история обработок и объёма по маршрутам (`history.py`);
+- данные от страницы водителя (`driver_data.py`), включая проверку
+  того, что чужой идентификатор машины не уводит запись за пределы
+  папки с данными.
+
+Не покрыты тестами: окно на tkinter (`gui_app.py`), веб-дашборд
+(`orders_dashboard/`) и симуляция движения (`tracking_sim.py`) —
+проверяются вручную.
 
 ```
 pip install -r requirements-dev.txt
