@@ -3,9 +3,8 @@ from datetime import datetime
 from pathlib import Path
 
 from modules.config import load_stores
+from modules.paths import TRACKING_FOLDER as DATA_DIR
 
-
-DATA_DIR = Path("tracking_data")
 TRAIL_LIMIT = 100
 
 

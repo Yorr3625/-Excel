@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 
+from modules import paths
 from modules.config import load_settings, load_stores, build_groups
 from modules.styles import (
     green_fill,
@@ -16,7 +17,7 @@ from modules.reporter import print_summary
 
 
 
-LOG_FILE = "processed_files.json"
+LOG_FILE = paths.PROCESSED_FILES_FILE
 
 
 def load_processed_files():
@@ -83,14 +84,14 @@ def main():
     mode = input("\nВаш выбор: ").strip()
 
     if mode == "1":
-        stores_file = "stores_city.json"
         mode_name = "Город"
     elif mode == "2":
-        stores_file = "stores_region.json"
         mode_name = "Область"
     else:
         print("Неверный выбор!")
         return
+
+    stores_file = paths.stores_file_for(mode_name)
 
     print(f"\nВыбран режим: {mode_name}")
     print(f"Файл магазинов: {stores_file}")

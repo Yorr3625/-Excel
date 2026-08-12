@@ -10,7 +10,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from modules import driver_data
+from modules import driver_data, paths
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
@@ -89,10 +89,10 @@ ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
-PROCESSED_FILES = Path("processed_files.json")
-VOLUME_HISTORY_FILE = Path("volume_history.json")
+PROCESSED_FILES = paths.PROCESSED_FILES_FILE
+VOLUME_HISTORY_FILE = paths.VOLUME_HISTORY_FILE
 VOLUME_CHART_DAYS = 31
-ROUTE_BACKUPS_FILE = Path("route_backups.json")
+ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
 VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3", "Маршрут 4"]
 
@@ -322,8 +322,8 @@ class State(rx.State):
             self.init_tracking()
 
     @property
-    def stores_file(self) -> str:
-        return "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
+    def stores_file(self) -> Path:
+        return paths.stores_file_for(self.routes_source)
 
     def load_routes(self):
         data = load_stores(self.stores_file)
@@ -433,7 +433,7 @@ class State(rx.State):
         self.settings_status = "Настройки сохранены"
 
     def init_tracking(self):
-        stores_file = "stores_city.json" if self.tracking_source == "Город" else "stores_region.json"
+        stores_file = paths.stores_file_for(self.tracking_source)
         self.vehicles = init_vehicles(stores_file)
         self.tracking_event_log = []
 
@@ -570,7 +570,7 @@ class State(rx.State):
     def refresh_stores_total(self):
         total = 0
 
-        for filename in ("stores_city.json", "stores_region.json"):
+        for filename in (paths.STORES_CITY_FILE, paths.STORES_REGION_FILE):
             try:
                 store_data = load_stores(filename)
             except (OSError, json.JSONDecodeError):
@@ -608,8 +608,8 @@ class State(rx.State):
         try:
             fills = [green_fill, yellow_fill, blue_fill, purple_fill]
             mode_groups = {
-                "Город": build_groups(load_stores("stores_city.json"), fills),
-                "Область": build_groups(load_stores("stores_region.json"), fills),
+                mode: build_groups(load_stores(paths.stores_file_for(mode)), fills)
+                for mode in ("Город", "Область")
             }
 
             mode, scores = detect_mode(self.uploaded_file_path, mode_groups, conflict_fill)
@@ -643,7 +643,7 @@ class State(rx.State):
         self.error_text = ""
 
         try:
-            stores_file = "stores_city.json" if self.mode == "Город" else "stores_region.json"
+            stores_file = paths.stores_file_for(self.mode)
             settings = load_settings()
 
             stores = load_stores(stores_file)
@@ -1912,8 +1912,8 @@ class DriverState(rx.State):
     active_stop: str = ""
     upload_status: str = ""
 
-    def _stores_file(self) -> str:
-        return "stores_city.json" if self.source == "Город" else "stores_region.json"
+    def _stores_file(self) -> Path:
+        return paths.stores_file_for(self.source)
 
     def select_vehicle(self, key: str, label: str):
         self.vehicle_key = key

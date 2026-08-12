@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 
 from modules.logger import write_log
+from modules.paths import LOGS_FOLDER
 
 
 def _stats(**overrides):
@@ -22,7 +23,7 @@ def test_write_log_creates_dated_file_with_expected_content(tmp_path, monkeypatc
 
     log_file = write_log("11.08.26", now, "orders/заказ.xlsx", "processed_orders/out.xlsx", _stats())
 
-    assert log_file == os.path.join("logs", "11.08.26", "лог.txt")
+    assert log_file == os.path.join(LOGS_FOLDER, "11.08.26", "лог.txt")
     text = open(log_file, encoding="utf-8").read()
 
     assert "orders/заказ.xlsx" in text

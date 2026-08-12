@@ -14,22 +14,15 @@ dist/
 .web/
 reflex.lock/
 .states/
-uploaded_files/
-tracking_data/
 
-# Данные, которые дашборд накапливает локально при работе
-route_backups.json
-volume_history.json
+# Рабочие данные: заказы, результаты, логи, история дашборда.
+# Файлы внутри не версионируются, но сама папка нужна приложению.
+data/*
+!data/.gitkeep
 
 # Ignore Excel files
 *.xlsx
 *.xls
-
-# Keep order folders visible if needed
-# orders/
-# processed_orders/
-
-logs/
 
 venv/
 .venv/
