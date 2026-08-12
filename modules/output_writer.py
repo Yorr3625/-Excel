@@ -1,7 +1,6 @@
 import os
 
-
-PROCESSED_FOLDER = "processed_orders"
+from modules.paths import PROCESSED_FOLDER
 
 
 def build_output_path(now):

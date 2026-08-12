@@ -15,8 +15,8 @@ echo        ОБРАБОТКА ЗАКАЗОВ v1.1
 echo =====================================
 echo.
 echo 1. Запустить обработку заказа
-echo 2. Открыть папку orders
-echo 3. Открыть processed_orders
+echo 2. Открыть папку data\orders
+echo 3. Открыть data\processed_orders
 echo 4. Открыть настройки
 echo 5. Выход
 echo.
@@ -80,14 +80,14 @@ goto menu
 
 :orders
 
-if not exist "%~dp0orders" (
+if not exist "%~dp0data\orders" (
 
-    mkdir "%~dp0orders"
+    mkdir "%~dp0data\orders"
 
 )
 
 
-explorer "%~dp0orders"
+explorer "%~dp0data\orders"
 
 
 goto menu
@@ -96,14 +96,14 @@ goto menu
 
 :ready
 
-if not exist "%~dp0processed_orders" (
+if not exist "%~dp0data\processed_orders" (
 
-    mkdir "%~dp0processed_orders"
+    mkdir "%~dp0data\processed_orders"
 
 )
 
 
-explorer "%~dp0processed_orders"
+explorer "%~dp0data\processed_orders"
 
 
 goto menu
@@ -112,17 +112,17 @@ goto menu
 
 :settings
 
-if not exist "%~dp0settings.json" (
+if not exist "%~dp0config\settings.json" (
 
     echo {
     echo     "open_file_after_processing": true,
     echo     "open_folder_after_processing": false
-    echo } > "%~dp0settings.json"
+    echo } > "%~dp0config\settings.json"
 
 )
 
 
-notepad "%~dp0settings.json"
+notepad "%~dp0config\settings.json"
 
 
 goto menu

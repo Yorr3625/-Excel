@@ -1,7 +1,6 @@
 import os
 
-
-LOGS_FOLDER = "logs"
+from modules.paths import LOGS_FOLDER
 
 
 def write_log(date_folder, now, input_file, output_file, stats):

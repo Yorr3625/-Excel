@@ -1,8 +1,8 @@
-import json
 from pathlib import Path
-from datetime import datetime
 
+from modules import paths
 from modules.config import load_settings, load_stores, build_groups
+from modules.history import load_processed_files, record_processing
 from modules.styles import (
     green_fill,
     yellow_fill,
@@ -14,29 +14,6 @@ from modules.file_selector import select_order_file
 from modules.pipeline import process_order
 from modules.reporter import print_summary
 
-
-
-LOG_FILE = "processed_files.json"
-
-
-def load_processed_files():
-    if not Path(LOG_FILE).exists():
-        return {}
-
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-
-def save_processed_file(filename):
-    data = load_processed_files()
-
-    data[filename] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
 
 def main():
 
@@ -83,19 +60,18 @@ def main():
     mode = input("\nВаш выбор: ").strip()
 
     if mode == "1":
-        stores_file = "stores_city.json"
         mode_name = "Город"
     elif mode == "2":
-        stores_file = "stores_region.json"
         mode_name = "Область"
     else:
         print("Неверный выбор!")
         return
 
+    stores_file = paths.stores_file_for(mode_name)
+
     print(f"\nВыбран режим: {mode_name}")
     print(f"Файл магазинов: {stores_file}")
 
-    print(f"\nВыбран режим: {mode_name}")
     stores = load_stores(stores_file)
     fills = [green_fill, yellow_fill, blue_fill, purple_fill]
     groups = build_groups(stores, fills)
@@ -108,17 +84,8 @@ def main():
     )
 
     print_summary(output_file, stats, log_file)
-    save_processed_file(filename)
+    record_processing(filename, stats)
 
-KEYWORDS = [
-    "итого",
-    "итог",
-    "всего",
-    "итого:",
-    "итог:"
-]
-
-rows_to_delete = []
 
 if __name__ == "__main__":
     try:

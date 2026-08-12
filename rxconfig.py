@@ -1,31 +1,35 @@
 import os
-from pathlib import Path
 
 import reflex as rx
 
+from modules import paths
 
-# Папки и файлы, которые приложение само создаёт и перезаписывает при
-# обработке заказов (excel-файлы, логи, json с настройками/историей).
-# Без этого исключения dev-сервер (uvicorn --reload) следит за всей
-# папкой проекта без фильтра по расширениям и перезапускает бэкенд на
-# каждую такую запись, из-за чего сбрасывается состояние открытой
-# страницы (пропадает сводка обработки, сбрасываются переключатели).
-_RUNTIME_DIRS = ["orders", "processed_orders", "logs"]
-_RUNTIME_FILES = [
-    "processed_files.json",
-    "settings.json",
-    "stores.json",
-    "stores_city.json",
-    "stores_region.json",
-]
 
-for _dir in _RUNTIME_DIRS:
-    Path(_dir).mkdir(exist_ok=True)
+# Дашборд постоянно пишет в data/ (excel-результаты, логи, json с историей)
+# и в config/ (настройки, списки магазинов). Dev-сервер Reflex следит за
+# всей папкой проекта без фильтра по расширениям и перезапускал бы бэкенд
+# на каждую такую запись, сбрасывая состояние открытой страницы (пропадала
+# сводка обработки, слетали переключатели). Исключаем обе папки целиком —
+# так список не надо поддерживать при появлении новых файлов.
+for _dir in (
+    paths.CONFIG_DIR,
+    paths.DATA_DIR,
+    paths.ORDERS_FOLDER,
+    paths.PROCESSED_FOLDER,
+    paths.LOGS_FOLDER,
+    paths.UPLOADS_FOLDER,
+    paths.TRACKING_FOLDER,
+):
+    _dir.mkdir(parents=True, exist_ok=True)
 
 os.environ.setdefault(
     "REFLEX_HOT_RELOAD_EXCLUDE_PATHS",
-    ":".join(_RUNTIME_DIRS + _RUNTIME_FILES),
+    ":".join(str(_dir) for _dir in (paths.CONFIG_DIR, paths.DATA_DIR)),
 )
+
+# По умолчанию Reflex складывает загруженные файлы в uploaded_files/ в
+# корне проекта — уводим внутрь data/, к остальным рабочим папкам.
+os.environ.setdefault("REFLEX_UPLOADED_FILES_DIR", str(paths.UPLOADS_FOLDER))
 
 
 config = rx.Config(

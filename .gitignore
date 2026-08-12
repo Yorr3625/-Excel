@@ -1,3 +1,8 @@
+.web
+*.db
+*.py[cod]
+assets/external/
+.states
 __pycache__/
 *.pyc
 
@@ -9,23 +14,24 @@ dist/
 .web/
 reflex.lock/
 .states/
-uploaded_files/
+
+# Рабочие данные: заказы, результаты, логи, история дашборда.
+# Файлы внутри не версионируются, но сама папка нужна приложению.
+data/*
+!data/.gitkeep
 
 # Ignore Excel files
 *.xlsx
 *.xls
 
-# Keep order folders visible if needed
-# orders/
-# processed_orders/
-
-logs/
-
 venv/
 .venv/
 
+.pytest_cache/
+
 .vscode/
 .idea/
+.claude/
 
 Thumbs.db
 .DS_Store

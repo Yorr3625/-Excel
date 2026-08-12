@@ -1,6 +1,6 @@
 import os
 
-ORDERS_FOLDER = "orders"
+from modules.paths import ORDERS_FOLDER
 
 
 def select_order_file():

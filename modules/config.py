@@ -1,29 +1,31 @@
 import json
 
-
-def load_settings(path="settings.json"):
-    """Загружает settings.json (настройки поведения программы)."""
-
-    with open(path, "r", encoding="utf-8") as file:
-        return json.load(file)
+from modules import paths
 
 
-def load_stores(path="stores.json"):
-    """Загружает stores.json (список магазинов по маршрутам)."""
+def load_settings(path=paths.SETTINGS_FILE):
+    """Загружает config/settings.json (настройки поведения программы)."""
 
     with open(path, "r", encoding="utf-8") as file:
         return json.load(file)
 
 
-def save_settings(data, path="settings.json"):
-    """Сохраняет настройки в settings.json."""
+def load_stores(path=paths.STORES_FILE):
+    """Загружает список магазинов по маршрутам (config/stores*.json)."""
+
+    with open(path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def save_settings(data, path=paths.SETTINGS_FILE):
+    """Сохраняет настройки в config/settings.json."""
 
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
 
 
-def save_stores(data, path="stores.json"):
-    """Сохраняет список магазинов по маршрутам в stores.json."""
+def save_stores(data, path=paths.STORES_FILE):
+    """Сохраняет список магазинов по маршрутам в config/stores*.json."""
 
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)

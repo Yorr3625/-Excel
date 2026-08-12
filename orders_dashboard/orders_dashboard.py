@@ -1,24 +1,117 @@
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import asyncio
 import json
 import traceback
 
 import reflex as rx
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
+from modules import driver_data, paths
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
+from modules.history import load_processed_files, load_volume_history, record_processing
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
+from modules.tracking_sim import (
+    ROUTE_COLORS,
+    ROUTE_KEYS,
+    ROUTE_LABELS,
+    advance_tick,
+    build_map_svg,
+    init_vehicles,
+)
+
+
+async def gps_ping(request: Request):
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "bad payload"}, status_code=400)
+
+    vehicle = payload.get("vehicle", "")
+
+    if not driver_data.is_valid_vehicle(vehicle):
+        return JSONResponse({"ok": False, "error": "unknown vehicle"}, status_code=400)
+
+    driver_data.append_gps(
+        vehicle,
+        payload.get("lat"),
+        payload.get("lon"),
+        payload.get("speed"),
+    )
+    return JSONResponse({"ok": True})
+
+
+custom_api = Starlette(routes=[Route("/api/gps-ping", gps_ping, methods=["POST"])])
+
+
+FA_ICON_MAP = {
+    "layout_dashboard": "FaGauge",
+    "package": "FaBox",
+    "route": "FaRoute",
+    "truck": "FaTruck",
+    "history": "FaClockRotateLeft",
+    "settings": "FaGear",
+    "boxes": "FaBoxesStacked",
+    "sun": "FaSun",
+    "moon": "FaMoon",
+    "upload": "FaUpload",
+    "file_spreadsheet": "FaFileExcel",
+    "chart_no_axes_column": "FaChartColumn",
+    "map": "FaMap",
+    "award": "FaAward",
+    "list": "FaList",
+    "map_pin": "FaLocationDot",
+    "x": "FaXmark",
+    "plus": "FaPlus",
+    "camera": "FaCamera",
+    "circle_check": "FaCircleCheck",
+    "circle": "FaCircle",
+    "store": "FaStore",
+    "fuel": "FaGasPump",
+    "triangle_alert": "FaTriangleExclamation",
+}
+
+
+class FaIcon(rx.Component):
+    """Font Awesome 6 icon, loaded from the react-icons/fa6 package."""
+
+    library = "react-icons/fa6"
+    tag = "FaCircleQuestion"
+
+    size: rx.Var[int]
+    color: rx.Var[str]
+
+    @classmethod
+    def create(cls, **props):
+        name = props.pop("tag", "")
+        props["tag"] = FA_ICON_MAP.get(name, "FaCircleQuestion")
+        return super().create(**props)
+
+
+fa_icon = FaIcon.create
 
 
 ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
 UPLOAD_ID = "order_upload"
-PROCESSED_FILES = Path("processed_files.json")
+INVOICE_UPLOAD_ID = "invoice_upload"
+VOLUME_CHART_DAYS = 31
+ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
+MAX_ROUTE_BACKUPS = 20
+VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3", "Маршрут 4"]
 
 NAV_ITEMS = [
     ("Dashboard", "layout_dashboard"),
     ("Заказы", "package"),
     ("Маршруты", "route"),
+    ("Трекинг", "truck"),
     ("История", "history"),
     ("Настройки", "settings"),
 ]
@@ -53,23 +146,77 @@ SETTINGS_LABELS = {
 }
 
 
-def load_processed_files():
-    if not PROCESSED_FILES.exists():
+def load_route_backups():
+    if not ROUTE_BACKUPS_FILE.exists():
         return {}
 
     try:
-        return json.loads(PROCESSED_FILES.read_text(encoding="utf-8"))
+        return json.loads(ROUTE_BACKUPS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def save_processed_file(filename: str):
-    data = load_processed_files()
-    data[filename] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    PROCESSED_FILES.write_text(
-        json.dumps(data, ensure_ascii=False, indent=4),
+def append_route_backup(source: str, routes: dict, note: str) -> str:
+    """Кладёт копию маршрутов в начало списка и возвращает её подпись."""
+
+    data = load_route_backups()
+    items = data.get(source, [])
+
+    # Подпись — это и значение в выпадающем списке, и ключ поиска при
+    # восстановлении, поэтому она должна быть уникальной: две копии,
+    # созданные в одну секунду, иначе стали бы неразличимы.
+    base_label = f"{datetime.now():%d.%m.%Y %H:%M:%S} — {note}"
+    existing = {item.get("label") for item in items}
+    label = base_label
+    suffix = 2
+
+    while label in existing:
+        label = f"{base_label} ({suffix})"
+        suffix += 1
+
+    items.insert(0, {"label": label, "routes": routes})
+    data[source] = items[:MAX_ROUTE_BACKUPS]
+
+    ROUTE_BACKUPS_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    return label
+
+
+def routes_dict(route_stores) -> dict:
+    """Списки маршрутов (по индексам) -> структура для stores_*.json."""
+
+    return {key: list(names) for key, names in zip(ROUTE_KEYS, route_stores)}
+
+
+def build_volume_chart_data():
+    daily = {}
+
+    for record in load_volume_history():
+        date = record.get("date")
+        if not date:
+            continue
+
+        bucket = daily.setdefault(date, [0.0, 0.0, 0.0, 0.0])
+        for index, key in enumerate(("route_1", "route_2", "route_3", "route_4")):
+            bucket[index] += float(record.get(key) or 0)
+
+    today = datetime.now().date()
+    chart = []
+
+    for offset in range(VOLUME_CHART_DAYS - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        totals = daily.get(day.strftime("%Y-%m-%d"), [0.0, 0.0, 0.0, 0.0])
+
+        point = {"date": day.strftime("%d.%m")}
+        for label, total in zip(VOLUME_ROUTE_LABELS, totals):
+            point[label] = round(total)
+
+        chart.append(point)
+
+    return chart
 
 
 def format_number(value):
@@ -87,10 +234,7 @@ class State(rx.State):
     output_file: str = ""
     log_file: str = ""
     grand_total: str = "0"
-    route_1_total: str = "0"
-    route_2_total: str = "0"
-    route_3_total: str = "0"
-    route_4_total: str = "0"
+    route_totals: list[str] = ["0", "0", "0", "0"]
     conflict_count: int = 0
     unknown_count: int = 0
     error_text: str = ""
@@ -104,19 +248,26 @@ class State(rx.State):
     orders_today_count: int = 0
     orders_total_count: int = 0
     stores_total_count: int = 0
+    volume_chart_data: list[dict] = []
 
     current_page: str = "Dashboard"
 
     routes_source: str = "Область"
-    route_1_stores: list[str] = []
-    route_2_stores: list[str] = []
-    route_3_stores: list[str] = []
-    route_4_stores: list[str] = []
-    new_store_1: str = ""
-    new_store_2: str = ""
-    new_store_3: str = ""
-    new_store_4: str = ""
+    # Списки по маршрутам (индексы 0..3 соответствуют ROUTE_KEYS).
+    route_stores: list[list[str]] = [[], [], [], []]
+    new_store_inputs: list[str] = ["", "", "", ""]
     routes_status: str = ""
+    route_backup_labels: list[str] = []
+    selected_route_backup: str = ""
+
+    tracking_source: str = "Область"
+    tracking_running: bool = False
+    vehicles: list[dict] = []
+    tracking_event_log: list[str] = []
+
+    tracking_view: str = "Симуляция"
+    real_vehicles: list[dict] = []
+    real_watching: bool = False
 
     settings_data: dict[str, bool] = {
         "open_file_after_processing": True,
@@ -134,77 +285,106 @@ class State(rx.State):
             self.load_routes()
         elif page == "Настройки":
             self.load_settings_form()
+        elif page == "Трекинг" and not self.vehicles:
+            self.init_tracking()
+
+    @property
+    def stores_file(self) -> Path:
+        return paths.stores_file_for(self.routes_source)
 
     def load_routes(self):
-        stores_file = "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
-        data = load_stores(stores_file)
-        self.route_1_stores = list(data.get("route_1", []))
-        self.route_2_stores = list(data.get("route_2", []))
-        self.route_3_stores = list(data.get("route_3", []))
-        self.route_4_stores = list(data.get("route_4", []))
+        data = load_stores(self.stores_file)
+        self.route_stores = [list(data.get(key, [])) for key in ROUTE_KEYS]
         self.routes_status = ""
+        self.refresh_route_backups()
+
+    def refresh_route_backups(self):
+        data = load_route_backups()
+        self.route_backup_labels = [
+            item.get("label", "") for item in data.get(self.routes_source, [])
+        ]
+
+        if self.selected_route_backup not in self.route_backup_labels:
+            self.selected_route_backup = ""
+
+    def set_selected_route_backup(self, value: str):
+        self.selected_route_backup = value
+
+    def create_route_backup(self):
+        label = append_route_backup(
+            self.routes_source,
+            routes_dict(self.route_stores),
+            "вручную",
+        )
+
+        self.refresh_route_backups()
+        self.selected_route_backup = label
+        self.routes_status = f"Копия создана: {label}"
+
+    def restore_route_backup(self):
+        if not self.selected_route_backup:
+            self.routes_status = "Сначала выберите копию в списке"
+            return
+
+        data = load_route_backups()
+
+        for item in data.get(self.routes_source, []):
+            if item.get("label") != self.selected_route_backup:
+                continue
+
+            routes = item.get("routes", {})
+            self.route_stores = [list(routes.get(key, [])) for key in ROUTE_KEYS]
+            self.routes_status = (
+                f"Загружена копия «{self.selected_route_backup}». "
+                "Нажмите «Сохранить маршруты», чтобы применить её."
+            )
+            return
+
+        self.routes_status = "Копия не найдена — обновите список"
+        self.refresh_route_backups()
 
     def set_routes_source(self, value: str):
         self.routes_source = value
         self.load_routes()
 
-    def set_new_store_1(self, value: str):
-        self.new_store_1 = value
+    def set_new_store(self, index: int, value: str):
+        inputs = list(self.new_store_inputs)
+        inputs[index] = value
+        self.new_store_inputs = inputs
 
-    def set_new_store_2(self, value: str):
-        self.new_store_2 = value
+    def add_store(self, index: int):
+        value = self.new_store_inputs[index].strip()
 
-    def set_new_store_3(self, value: str):
-        self.new_store_3 = value
+        if value and value not in self.route_stores[index]:
+            routes = [list(names) for names in self.route_stores]
+            routes[index].append(value)
+            self.route_stores = routes
 
-    def set_new_store_4(self, value: str):
-        self.new_store_4 = value
+        inputs = list(self.new_store_inputs)
+        inputs[index] = ""
+        self.new_store_inputs = inputs
 
-    def add_store_1(self):
-        value = self.new_store_1.strip()
-        if value and value not in self.route_1_stores:
-            self.route_1_stores = self.route_1_stores + [value]
-        self.new_store_1 = ""
-
-    def add_store_2(self):
-        value = self.new_store_2.strip()
-        if value and value not in self.route_2_stores:
-            self.route_2_stores = self.route_2_stores + [value]
-        self.new_store_2 = ""
-
-    def add_store_3(self):
-        value = self.new_store_3.strip()
-        if value and value not in self.route_3_stores:
-            self.route_3_stores = self.route_3_stores + [value]
-        self.new_store_3 = ""
-
-    def add_store_4(self):
-        value = self.new_store_4.strip()
-        if value and value not in self.route_4_stores:
-            self.route_4_stores = self.route_4_stores + [value]
-        self.new_store_4 = ""
-
-    def remove_store_1(self, name: str):
-        self.route_1_stores = [item for item in self.route_1_stores if item != name]
-
-    def remove_store_2(self, name: str):
-        self.route_2_stores = [item for item in self.route_2_stores if item != name]
-
-    def remove_store_3(self, name: str):
-        self.route_3_stores = [item for item in self.route_3_stores if item != name]
-
-    def remove_store_4(self, name: str):
-        self.route_4_stores = [item for item in self.route_4_stores if item != name]
+    def remove_store(self, index: int, name: str):
+        routes = [list(names) for names in self.route_stores]
+        routes[index] = [item for item in routes[index] if item != name]
+        self.route_stores = routes
 
     def save_routes(self):
-        stores_file = "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
-        data = {
-            "route_1": self.route_1_stores,
-            "route_2": self.route_2_stores,
-            "route_3": self.route_3_stores,
-            "route_4": self.route_4_stores,
-        }
-        save_stores(data, stores_file)
+        stores_file = self.stores_file
+
+        # Прежнее содержимое файла уходит в копию — так к нему можно
+        # вернуться через выпадающий список, если новая версия не подошла.
+        try:
+            previous = load_stores(stores_file)
+        except (OSError, ValueError):
+            previous = None
+
+        if previous:
+            append_route_backup(self.routes_source, previous, "перед сохранением")
+
+        save_stores(routes_dict(self.route_stores), stores_file)
+
+        self.refresh_route_backups()
         self.routes_status = f"Сохранено в {stores_file}"
 
     def load_settings_form(self):
@@ -218,6 +398,121 @@ class State(rx.State):
     def save_settings_form(self):
         save_settings(dict(self.settings_data))
         self.settings_status = "Настройки сохранены"
+
+    def init_tracking(self):
+        stores_file = paths.stores_file_for(self.tracking_source)
+        self.vehicles = init_vehicles(stores_file)
+        self.tracking_event_log = []
+
+    def set_tracking_source(self, value: str):
+        self.tracking_running = False
+        self.tracking_source = value
+        self.init_tracking()
+
+    def reset_tracking(self):
+        self.tracking_running = False
+        self.init_tracking()
+
+    def stop_tracking(self):
+        self.tracking_running = False
+
+    @rx.event(background=True)
+    async def start_tracking(self):
+        async with self:
+            if self.tracking_running or not self.vehicles:
+                return
+            self.tracking_running = True
+
+        while True:
+            await asyncio.sleep(1.0)
+
+            async with self:
+                if not self.tracking_running:
+                    return
+
+                updated, events = advance_tick(self.vehicles)
+                self.vehicles = updated
+
+                if events:
+                    self.tracking_event_log = (events + self.tracking_event_log)[:40]
+
+    @rx.var
+    def map_svg(self) -> str:
+        return build_map_svg(self.vehicles)
+
+    @rx.var
+    def ranked_vehicles(self) -> list[dict]:
+        return sorted(self.vehicles, key=lambda v: v["score"], reverse=True)
+
+    @rx.var
+    def tracking_total_distance(self) -> str:
+        return format_number(sum(v["distance_km"] for v in self.vehicles))
+
+    @rx.var
+    def tracking_total_fuel(self) -> str:
+        return format_number(sum(v["fuel_l"] for v in self.vehicles))
+
+    @rx.var
+    def tracking_total_cost(self) -> str:
+        return format_number(sum(v["cost"] for v in self.vehicles))
+
+    @rx.var
+    def tracking_total_harsh(self) -> int:
+        return sum(v["harsh_count"] for v in self.vehicles)
+
+    @rx.var
+    def tracking_avg_score(self) -> int:
+        if not self.vehicles:
+            return 100
+        return round(sum(v["score"] for v in self.vehicles) / len(self.vehicles))
+
+    def set_tracking_view(self, value: str):
+        self.tracking_view = value
+
+        if value == "Реальные данные":
+            self.refresh_real_data()
+        else:
+            self.real_watching = False
+
+    def refresh_real_data(self):
+        items = []
+
+        for index, key in enumerate(ROUTE_KEYS):
+            data = driver_data.load_today(key)
+            stops = data["stops"] if data else []
+            last = data.get("last_position") if data else None
+
+            items.append({
+                "route_index": index,
+                "label": ROUTE_LABELS[index],
+                "color": ROUTE_COLORS[index],
+                "stops": stops,
+                "done_count": sum(1 for s in stops if s["status"] == "done"),
+                "total_count": len(stops),
+                "has_position": last is not None,
+                "last_lat": last["lat"] if last else 0,
+                "last_lon": last["lon"] if last else 0,
+                "last_ts": last["ts"] if last else "",
+            })
+
+        self.real_vehicles = items
+
+    @rx.event(background=True)
+    async def watch_real_data(self):
+        async with self:
+            if self.real_watching:
+                return
+            self.real_watching = True
+
+        while True:
+            await asyncio.sleep(5.0)
+
+            async with self:
+                if not self.real_watching or self.tracking_view != "Реальные данные":
+                    self.real_watching = False
+                    return
+
+                self.refresh_real_data()
 
     def load_history(self):
         data = load_processed_files()
@@ -234,11 +529,15 @@ class State(rx.State):
         self.orders_today_count = sum(1 for ts in data.values() if ts.startswith(today))
 
         self.refresh_stores_total()
+        self.volume_chart_data = build_volume_chart_data()
+
+        if not self.vehicles:
+            self.init_tracking()
 
     def refresh_stores_total(self):
         total = 0
 
-        for filename in ("stores_city.json", "stores_region.json"):
+        for filename in (paths.STORES_CITY_FILE, paths.STORES_REGION_FILE):
             try:
                 store_data = load_stores(filename)
             except (OSError, json.JSONDecodeError):
@@ -276,8 +575,8 @@ class State(rx.State):
         try:
             fills = [green_fill, yellow_fill, blue_fill, purple_fill]
             mode_groups = {
-                "Город": build_groups(load_stores("stores_city.json"), fills),
-                "Область": build_groups(load_stores("stores_region.json"), fills),
+                mode: build_groups(load_stores(paths.stores_file_for(mode)), fills)
+                for mode in ("Город", "Область")
             }
 
             mode, scores = detect_mode(self.uploaded_file_path, mode_groups, conflict_fill)
@@ -311,7 +610,7 @@ class State(rx.State):
         self.error_text = ""
 
         try:
-            stores_file = "stores_city.json" if self.mode == "Город" else "stores_region.json"
+            stores_file = paths.stores_file_for(self.mode)
             settings = load_settings()
 
             stores = load_stores(stores_file)
@@ -329,10 +628,7 @@ class State(rx.State):
             while len(route_totals) < 4:
                 route_totals.append(0)
 
-            self.route_1_total = format_number(route_totals[0])
-            self.route_2_total = format_number(route_totals[1])
-            self.route_3_total = format_number(route_totals[2])
-            self.route_4_total = format_number(route_totals[3])
+            self.route_totals = [format_number(total) for total in route_totals]
             self.grand_total = format_number(sum(route_totals))
             self.conflict_count = int(stats.get("conflict_count", 0))
             self.unknown_count = len(stats.get("unknown_stores", []))
@@ -340,7 +636,7 @@ class State(rx.State):
             self.log_file = str(log_file)
             self.status = "Обработка завершена"
 
-            save_processed_file(self.selected_file)
+            record_processing(self.selected_file, stats)
             self.load_history()
 
         except Exception:
@@ -419,7 +715,7 @@ def nav_button(label: str, icon: str):
     active = State.current_page == label
 
     return rx.button(
-        rx.icon(tag=icon, size=17),
+        fa_icon(tag=icon, size=17),
         rx.text(label, font_size="14px"),
         on_click=State.set_page(label),
         width="100%",
@@ -476,7 +772,7 @@ def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
 
     return rx.hstack(
         rx.box(
-            rx.icon(tag=icon, size=20, color=color),
+            fa_icon(tag=icon, size=20, color=color),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -507,7 +803,7 @@ def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
 def sidebar_logo():
     return rx.hstack(
         rx.box(
-            rx.icon(tag="boxes", size=18, color="white"),
+            fa_icon(tag="boxes", size=18, color="white"),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -528,32 +824,13 @@ def sidebar_logo():
     )
 
 
-def future_teaser_card():
-    return rx.vstack(
-        rx.hstack(
-            rx.icon(tag="truck", size=16, color=ICON_TINTS["blue"][0]),
-            rx.text("Скоро: трекинг машин", color=text(), font_size="12px", font_weight="700"),
-            spacing="2",
-            align="center",
-        ),
-        rx.text(
-            "GPS, расход топлива и экономичность вождения по каждой машине.",
-            color=muted(),
-            font_size="11px",
-        ),
-        align="start",
-        spacing="2",
-        padding="12px",
-        border=f"1px solid {border()}",
-        border_radius="12px",
-        background=surface_alt(),
-        width="100%",
-    )
-
-
 def theme_switch_row():
     return rx.hstack(
-        rx.icon(tag=rx.cond(State.theme == "light", "sun", "moon"), size=16, color=muted()),
+        rx.cond(
+            State.theme == "light",
+            fa_icon(tag="sun", size=16, color=muted()),
+            fa_icon(tag="moon", size=16, color=muted()),
+        ),
         rx.text("Тёмная тема", color=text(), font_size="13px", font_weight="600"),
         rx.spacer(),
         rx.switch(
@@ -586,7 +863,6 @@ def sidebar():
             width="100%",
         ),
         rx.spacer(),
-        future_teaser_card(),
         theme_switch_row(),
         align="start",
         spacing="6",
@@ -603,7 +879,7 @@ def upload_area():
     return rx.upload(
         rx.hstack(
             rx.box(
-                rx.icon(tag="upload", size=18, color=ICON_TINTS["green"][0]),
+                fa_icon(tag="upload", size=18, color=ICON_TINTS["green"][0]),
                 display="flex",
                 align_items="center",
                 justify_content="center",
@@ -766,10 +1042,10 @@ def processing_summary():
             width="100%",
         ),
         rx.vstack(
-            route_result("Маршрут №1", State.route_1_total),
-            route_result("Маршрут №2", State.route_2_total),
-            route_result("Маршрут №3", State.route_3_total),
-            route_result("Маршрут №4", State.route_4_total),
+            *[
+                route_result(f"Маршрут №{index + 1}", State.route_totals[index])
+                for index in range(len(ROUTE_KEYS))
+            ],
             spacing="2",
             width="100%",
         ),
@@ -790,7 +1066,7 @@ def processing_summary():
 def history_panel():
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="history", size=17, color=text()),
+            fa_icon(tag="history", size=17, color=text()),
             rx.heading("Последние обработки", color=text(), size="4"),
             spacing="2",
             align="center",
@@ -816,7 +1092,7 @@ def history_panel():
 def history_row(filename, time):
     return rx.hstack(
         rx.box(
-            rx.icon(tag="file_spreadsheet", size=16, color=muted()),
+            fa_icon(tag="file_spreadsheet", size=16, color=muted()),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -870,11 +1146,87 @@ def topbar(title: str, subtitle: str, actions=None):
     )
 
 
+def panel_shell(*children):
+    return rx.vstack(
+        *children,
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def panel_title(icon: str, title: str):
+    return rx.hstack(
+        fa_icon(tag=icon, size=17, color=text()),
+        rx.heading(title, color=text(), size="4"),
+        spacing="2",
+        align="center",
+    )
+
+
+def volume_chart_panel():
+    return panel_shell(
+        panel_title("chart_no_axes_column", "Вывезенный объём"),
+        muted_text(f"Сумма по маршрутам за последние {VOLUME_CHART_DAYS} дней", size="12px"),
+        rx.recharts.responsive_container(
+            rx.recharts.bar_chart(
+                rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=border()),
+                rx.recharts.x_axis(data_key="date", stroke=muted(), interval=2),
+                rx.recharts.y_axis(stroke=muted()),
+                rx.recharts.tooltip(),
+                rx.recharts.legend(),
+                rx.recharts.bar(data_key="Маршрут 1", stack_id="a", fill=ROUTE_COLORS[0]),
+                rx.recharts.bar(data_key="Маршрут 2", stack_id="a", fill=ROUTE_COLORS[1]),
+                rx.recharts.bar(data_key="Маршрут 3", stack_id="a", fill=ROUTE_COLORS[2]),
+                rx.recharts.bar(data_key="Маршрут 4", stack_id="a", fill=ROUTE_COLORS[3]),
+                data=State.volume_chart_data,
+                margin={"left": 0, "right": 8, "top": 4, "bottom": 0},
+            ),
+            width="100%",
+            height=280,
+        ),
+    )
+
+
+def dashboard_tracking_preview():
+    return panel_shell(
+        rx.hstack(
+            panel_title("truck", "Трекинг машин"),
+            rx.spacer(),
+            rx.cond(
+                State.tracking_running,
+                rx.badge("В движении", color_scheme="green", variant="soft"),
+                rx.badge("Остановлено", color_scheme="gray", variant="soft"),
+            ),
+            width="100%",
+            align="center",
+        ),
+        rx.box(
+            rx.html(State.map_svg),
+            width="100%",
+            border_radius="10px",
+            background=surface_alt(),
+            padding="12px",
+            overflow="hidden",
+        ),
+        secondary_button(
+            "Открыть Трекинг",
+            on_click=State.set_page("Трекинг"),
+            width="100%",
+        ),
+    )
+
+
 def overview_page():
     return page_shell(
         topbar(
             "Dashboard",
-            "Загрузка заказа, выбор режима и запуск обработки в одном аккуратном рабочем блоке.",
+            "Обзор: заказы, магазины и маршруты — и переход в нужный раздел.",
         ),
         rx.grid(
             stat_card(
@@ -897,8 +1249,8 @@ def overview_page():
             width="100%",
         ),
         rx.grid(
-            order_panel(),
-            history_panel(),
+            volume_chart_panel(),
+            dashboard_tracking_preview(),
             columns="2",
             spacing="4",
             width="100%",
@@ -926,11 +1278,11 @@ def history_page():
 
 def store_row(name, on_remove):
     return rx.hstack(
-        rx.icon(tag="map_pin", size=13, color=muted()),
+        fa_icon(tag="map_pin", size=13, color=muted()),
         rx.text(name, color=text(), font_size="13px"),
         rx.spacer(),
         rx.button(
-            rx.icon(tag="x", size=13),
+            fa_icon(tag="x", size=13),
             on_click=on_remove(name),
             size="1",
             variant="ghost",
@@ -946,16 +1298,19 @@ def store_row(name, on_remove):
     )
 
 
-def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
+def route_edit_card(index: int):
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="route", size=15, color=text()),
-            rx.text(title, color=text(), font_size="15px", font_weight="800"),
+            fa_icon(tag="route", size=15, color=text()),
+            rx.text(f"Маршрут №{index + 1}", color=text(), font_size="15px", font_weight="800"),
             spacing="2",
             align="center",
         ),
         rx.vstack(
-            rx.foreach(stores, lambda name: store_row(name, on_remove)),
+            rx.foreach(
+                State.route_stores[index],
+                lambda name: store_row(name, lambda value: State.remove_store(index, value)),
+            ),
             spacing="1",
             width="100%",
             max_height="220px",
@@ -964,11 +1319,16 @@ def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
         rx.hstack(
             rx.input(
                 placeholder="Название магазина",
-                value=new_value,
-                on_change=on_change,
+                value=State.new_store_inputs[index],
+                on_change=lambda value: State.set_new_store(index, value),
                 width="100%",
             ),
-            rx.button(rx.icon(tag="plus", size=15), "Добавить", on_click=on_add, height="36px"),
+            rx.button(
+                fa_icon(tag="plus", size=15),
+                "Добавить",
+                on_click=State.add_store(index),
+                height="36px",
+            ),
             width="100%",
             spacing="2",
         ),
@@ -983,6 +1343,27 @@ def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
     )
 
 
+def routes_backup_bar():
+    return rx.hstack(
+        primary_button("Сохранить маршруты", on_click=State.save_routes, width="210px"),
+        secondary_button("Создать копию", on_click=State.create_route_backup, width="165px"),
+        rx.spacer(),
+        fa_icon(tag="history", size=15, color=muted()),
+        rx.select(
+            State.route_backup_labels,
+            value=State.selected_route_backup,
+            on_change=State.set_selected_route_backup,
+            placeholder="Резервные копии",
+            width="270px",
+        ),
+        secondary_button("Восстановить", on_click=State.restore_route_backup, width="150px"),
+        spacing="3",
+        align="center",
+        width="100%",
+        wrap="wrap",
+    )
+
+
 def routes_page():
     return page_shell(
         topbar(
@@ -991,31 +1372,400 @@ def routes_page():
             actions=[segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source)],
         ),
         rx.grid(
-            route_edit_card(
-                "Маршрут №1", State.route_1_stores, State.new_store_1,
-                State.add_store_1, State.set_new_store_1, State.remove_store_1,
-            ),
-            route_edit_card(
-                "Маршрут №2", State.route_2_stores, State.new_store_2,
-                State.add_store_2, State.set_new_store_2, State.remove_store_2,
-            ),
-            route_edit_card(
-                "Маршрут №3", State.route_3_stores, State.new_store_3,
-                State.add_store_3, State.set_new_store_3, State.remove_store_3,
-            ),
-            route_edit_card(
-                "Маршрут №4", State.route_4_stores, State.new_store_4,
-                State.add_store_4, State.set_new_store_4, State.remove_store_4,
-            ),
+            *[route_edit_card(index) for index in range(len(ROUTE_KEYS))],
             columns="2",
             spacing="4",
             width="100%",
         ),
-        rx.hstack(
-            primary_button("Сохранить маршруты", on_click=State.save_routes, width="220px"),
+        routes_backup_bar(),
+        rx.cond(
+            State.routes_status != "",
             rx.text(State.routes_status, color=muted(), font_size="13px"),
-            spacing="4",
+            rx.box(),
+        ),
+    )
+
+
+def start_pause_button():
+    return rx.cond(
+        State.tracking_running,
+        secondary_button("Пауза", on_click=State.stop_tracking, width="130px"),
+        primary_button("Старт симуляции", on_click=State.start_tracking, width="180px"),
+    )
+
+
+def tracking_controls():
+    return rx.hstack(
+        segmented_control(["Город", "Область"], State.tracking_source, State.set_tracking_source),
+        rx.spacer(),
+        start_pause_button(),
+        secondary_button("Сброс", on_click=State.reset_tracking, width="110px"),
+        spacing="3",
+        align="center",
+        width="100%",
+    )
+
+
+def tracking_legend_dot(color, label):
+    return rx.hstack(
+        rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=color),
+        rx.text(label, color=muted(), font_size="12px"),
+        spacing="2",
+        align="center",
+    )
+
+
+def tracking_legend():
+    return rx.hstack(
+        *[tracking_legend_dot(color, label) for label, color in zip(ROUTE_LABELS, ROUTE_COLORS)],
+        tracking_legend_dot("#f5a623", "Резкий разгон"),
+        tracking_legend_dot("#e5484d", "Резкое торможение"),
+        spacing="5",
+        wrap="wrap",
+        width="100%",
+    )
+
+
+def tracking_map_panel():
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="map", size=17, color=text()),
+            rx.heading("Карта маршрутов", color=text(), size="4"),
+            spacing="2",
             align="center",
+        ),
+        rx.box(
+            rx.html(State.map_svg),
+            width="100%",
+            border_radius="10px",
+            background=surface_alt(),
+            padding="12px",
+            overflow="hidden",
+        ),
+        tracking_legend(),
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def event_badge(flag):
+    return rx.cond(
+        flag == "harsh_brake",
+        rx.text("Резкое торможение", color="#e5484d", font_size="11px", font_weight="700"),
+        rx.cond(
+            flag == "harsh_accel",
+            rx.text("Резкий разгон", color="#f5a623", font_size="11px", font_weight="700"),
+            rx.text("Плавно", color=muted(), font_size="11px"),
+        ),
+    )
+
+
+def tracking_progress_bar(percent, color):
+    return rx.box(
+        rx.box(
+            width=f"{percent}%",
+            height="100%",
+            border_radius="6px",
+            background=color,
+            transition="width 400ms ease",
+        ),
+        width="100%",
+        height="8px",
+        border_radius="6px",
+        background=surface_alt(),
+        overflow="hidden",
+    )
+
+
+def vehicle_card(v):
+    return rx.vstack(
+        rx.hstack(
+            rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=v["color"]),
+            rx.text(v["label"], color=text(), font_size="14px", font_weight="800"),
+            rx.spacer(),
+            event_badge(v["event_flag"]),
+            width="100%",
+            align="center",
+            spacing="2",
+        ),
+        rx.text(v["status"], color=muted(), font_size="12px"),
+        tracking_progress_bar(v["progress_percent"], v["color"]),
+        route_result("Скорость", f"{v['speed_kmh']} км/ч"),
+        route_result("Рейтинг", v["score"]),
+        route_result("Пробег", f"{v['distance_km']} км"),
+        route_result("Резкие манёвры", v["harsh_count"]),
+        align="start",
+        spacing="2",
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def rating_row(v):
+    return rx.hstack(
+        rx.box(width="8px", height="8px", min_width="8px", border_radius="50%", background=v["color"]),
+        rx.text(v["label"], color=text(), font_size="13px", font_weight="700"),
+        rx.spacer(),
+        rx.text(v["harsh_count"], color=muted(), font_size="12px"),
+        rx.text(" рывков", color=muted(), font_size="12px"),
+        rx.text(v["score"], color=text(), font_size="14px", font_weight="800"),
+        spacing="2",
+        align="center",
+        width="100%",
+        padding="10px 12px",
+        border_radius="9px",
+        background=surface_alt(),
+    )
+
+
+def rating_panel():
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="award", size=17, color=text()),
+            rx.heading("Рейтинг водителей", color=text(), size="4"),
+            spacing="2",
+            align="center",
+        ),
+        rx.vstack(
+            rx.foreach(State.ranked_vehicles, rating_row),
+            spacing="2",
+            width="100%",
+        ),
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def event_log_panel():
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="list", size=17, color=text()),
+            rx.heading("Журнал событий", color=text(), size="4"),
+            spacing="2",
+            align="center",
+        ),
+        rx.cond(
+            State.tracking_event_log.length() == 0,
+            rx.text("Событий пока нет — запустите симуляцию.", color=muted(), font_size="13px"),
+            rx.vstack(
+                rx.foreach(
+                    State.tracking_event_log,
+                    lambda entry: rx.text(entry, color=text(), font_size="12px"),
+                ),
+                spacing="2",
+                width="100%",
+                max_height="260px",
+                overflow_y="auto",
+            ),
+        ),
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def tracking_view_toggle():
+    return rx.hstack(
+        segment_button(
+            "Симуляция", State.tracking_view,
+            State.set_tracking_view("Симуляция"),
+        ),
+        segment_button(
+            "Реальные данные", State.tracking_view,
+            [State.set_tracking_view("Реальные данные"), State.watch_real_data],
+        ),
+        spacing="1",
+        padding="4px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+        width="fit-content",
+    )
+
+
+def simulation_section():
+    return rx.vstack(
+        tracking_controls(),
+        rx.grid(
+            stat_card(
+                "route", "green",
+                "Общий пробег", f"{State.tracking_total_distance} км",
+                muted_text("за сессию симуляции"),
+            ),
+            stat_card(
+                "fuel", "blue",
+                "Расход топлива", f"{State.tracking_total_fuel} л",
+                muted_text("≈ ", State.tracking_total_cost, " ₽"),
+            ),
+            stat_card(
+                "triangle_alert", "violet",
+                "Резкие манёвры", State.tracking_total_harsh,
+                muted_text("средний рейтинг: ", State.tracking_avg_score),
+            ),
+            columns="3",
+            spacing="4",
+            width="100%",
+        ),
+        tracking_map_panel(),
+        rx.grid(
+            rx.foreach(State.vehicles, vehicle_card),
+            columns="2",
+            spacing="4",
+            width="100%",
+        ),
+        rx.grid(
+            rating_panel(),
+            event_log_panel(),
+            columns="2",
+            spacing="4",
+            width="100%",
+            align_items="start",
+        ),
+        spacing="4",
+        width="100%",
+    )
+
+
+def real_stop_row(stop):
+    return rx.hstack(
+        rx.cond(
+            stop["status"] == "done",
+            fa_icon(tag="circle_check", size=14, color=ACCENT),
+            fa_icon(tag="circle", size=14, color=muted()),
+        ),
+        rx.text(stop["name"], color=text(), font_size="13px"),
+        rx.spacer(),
+        rx.cond(
+            stop["status"] == "done",
+            rx.text(stop["done_at"], color=muted(), font_size="11px"),
+            rx.text("ожидание", color=muted(), font_size="11px"),
+        ),
+        width="100%",
+        align="center",
+        spacing="2",
+        padding="6px 10px",
+        border_radius="7px",
+        background=surface_alt(),
+    )
+
+
+def real_vehicle_map(v):
+    lat = v["last_lat"].to(float)
+    lon = v["last_lon"].to(float)
+    map_src = (
+        f"https://www.openstreetmap.org/export/embed.html?bbox="
+        f"{lon - 0.01}%2C{lat - 0.01}%2C{lon + 0.01}%2C{lat + 0.01}"
+        f"&marker={lat}%2C{lon}"
+    )
+
+    return rx.cond(
+        v["has_position"],
+        rx.vstack(
+            rx.text("Последний сигнал: ", v["last_ts"], color=muted(), font_size="12px"),
+            rx.el.iframe(
+                src=map_src,
+                width="100%",
+                height="200px",
+                style={"border": "0", "borderRadius": "10px"},
+            ),
+            spacing="2",
+            width="100%",
+        ),
+        rx.text("GPS ещё не поступал с планшета водителя.", color=muted(), font_size="12px"),
+    )
+
+
+def real_vehicle_card(v):
+    return rx.vstack(
+        rx.hstack(
+            rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=v["color"]),
+            rx.text(v["label"], color=text(), font_size="15px", font_weight="800"),
+            rx.spacer(),
+            rx.text(v["done_count"], color=text(), font_size="13px", font_weight="700"),
+            rx.text(" / ", color=muted(), font_size="13px"),
+            rx.text(v["total_count"], color=muted(), font_size="13px"),
+            width="100%",
+            align="center",
+            spacing="1",
+        ),
+        real_vehicle_map(v),
+        rx.cond(
+            v["total_count"].to(int) > 0,
+            rx.vstack(
+                rx.foreach(v["stops"].to(list[dict]), real_stop_row),
+                spacing="2",
+                width="100%",
+                max_height="200px",
+                overflow_y="auto",
+            ),
+            rx.text("Водитель ещё не открывал чек-лист сегодня.", color=muted(), font_size="12px"),
+        ),
+        align="start",
+        spacing="3",
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def real_data_section():
+    return rx.vstack(
+        rx.hstack(
+            rx.text(
+                "Данные от водителей за сегодня — открывается на /driver, обновляется каждые ~5 сек.",
+                color=muted(), font_size="13px",
+            ),
+            rx.spacer(),
+            secondary_button("Обновить", on_click=State.refresh_real_data, width="120px"),
+            width="100%",
+            align="center",
+        ),
+        rx.grid(
+            rx.foreach(State.real_vehicles, real_vehicle_card),
+            columns="2",
+            spacing="4",
+            width="100%",
+        ),
+        spacing="4",
+        width="100%",
+    )
+
+
+def tracking_page():
+    return page_shell(
+        topbar(
+            "Трекинг",
+            "Симуляция движения машин по маршрутам либо реальные данные от водителей.",
+            actions=[tracking_view_toggle()],
+        ),
+        rx.cond(
+            State.tracking_view == "Симуляция",
+            simulation_section(),
+            real_data_section(),
         ),
     )
 
@@ -1069,6 +1819,7 @@ def main_content():
         State.current_page,
         ("Заказы", orders_page()),
         ("Маршруты", routes_page()),
+        ("Трекинг", tracking_page()),
         ("История", history_page()),
         ("Настройки", settings_page()),
         overview_page(),
@@ -1086,5 +1837,298 @@ def dashboard():
     )
 
 
-app = rx.App()
+DRIVER_VEHICLES = list(zip(ROUTE_KEYS, ROUTE_LABELS, ROUTE_COLORS))
+
+GPS_WATCH_JS = """
+(function () {
+    if (!navigator.geolocation || window.__driverGpsWatching) { return; }
+    window.__driverGpsWatching = true;
+
+    function send(pos) {
+        var meta = document.getElementById('driver-vehicle-meta');
+        var vehicle = meta ? meta.getAttribute('data-vehicle') : '';
+        if (!vehicle) { return; }
+
+        fetch('/api/gps-ping', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                vehicle: vehicle,
+                lat: pos.coords.latitude,
+                lon: pos.coords.longitude,
+                speed: pos.coords.speed
+            })
+        }).catch(function () {});
+    }
+
+    navigator.geolocation.watchPosition(send, function () {}, {
+        enableHighAccuracy: true,
+        maximumAge: 10000,
+        timeout: 15000
+    });
+})();
+"""
+
+
+class DriverState(rx.State):
+    vehicle_key: str = ""
+    vehicle_label: str = ""
+    source: str = "Область"
+    stops: list[dict] = []
+    active_stop: str = ""
+    upload_status: str = ""
+
+    def _stores_file(self) -> Path:
+        return paths.stores_file_for(self.source)
+
+    def select_vehicle(self, key: str, label: str):
+        self.vehicle_key = key
+        self.vehicle_label = label
+        self.active_stop = ""
+        self.upload_status = ""
+        data = driver_data.load_or_init_day(key, self._stores_file())
+        self.stops = data["stops"]
+
+    def set_source(self, value: str):
+        self.source = value
+
+        if self.vehicle_key:
+            data = driver_data.load_or_init_day(self.vehicle_key, self._stores_file())
+            self.stops = data["stops"]
+
+    def change_vehicle(self):
+        self.vehicle_key = ""
+        self.vehicle_label = ""
+        self.stops = []
+        self.active_stop = ""
+
+    def open_upload(self, name: str):
+        self.active_stop = name
+        self.upload_status = ""
+
+    def cancel_upload(self):
+        self.active_stop = ""
+
+    async def handle_invoice_upload(self, files: list[rx.UploadFile]):
+        if not files or not self.active_stop:
+            self.upload_status = "Сначала сделайте фото накладной"
+            return
+
+        file = files[0]
+        data = await file.read()
+        safe_stop = "".join(ch if ch.isalnum() else "_" for ch in self.active_stop)
+        filename = f"{datetime.now():%Y%m%d_%H%M%S}_{safe_stop}.jpg"
+
+        vehicle_upload_dir = rx.get_upload_dir() / "invoices" / self.vehicle_key
+        vehicle_upload_dir.mkdir(parents=True, exist_ok=True)
+        (vehicle_upload_dir / filename).write_bytes(data)
+
+        photo_rel_path = f"invoices/{self.vehicle_key}/{filename}"
+        updated = driver_data.mark_stop_done(
+            self.vehicle_key, self._stores_file(), self.active_stop, photo_rel_path,
+        )
+        self.stops = updated["stops"]
+        self.active_stop = ""
+        self.upload_status = "Накладная сохранена"
+
+
+def driver_vehicle_button(key, label, color):
+    return rx.button(
+        fa_icon(tag="truck", size=22, color="white"),
+        rx.text(label, font_size="17px", font_weight="800", color="white"),
+        on_click=DriverState.select_vehicle(key, label),
+        width="100%",
+        height="76px",
+        border_radius="14px",
+        background=color,
+        _hover={"opacity": 0.9},
+        cursor="pointer",
+    )
+
+
+def driver_select_screen():
+    return rx.vstack(
+        rx.heading("Выберите машину", color=text(), size="6"),
+        segmented_control(["Город", "Область"], DriverState.source, DriverState.set_source),
+        rx.vstack(
+            *[driver_vehicle_button(key, label, color) for key, label, color in DRIVER_VEHICLES],
+            spacing="3",
+            width="100%",
+        ),
+        spacing="5",
+        width="100%",
+        max_width="420px",
+        padding="24px",
+    )
+
+
+def driver_upload_box():
+    return rx.vstack(
+        rx.upload(
+            rx.vstack(
+                fa_icon(tag="camera", size=22, color=ACCENT),
+                rx.text(
+                    "Нажмите, чтобы сфотографировать накладную",
+                    color=muted(), font_size="13px", text_align="center",
+                ),
+                align="center",
+                spacing="2",
+            ),
+            id=INVOICE_UPLOAD_ID,
+            accept={"image/*": [".jpg", ".jpeg", ".png"]},
+            max_files=1,
+            border=f"1px dashed {border()}",
+            border_radius="10px",
+            background=surface_alt(),
+            padding="18px",
+            width="100%",
+            cursor="pointer",
+        ),
+        rx.hstack(
+            rx.button(
+                "Сохранить",
+                on_click=DriverState.handle_invoice_upload(rx.upload_files(upload_id=INVOICE_UPLOAD_ID)),
+                height="42px",
+                width="100%",
+                border_radius="9px",
+                background=ACCENT,
+                color="white",
+                font_weight="700",
+                cursor="pointer",
+            ),
+            rx.button(
+                "Отмена",
+                on_click=DriverState.cancel_upload,
+                height="42px",
+                width="120px",
+                border_radius="9px",
+                background=surface_alt(),
+                color=text(),
+                cursor="pointer",
+            ),
+            width="100%",
+            spacing="2",
+        ),
+        rx.cond(
+            DriverState.upload_status != "",
+            rx.text(DriverState.upload_status, color=muted(), font_size="12px"),
+            rx.box(),
+        ),
+        spacing="3",
+        width="100%",
+        padding="12px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface(),
+    )
+
+
+def driver_stop_card(stop):
+    return rx.vstack(
+        rx.hstack(
+            rx.cond(
+                stop["status"] == "done",
+                fa_icon(tag="circle_check", size=20, color=ACCENT),
+                fa_icon(tag="circle", size=20, color=muted()),
+            ),
+            rx.text(stop["name"], color=text(), font_size="16px", font_weight="700"),
+            rx.spacer(),
+            rx.cond(
+                stop["status"] == "done",
+                rx.text(stop["done_at"], color=muted(), font_size="12px"),
+                rx.box(),
+            ),
+            width="100%",
+            align="center",
+            spacing="3",
+        ),
+        rx.cond(
+            stop["status"] == "done",
+            rx.image(
+                src=f"/_upload/{stop['photo']}",
+                width="100%", max_height="160px",
+                object_fit="cover", border_radius="8px",
+            ),
+            rx.cond(
+                DriverState.active_stop == stop["name"],
+                driver_upload_box(),
+                rx.button(
+                    "Закрыть магазин",
+                    on_click=DriverState.open_upload(stop["name"]),
+                    width="100%",
+                    height="46px",
+                    border_radius="9px",
+                    background=ACCENT,
+                    color="white",
+                    font_weight="700",
+                    cursor="pointer",
+                ),
+            ),
+        ),
+        align="start",
+        spacing="3",
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface(),
+        width="100%",
+    )
+
+
+def driver_stops_screen():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading(DriverState.vehicle_label, color=text(), size="6"),
+                rx.text("Список магазинов на сегодня", color=muted(), font_size="13px"),
+                align="start",
+                spacing="1",
+            ),
+            rx.spacer(),
+            secondary_button("Сменить машину", on_click=DriverState.change_vehicle, width="170px"),
+            width="100%",
+            align="center",
+        ),
+        rx.box(
+            id="driver-vehicle-meta",
+            custom_attrs={"data-vehicle": DriverState.vehicle_key},
+            display="none",
+        ),
+        rx.script(GPS_WATCH_JS),
+        rx.vstack(
+            rx.foreach(DriverState.stops, driver_stop_card),
+            spacing="3",
+            width="100%",
+        ),
+        spacing="4",
+        width="100%",
+        max_width="480px",
+        padding="20px",
+    )
+
+
+def driver_page():
+    return rx.center(
+        rx.cond(
+            DriverState.vehicle_key == "",
+            driver_select_screen(),
+            driver_stops_screen(),
+        ),
+        width="100%",
+        min_height="100vh",
+        background=page_bg(),
+    )
+
+
+app = rx.App(
+    api_transformer=custom_api,
+    stylesheets=[
+        "https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700;800&display=swap",
+    ],
+    style={
+        "font_family": "'Roboto', sans-serif",
+        "--default-font-family": "'Roboto', sans-serif",
+    },
+)
 app.add_page(dashboard, route="/", title="Обработка заказов", on_load=State.load_history)
+app.add_page(driver_page, route="/driver", title="Водитель")

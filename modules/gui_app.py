@@ -18,6 +18,7 @@ from modules.styles import (
     purple_fill,
     conflict_fill,
 )
+from modules.history import record_processing
 from modules.file_selector import ORDERS_FOLDER
 from modules.output_writer import PROCESSED_FOLDER
 from modules.logger import LOGS_FOLDER
@@ -212,6 +213,8 @@ class App:
                 conflict_fill,
             )
 
+            record_processing(os.path.basename(input_file), stats)
+
             summary = format_summary(output_file, stats, log_file)
             self.result_queue.put(("ok", summary))
 
@@ -257,6 +260,13 @@ class App:
         for root_dir, _, files in os.walk(PROCESSED_FOLDER):
 
             for name in files:
+
+                # ~$... — временные файлы блокировки, которые Excel создаёт
+                # рядом с открытым документом. Расширение у них тоже .xlsx,
+                # поэтому без явной проверки они попадали в список как
+                # мусорные строки, которые невозможно открыть.
+                if name.startswith("~$"):
+                    continue
 
                 if name.endswith((".xlsx", ".xlsm")):
 
