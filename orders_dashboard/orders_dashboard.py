@@ -193,13 +193,10 @@ def append_route_backup(source: str, routes: dict, note: str) -> str:
     return label
 
 
-def routes_dict(route_1, route_2, route_3, route_4) -> dict:
-    return {
-        "route_1": list(route_1),
-        "route_2": list(route_2),
-        "route_3": list(route_3),
-        "route_4": list(route_4),
-    }
+def routes_dict(route_stores) -> dict:
+    """Списки маршрутов (по индексам) -> структура для stores_*.json."""
+
+    return {key: list(names) for key, names in zip(ROUTE_KEYS, route_stores)}
 
 
 def load_volume_history():
@@ -270,10 +267,7 @@ class State(rx.State):
     output_file: str = ""
     log_file: str = ""
     grand_total: str = "0"
-    route_1_total: str = "0"
-    route_2_total: str = "0"
-    route_3_total: str = "0"
-    route_4_total: str = "0"
+    route_totals: list[str] = ["0", "0", "0", "0"]
     conflict_count: int = 0
     unknown_count: int = 0
     error_text: str = ""
@@ -292,14 +286,9 @@ class State(rx.State):
     current_page: str = "Dashboard"
 
     routes_source: str = "Область"
-    route_1_stores: list[str] = []
-    route_2_stores: list[str] = []
-    route_3_stores: list[str] = []
-    route_4_stores: list[str] = []
-    new_store_1: str = ""
-    new_store_2: str = ""
-    new_store_3: str = ""
-    new_store_4: str = ""
+    # Списки по маршрутам (индексы 0..3 соответствуют ROUTE_KEYS).
+    route_stores: list[list[str]] = [[], [], [], []]
+    new_store_inputs: list[str] = ["", "", "", ""]
     routes_status: str = ""
     route_backup_labels: list[str] = []
     selected_route_backup: str = ""
@@ -332,13 +321,13 @@ class State(rx.State):
         elif page == "Трекинг" and not self.vehicles:
             self.init_tracking()
 
+    @property
+    def stores_file(self) -> str:
+        return "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
+
     def load_routes(self):
-        stores_file = "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
-        data = load_stores(stores_file)
-        self.route_1_stores = list(data.get("route_1", []))
-        self.route_2_stores = list(data.get("route_2", []))
-        self.route_3_stores = list(data.get("route_3", []))
-        self.route_4_stores = list(data.get("route_4", []))
+        data = load_stores(self.stores_file)
+        self.route_stores = [list(data.get(key, [])) for key in ROUTE_KEYS]
         self.routes_status = ""
         self.refresh_route_backups()
 
@@ -357,12 +346,7 @@ class State(rx.State):
     def create_route_backup(self):
         label = append_route_backup(
             self.routes_source,
-            routes_dict(
-                self.route_1_stores,
-                self.route_2_stores,
-                self.route_3_stores,
-                self.route_4_stores,
-            ),
+            routes_dict(self.route_stores),
             "вручную",
         )
 
@@ -382,10 +366,7 @@ class State(rx.State):
                 continue
 
             routes = item.get("routes", {})
-            self.route_1_stores = list(routes.get("route_1", []))
-            self.route_2_stores = list(routes.get("route_2", []))
-            self.route_3_stores = list(routes.get("route_3", []))
-            self.route_4_stores = list(routes.get("route_4", []))
+            self.route_stores = [list(routes.get(key, [])) for key in ROUTE_KEYS]
             self.routes_status = (
                 f"Загружена копия «{self.selected_route_backup}». "
                 "Нажмите «Сохранить маршруты», чтобы применить её."
@@ -399,56 +380,30 @@ class State(rx.State):
         self.routes_source = value
         self.load_routes()
 
-    def set_new_store_1(self, value: str):
-        self.new_store_1 = value
+    def set_new_store(self, index: int, value: str):
+        inputs = list(self.new_store_inputs)
+        inputs[index] = value
+        self.new_store_inputs = inputs
 
-    def set_new_store_2(self, value: str):
-        self.new_store_2 = value
+    def add_store(self, index: int):
+        value = self.new_store_inputs[index].strip()
 
-    def set_new_store_3(self, value: str):
-        self.new_store_3 = value
+        if value and value not in self.route_stores[index]:
+            routes = [list(names) for names in self.route_stores]
+            routes[index].append(value)
+            self.route_stores = routes
 
-    def set_new_store_4(self, value: str):
-        self.new_store_4 = value
+        inputs = list(self.new_store_inputs)
+        inputs[index] = ""
+        self.new_store_inputs = inputs
 
-    def add_store_1(self):
-        value = self.new_store_1.strip()
-        if value and value not in self.route_1_stores:
-            self.route_1_stores = self.route_1_stores + [value]
-        self.new_store_1 = ""
-
-    def add_store_2(self):
-        value = self.new_store_2.strip()
-        if value and value not in self.route_2_stores:
-            self.route_2_stores = self.route_2_stores + [value]
-        self.new_store_2 = ""
-
-    def add_store_3(self):
-        value = self.new_store_3.strip()
-        if value and value not in self.route_3_stores:
-            self.route_3_stores = self.route_3_stores + [value]
-        self.new_store_3 = ""
-
-    def add_store_4(self):
-        value = self.new_store_4.strip()
-        if value and value not in self.route_4_stores:
-            self.route_4_stores = self.route_4_stores + [value]
-        self.new_store_4 = ""
-
-    def remove_store_1(self, name: str):
-        self.route_1_stores = [item for item in self.route_1_stores if item != name]
-
-    def remove_store_2(self, name: str):
-        self.route_2_stores = [item for item in self.route_2_stores if item != name]
-
-    def remove_store_3(self, name: str):
-        self.route_3_stores = [item for item in self.route_3_stores if item != name]
-
-    def remove_store_4(self, name: str):
-        self.route_4_stores = [item for item in self.route_4_stores if item != name]
+    def remove_store(self, index: int, name: str):
+        routes = [list(names) for names in self.route_stores]
+        routes[index] = [item for item in routes[index] if item != name]
+        self.route_stores = routes
 
     def save_routes(self):
-        stores_file = "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
+        stores_file = self.stores_file
 
         # Прежнее содержимое файла уходит в копию — так к нему можно
         # вернуться через выпадающий список, если новая версия не подошла.
@@ -460,13 +415,7 @@ class State(rx.State):
         if previous:
             append_route_backup(self.routes_source, previous, "перед сохранением")
 
-        data = routes_dict(
-            self.route_1_stores,
-            self.route_2_stores,
-            self.route_3_stores,
-            self.route_4_stores,
-        )
-        save_stores(data, stores_file)
+        save_stores(routes_dict(self.route_stores), stores_file)
 
         self.refresh_route_backups()
         self.routes_status = f"Сохранено в {stores_file}"
@@ -712,10 +661,7 @@ class State(rx.State):
             while len(route_totals) < 4:
                 route_totals.append(0)
 
-            self.route_1_total = format_number(route_totals[0])
-            self.route_2_total = format_number(route_totals[1])
-            self.route_3_total = format_number(route_totals[2])
-            self.route_4_total = format_number(route_totals[3])
+            self.route_totals = [format_number(total) for total in route_totals]
             self.grand_total = format_number(sum(route_totals))
             self.conflict_count = int(stats.get("conflict_count", 0))
             self.unknown_count = len(stats.get("unknown_stores", []))
@@ -1130,10 +1076,10 @@ def processing_summary():
             width="100%",
         ),
         rx.vstack(
-            route_result("Маршрут №1", State.route_1_total),
-            route_result("Маршрут №2", State.route_2_total),
-            route_result("Маршрут №3", State.route_3_total),
-            route_result("Маршрут №4", State.route_4_total),
+            *[
+                route_result(f"Маршрут №{index + 1}", State.route_totals[index])
+                for index in range(len(ROUTE_KEYS))
+            ],
             spacing="2",
             width="100%",
         ),
@@ -1386,16 +1332,19 @@ def store_row(name, on_remove):
     )
 
 
-def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
+def route_edit_card(index: int):
     return rx.vstack(
         rx.hstack(
             fa_icon(tag="route", size=15, color=text()),
-            rx.text(title, color=text(), font_size="15px", font_weight="800"),
+            rx.text(f"Маршрут №{index + 1}", color=text(), font_size="15px", font_weight="800"),
             spacing="2",
             align="center",
         ),
         rx.vstack(
-            rx.foreach(stores, lambda name: store_row(name, on_remove)),
+            rx.foreach(
+                State.route_stores[index],
+                lambda name: store_row(name, lambda value: State.remove_store(index, value)),
+            ),
             spacing="1",
             width="100%",
             max_height="220px",
@@ -1404,11 +1353,16 @@ def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
         rx.hstack(
             rx.input(
                 placeholder="Название магазина",
-                value=new_value,
-                on_change=on_change,
+                value=State.new_store_inputs[index],
+                on_change=lambda value: State.set_new_store(index, value),
                 width="100%",
             ),
-            rx.button(fa_icon(tag="plus", size=15), "Добавить", on_click=on_add, height="36px"),
+            rx.button(
+                fa_icon(tag="plus", size=15),
+                "Добавить",
+                on_click=State.add_store(index),
+                height="36px",
+            ),
             width="100%",
             spacing="2",
         ),
@@ -1452,22 +1406,7 @@ def routes_page():
             actions=[segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source)],
         ),
         rx.grid(
-            route_edit_card(
-                "Маршрут №1", State.route_1_stores, State.new_store_1,
-                State.add_store_1, State.set_new_store_1, State.remove_store_1,
-            ),
-            route_edit_card(
-                "Маршрут №2", State.route_2_stores, State.new_store_2,
-                State.add_store_2, State.set_new_store_2, State.remove_store_2,
-            ),
-            route_edit_card(
-                "Маршрут №3", State.route_3_stores, State.new_store_3,
-                State.add_store_3, State.set_new_store_3, State.remove_store_3,
-            ),
-            route_edit_card(
-                "Маршрут №4", State.route_4_stores, State.new_store_4,
-                State.add_store_4, State.set_new_store_4, State.remove_store_4,
-            ),
+            *[route_edit_card(index) for index in range(len(ROUTE_KEYS))],
             columns="2",
             spacing="4",
             width="100%",

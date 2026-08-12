@@ -26,7 +26,7 @@ def load_processed_files():
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -95,7 +95,6 @@ def main():
     print(f"\nВыбран режим: {mode_name}")
     print(f"Файл магазинов: {stores_file}")
 
-    print(f"\nВыбран режим: {mode_name}")
     stores = load_stores(stores_file)
     fills = [green_fill, yellow_fill, blue_fill, purple_fill]
     groups = build_groups(stores, fills)
@@ -110,15 +109,6 @@ def main():
     print_summary(output_file, stats, log_file)
     save_processed_file(filename)
 
-KEYWORDS = [
-    "итого",
-    "итог",
-    "всего",
-    "итого:",
-    "итог:"
-]
-
-rows_to_delete = []
 
 if __name__ == "__main__":
     try:

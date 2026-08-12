@@ -17,8 +17,9 @@ reflex.lock/
 uploaded_files/
 tracking_data/
 
-# Локальные резервные копии маршрутов (создаются дашбордом при сохранении)
+# Данные, которые дашборд накапливает локально при работе
 route_backups.json
+volume_history.json
 
 # Ignore Excel files
 *.xlsx
