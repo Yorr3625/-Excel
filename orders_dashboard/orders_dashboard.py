@@ -12,6 +12,7 @@ from starlette.routing import Route
 
 from modules import driver_data, paths
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
+from modules.history import load_processed_files, load_volume_history, record_processing
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 from modules.tracking_sim import (
@@ -25,9 +26,21 @@ from modules.tracking_sim import (
 
 
 async def gps_ping(request: Request):
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": False, "error": "bad payload"}, status_code=400)
+
+    vehicle = payload.get("vehicle", "")
+
+    if not driver_data.is_valid_vehicle(vehicle):
+        return JSONResponse({"ok": False, "error": "unknown vehicle"}, status_code=400)
+
     driver_data.append_gps(
-        payload.get("vehicle", ""),
+        vehicle,
         payload.get("lat"),
         payload.get("lon"),
         payload.get("speed"),
@@ -89,8 +102,6 @@ ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
-PROCESSED_FILES = paths.PROCESSED_FILES_FILE
-VOLUME_HISTORY_FILE = paths.VOLUME_HISTORY_FILE
 VOLUME_CHART_DAYS = 31
 ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
@@ -133,25 +144,6 @@ SETTINGS_LABELS = {
         "Выводить подробный текст ошибки обработки на экран.",
     ),
 }
-
-
-def load_processed_files():
-    if not PROCESSED_FILES.exists():
-        return {}
-
-    try:
-        return json.loads(PROCESSED_FILES.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_processed_file(filename: str):
-    data = load_processed_files()
-    data[filename] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    PROCESSED_FILES.write_text(
-        json.dumps(data, ensure_ascii=False, indent=4),
-        encoding="utf-8",
-    )
 
 
 def load_route_backups():
@@ -197,31 +189,6 @@ def routes_dict(route_stores) -> dict:
     """Списки маршрутов (по индексам) -> структура для stores_*.json."""
 
     return {key: list(names) for key, names in zip(ROUTE_KEYS, route_stores)}
-
-
-def load_volume_history():
-    if not VOLUME_HISTORY_FILE.exists():
-        return []
-
-    try:
-        return json.loads(VOLUME_HISTORY_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def save_volume_record(route_totals):
-    records = load_volume_history()
-    records.append({
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "route_1": route_totals[0],
-        "route_2": route_totals[1],
-        "route_3": route_totals[2],
-        "route_4": route_totals[3],
-    })
-    VOLUME_HISTORY_FILE.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
 
 def build_volume_chart_data():
@@ -669,8 +636,7 @@ class State(rx.State):
             self.log_file = str(log_file)
             self.status = "Обработка завершена"
 
-            save_processed_file(self.selected_file)
-            save_volume_record(route_totals)
+            record_processing(self.selected_file, stats)
             self.load_history()
 
         except Exception:

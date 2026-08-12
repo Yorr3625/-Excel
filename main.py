@@ -1,9 +1,8 @@
-import json
 from pathlib import Path
-from datetime import datetime
 
 from modules import paths
 from modules.config import load_settings, load_stores, build_groups
+from modules.history import load_processed_files, record_processing
 from modules.styles import (
     green_fill,
     yellow_fill,
@@ -15,29 +14,6 @@ from modules.file_selector import select_order_file
 from modules.pipeline import process_order
 from modules.reporter import print_summary
 
-
-
-LOG_FILE = paths.PROCESSED_FILES_FILE
-
-
-def load_processed_files():
-    if not Path(LOG_FILE).exists():
-        return {}
-
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_processed_file(filename):
-    data = load_processed_files()
-
-    data[filename] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
 
 def main():
 
@@ -108,7 +84,7 @@ def main():
     )
 
     print_summary(output_file, stats, log_file)
-    save_processed_file(filename)
+    record_processing(filename, stats)
 
 
 if __name__ == "__main__":

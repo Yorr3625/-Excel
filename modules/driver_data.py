@@ -7,12 +7,26 @@ from modules.paths import TRACKING_FOLDER as DATA_DIR
 
 TRAIL_LIMIT = 100
 
+# Машина = маршрут; других ключей быть не может. Список нужен как белый
+# список: vehicle_key приходит в том числе из тела HTTP-запроса
+# (/api/gps-ping), а дальше подставляется в имя файла — без проверки
+# значение вида "../../config/stores_city" уводило запись за пределы
+# папки с данными.
+ALLOWED_VEHICLE_KEYS = ("route_1", "route_2", "route_3", "route_4")
+
+
+def is_valid_vehicle(vehicle_key: str) -> bool:
+    return vehicle_key in ALLOWED_VEHICLE_KEYS
+
 
 def today_key() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
 def _file_path(vehicle_key: str, day: str | None = None) -> Path:
+    if not is_valid_vehicle(vehicle_key):
+        raise ValueError(f"Неизвестная машина: {vehicle_key!r}")
+
     return DATA_DIR / f"{day or today_key()}_{vehicle_key}.json"
 
 
@@ -79,7 +93,7 @@ def mark_stop_done(vehicle_key: str, stores_file: str, stop_name: str, photo_rel
 
 
 def append_gps(vehicle_key: str, lat, lon, speed) -> None:
-    if not vehicle_key or lat is None or lon is None:
+    if not is_valid_vehicle(vehicle_key) or lat is None or lon is None:
         return
 
     path = _file_path(vehicle_key)
