@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import json
 import traceback
@@ -38,11 +38,63 @@ async def gps_ping(request: Request):
 custom_api = Starlette(routes=[Route("/api/gps-ping", gps_ping, methods=["POST"])])
 
 
+FA_ICON_MAP = {
+    "layout_dashboard": "FaGauge",
+    "package": "FaBox",
+    "route": "FaRoute",
+    "truck": "FaTruck",
+    "history": "FaClockRotateLeft",
+    "settings": "FaGear",
+    "boxes": "FaBoxesStacked",
+    "sun": "FaSun",
+    "moon": "FaMoon",
+    "upload": "FaUpload",
+    "file_spreadsheet": "FaFileExcel",
+    "chart_no_axes_column": "FaChartColumn",
+    "map": "FaMap",
+    "award": "FaAward",
+    "list": "FaList",
+    "map_pin": "FaLocationDot",
+    "x": "FaXmark",
+    "plus": "FaPlus",
+    "camera": "FaCamera",
+    "circle_check": "FaCircleCheck",
+    "circle": "FaCircle",
+    "store": "FaStore",
+    "fuel": "FaGasPump",
+    "triangle_alert": "FaTriangleExclamation",
+}
+
+
+class FaIcon(rx.Component):
+    """Font Awesome 6 icon, loaded from the react-icons/fa6 package."""
+
+    library = "react-icons/fa6"
+    tag = "FaCircleQuestion"
+
+    size: rx.Var[int]
+    color: rx.Var[str]
+
+    @classmethod
+    def create(cls, **props):
+        name = props.pop("tag", "")
+        props["tag"] = FA_ICON_MAP.get(name, "FaCircleQuestion")
+        return super().create(**props)
+
+
+fa_icon = FaIcon.create
+
+
 ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
 PROCESSED_FILES = Path("processed_files.json")
+VOLUME_HISTORY_FILE = Path("volume_history.json")
+VOLUME_CHART_DAYS = 31
+ROUTE_BACKUPS_FILE = Path("route_backups.json")
+MAX_ROUTE_BACKUPS = 20
+VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3", "Маршрут 4"]
 
 NAV_ITEMS = [
     ("Dashboard", "layout_dashboard"),
@@ -102,6 +154,107 @@ def save_processed_file(filename: str):
     )
 
 
+def load_route_backups():
+    if not ROUTE_BACKUPS_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(ROUTE_BACKUPS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def append_route_backup(source: str, routes: dict, note: str) -> str:
+    """Кладёт копию маршрутов в начало списка и возвращает её подпись."""
+
+    data = load_route_backups()
+    items = data.get(source, [])
+
+    # Подпись — это и значение в выпадающем списке, и ключ поиска при
+    # восстановлении, поэтому она должна быть уникальной: две копии,
+    # созданные в одну секунду, иначе стали бы неразличимы.
+    base_label = f"{datetime.now():%d.%m.%Y %H:%M:%S} — {note}"
+    existing = {item.get("label") for item in items}
+    label = base_label
+    suffix = 2
+
+    while label in existing:
+        label = f"{base_label} ({suffix})"
+        suffix += 1
+
+    items.insert(0, {"label": label, "routes": routes})
+    data[source] = items[:MAX_ROUTE_BACKUPS]
+
+    ROUTE_BACKUPS_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return label
+
+
+def routes_dict(route_1, route_2, route_3, route_4) -> dict:
+    return {
+        "route_1": list(route_1),
+        "route_2": list(route_2),
+        "route_3": list(route_3),
+        "route_4": list(route_4),
+    }
+
+
+def load_volume_history():
+    if not VOLUME_HISTORY_FILE.exists():
+        return []
+
+    try:
+        return json.loads(VOLUME_HISTORY_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_volume_record(route_totals):
+    records = load_volume_history()
+    records.append({
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "route_1": route_totals[0],
+        "route_2": route_totals[1],
+        "route_3": route_totals[2],
+        "route_4": route_totals[3],
+    })
+    VOLUME_HISTORY_FILE.write_text(
+        json.dumps(records, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def build_volume_chart_data():
+    daily = {}
+
+    for record in load_volume_history():
+        date = record.get("date")
+        if not date:
+            continue
+
+        bucket = daily.setdefault(date, [0.0, 0.0, 0.0, 0.0])
+        for index, key in enumerate(("route_1", "route_2", "route_3", "route_4")):
+            bucket[index] += float(record.get(key) or 0)
+
+    today = datetime.now().date()
+    chart = []
+
+    for offset in range(VOLUME_CHART_DAYS - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        totals = daily.get(day.strftime("%Y-%m-%d"), [0.0, 0.0, 0.0, 0.0])
+
+        point = {"date": day.strftime("%d.%m")}
+        for label, total in zip(VOLUME_ROUTE_LABELS, totals):
+            point[label] = round(total)
+
+        chart.append(point)
+
+    return chart
+
+
 def format_number(value):
     return f"{float(value):,.0f}".replace(",", " ")
 
@@ -134,6 +287,7 @@ class State(rx.State):
     orders_today_count: int = 0
     orders_total_count: int = 0
     stores_total_count: int = 0
+    volume_chart_data: list[dict] = []
 
     current_page: str = "Dashboard"
 
@@ -147,6 +301,8 @@ class State(rx.State):
     new_store_3: str = ""
     new_store_4: str = ""
     routes_status: str = ""
+    route_backup_labels: list[str] = []
+    selected_route_backup: str = ""
 
     tracking_source: str = "Область"
     tracking_running: bool = False
@@ -184,6 +340,60 @@ class State(rx.State):
         self.route_3_stores = list(data.get("route_3", []))
         self.route_4_stores = list(data.get("route_4", []))
         self.routes_status = ""
+        self.refresh_route_backups()
+
+    def refresh_route_backups(self):
+        data = load_route_backups()
+        self.route_backup_labels = [
+            item.get("label", "") for item in data.get(self.routes_source, [])
+        ]
+
+        if self.selected_route_backup not in self.route_backup_labels:
+            self.selected_route_backup = ""
+
+    def set_selected_route_backup(self, value: str):
+        self.selected_route_backup = value
+
+    def create_route_backup(self):
+        label = append_route_backup(
+            self.routes_source,
+            routes_dict(
+                self.route_1_stores,
+                self.route_2_stores,
+                self.route_3_stores,
+                self.route_4_stores,
+            ),
+            "вручную",
+        )
+
+        self.refresh_route_backups()
+        self.selected_route_backup = label
+        self.routes_status = f"Копия создана: {label}"
+
+    def restore_route_backup(self):
+        if not self.selected_route_backup:
+            self.routes_status = "Сначала выберите копию в списке"
+            return
+
+        data = load_route_backups()
+
+        for item in data.get(self.routes_source, []):
+            if item.get("label") != self.selected_route_backup:
+                continue
+
+            routes = item.get("routes", {})
+            self.route_1_stores = list(routes.get("route_1", []))
+            self.route_2_stores = list(routes.get("route_2", []))
+            self.route_3_stores = list(routes.get("route_3", []))
+            self.route_4_stores = list(routes.get("route_4", []))
+            self.routes_status = (
+                f"Загружена копия «{self.selected_route_backup}». "
+                "Нажмите «Сохранить маршруты», чтобы применить её."
+            )
+            return
+
+        self.routes_status = "Копия не найдена — обновите список"
+        self.refresh_route_backups()
 
     def set_routes_source(self, value: str):
         self.routes_source = value
@@ -239,13 +449,26 @@ class State(rx.State):
 
     def save_routes(self):
         stores_file = "stores_city.json" if self.routes_source == "Город" else "stores_region.json"
-        data = {
-            "route_1": self.route_1_stores,
-            "route_2": self.route_2_stores,
-            "route_3": self.route_3_stores,
-            "route_4": self.route_4_stores,
-        }
+
+        # Прежнее содержимое файла уходит в копию — так к нему можно
+        # вернуться через выпадающий список, если новая версия не подошла.
+        try:
+            previous = load_stores(stores_file)
+        except (OSError, ValueError):
+            previous = None
+
+        if previous:
+            append_route_backup(self.routes_source, previous, "перед сохранением")
+
+        data = routes_dict(
+            self.route_1_stores,
+            self.route_2_stores,
+            self.route_3_stores,
+            self.route_4_stores,
+        )
         save_stores(data, stores_file)
+
+        self.refresh_route_backups()
         self.routes_status = f"Сохранено в {stores_file}"
 
     def load_settings_form(self):
@@ -390,6 +613,10 @@ class State(rx.State):
         self.orders_today_count = sum(1 for ts in data.values() if ts.startswith(today))
 
         self.refresh_stores_total()
+        self.volume_chart_data = build_volume_chart_data()
+
+        if not self.vehicles:
+            self.init_tracking()
 
     def refresh_stores_total(self):
         total = 0
@@ -497,6 +724,7 @@ class State(rx.State):
             self.status = "Обработка завершена"
 
             save_processed_file(self.selected_file)
+            save_volume_record(route_totals)
             self.load_history()
 
         except Exception:
@@ -575,7 +803,7 @@ def nav_button(label: str, icon: str):
     active = State.current_page == label
 
     return rx.button(
-        rx.icon(tag=icon, size=17),
+        fa_icon(tag=icon, size=17),
         rx.text(label, font_size="14px"),
         on_click=State.set_page(label),
         width="100%",
@@ -632,7 +860,7 @@ def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
 
     return rx.hstack(
         rx.box(
-            rx.icon(tag=icon, size=20, color=color),
+            fa_icon(tag=icon, size=20, color=color),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -663,7 +891,7 @@ def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
 def sidebar_logo():
     return rx.hstack(
         rx.box(
-            rx.icon(tag="boxes", size=18, color="white"),
+            fa_icon(tag="boxes", size=18, color="white"),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -686,7 +914,11 @@ def sidebar_logo():
 
 def theme_switch_row():
     return rx.hstack(
-        rx.icon(tag=rx.cond(State.theme == "light", "sun", "moon"), size=16, color=muted()),
+        rx.cond(
+            State.theme == "light",
+            fa_icon(tag="sun", size=16, color=muted()),
+            fa_icon(tag="moon", size=16, color=muted()),
+        ),
         rx.text("Тёмная тема", color=text(), font_size="13px", font_weight="600"),
         rx.spacer(),
         rx.switch(
@@ -735,7 +967,7 @@ def upload_area():
     return rx.upload(
         rx.hstack(
             rx.box(
-                rx.icon(tag="upload", size=18, color=ICON_TINTS["green"][0]),
+                fa_icon(tag="upload", size=18, color=ICON_TINTS["green"][0]),
                 display="flex",
                 align_items="center",
                 justify_content="center",
@@ -922,7 +1154,7 @@ def processing_summary():
 def history_panel():
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="history", size=17, color=text()),
+            fa_icon(tag="history", size=17, color=text()),
             rx.heading("Последние обработки", color=text(), size="4"),
             spacing="2",
             align="center",
@@ -948,7 +1180,7 @@ def history_panel():
 def history_row(filename, time):
     return rx.hstack(
         rx.box(
-            rx.icon(tag="file_spreadsheet", size=16, color=muted()),
+            fa_icon(tag="file_spreadsheet", size=16, color=muted()),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -1002,11 +1234,87 @@ def topbar(title: str, subtitle: str, actions=None):
     )
 
 
+def panel_shell(*children):
+    return rx.vstack(
+        *children,
+        align="start",
+        spacing="4",
+        padding="24px",
+        border=f"1px solid {border()}",
+        border_radius="14px",
+        background=surface(),
+        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+        width="100%",
+    )
+
+
+def panel_title(icon: str, title: str):
+    return rx.hstack(
+        fa_icon(tag=icon, size=17, color=text()),
+        rx.heading(title, color=text(), size="4"),
+        spacing="2",
+        align="center",
+    )
+
+
+def volume_chart_panel():
+    return panel_shell(
+        panel_title("chart_no_axes_column", "Вывезенный объём"),
+        muted_text(f"Сумма по маршрутам за последние {VOLUME_CHART_DAYS} дней", size="12px"),
+        rx.recharts.responsive_container(
+            rx.recharts.bar_chart(
+                rx.recharts.cartesian_grid(stroke_dasharray="3 3", stroke=border()),
+                rx.recharts.x_axis(data_key="date", stroke=muted(), interval=2),
+                rx.recharts.y_axis(stroke=muted()),
+                rx.recharts.tooltip(),
+                rx.recharts.legend(),
+                rx.recharts.bar(data_key="Маршрут 1", stack_id="a", fill=ROUTE_COLORS[0]),
+                rx.recharts.bar(data_key="Маршрут 2", stack_id="a", fill=ROUTE_COLORS[1]),
+                rx.recharts.bar(data_key="Маршрут 3", stack_id="a", fill=ROUTE_COLORS[2]),
+                rx.recharts.bar(data_key="Маршрут 4", stack_id="a", fill=ROUTE_COLORS[3]),
+                data=State.volume_chart_data,
+                margin={"left": 0, "right": 8, "top": 4, "bottom": 0},
+            ),
+            width="100%",
+            height=280,
+        ),
+    )
+
+
+def dashboard_tracking_preview():
+    return panel_shell(
+        rx.hstack(
+            panel_title("truck", "Трекинг машин"),
+            rx.spacer(),
+            rx.cond(
+                State.tracking_running,
+                rx.badge("В движении", color_scheme="green", variant="soft"),
+                rx.badge("Остановлено", color_scheme="gray", variant="soft"),
+            ),
+            width="100%",
+            align="center",
+        ),
+        rx.box(
+            rx.html(State.map_svg),
+            width="100%",
+            border_radius="10px",
+            background=surface_alt(),
+            padding="12px",
+            overflow="hidden",
+        ),
+        secondary_button(
+            "Открыть Трекинг",
+            on_click=State.set_page("Трекинг"),
+            width="100%",
+        ),
+    )
+
+
 def overview_page():
     return page_shell(
         topbar(
             "Dashboard",
-            "Загрузка заказа, выбор режима и запуск обработки в одном аккуратном рабочем блоке.",
+            "Обзор: заказы, магазины и маршруты — и переход в нужный раздел.",
         ),
         rx.grid(
             stat_card(
@@ -1029,8 +1337,8 @@ def overview_page():
             width="100%",
         ),
         rx.grid(
-            order_panel(),
-            history_panel(),
+            volume_chart_panel(),
+            dashboard_tracking_preview(),
             columns="2",
             spacing="4",
             width="100%",
@@ -1058,11 +1366,11 @@ def history_page():
 
 def store_row(name, on_remove):
     return rx.hstack(
-        rx.icon(tag="map_pin", size=13, color=muted()),
+        fa_icon(tag="map_pin", size=13, color=muted()),
         rx.text(name, color=text(), font_size="13px"),
         rx.spacer(),
         rx.button(
-            rx.icon(tag="x", size=13),
+            fa_icon(tag="x", size=13),
             on_click=on_remove(name),
             size="1",
             variant="ghost",
@@ -1081,7 +1389,7 @@ def store_row(name, on_remove):
 def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="route", size=15, color=text()),
+            fa_icon(tag="route", size=15, color=text()),
             rx.text(title, color=text(), font_size="15px", font_weight="800"),
             spacing="2",
             align="center",
@@ -1100,7 +1408,7 @@ def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
                 on_change=on_change,
                 width="100%",
             ),
-            rx.button(rx.icon(tag="plus", size=15), "Добавить", on_click=on_add, height="36px"),
+            rx.button(fa_icon(tag="plus", size=15), "Добавить", on_click=on_add, height="36px"),
             width="100%",
             spacing="2",
         ),
@@ -1112,6 +1420,27 @@ def route_edit_card(title, stores, new_value, on_add, on_change, on_remove):
         background=surface(),
         box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
+    )
+
+
+def routes_backup_bar():
+    return rx.hstack(
+        primary_button("Сохранить маршруты", on_click=State.save_routes, width="210px"),
+        secondary_button("Создать копию", on_click=State.create_route_backup, width="165px"),
+        rx.spacer(),
+        fa_icon(tag="history", size=15, color=muted()),
+        rx.select(
+            State.route_backup_labels,
+            value=State.selected_route_backup,
+            on_change=State.set_selected_route_backup,
+            placeholder="Резервные копии",
+            width="270px",
+        ),
+        secondary_button("Восстановить", on_click=State.restore_route_backup, width="150px"),
+        spacing="3",
+        align="center",
+        width="100%",
+        wrap="wrap",
     )
 
 
@@ -1143,11 +1472,11 @@ def routes_page():
             spacing="4",
             width="100%",
         ),
-        rx.hstack(
-            primary_button("Сохранить маршруты", on_click=State.save_routes, width="220px"),
+        routes_backup_bar(),
+        rx.cond(
+            State.routes_status != "",
             rx.text(State.routes_status, color=muted(), font_size="13px"),
-            spacing="4",
-            align="center",
+            rx.box(),
         ),
     )
 
@@ -1195,7 +1524,7 @@ def tracking_legend():
 def tracking_map_panel():
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="map", size=17, color=text()),
+            fa_icon(tag="map", size=17, color=text()),
             rx.heading("Карта маршрутов", color=text(), size="4"),
             spacing="2",
             align="center",
@@ -1297,7 +1626,7 @@ def rating_row(v):
 def rating_panel():
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="award", size=17, color=text()),
+            fa_icon(tag="award", size=17, color=text()),
             rx.heading("Рейтинг водителей", color=text(), size="4"),
             spacing="2",
             align="center",
@@ -1321,7 +1650,7 @@ def rating_panel():
 def event_log_panel():
     return rx.vstack(
         rx.hstack(
-            rx.icon(tag="list", size=17, color=text()),
+            fa_icon(tag="list", size=17, color=text()),
             rx.heading("Журнал событий", color=text(), size="4"),
             spacing="2",
             align="center",
@@ -1415,10 +1744,10 @@ def simulation_section():
 
 def real_stop_row(stop):
     return rx.hstack(
-        rx.icon(
-            tag=rx.cond(stop["status"] == "done", "circle_check", "circle"),
-            size=14,
-            color=rx.cond(stop["status"] == "done", ACCENT, muted()),
+        rx.cond(
+            stop["status"] == "done",
+            fa_icon(tag="circle_check", size=14, color=ACCENT),
+            fa_icon(tag="circle", size=14, color=muted()),
         ),
         rx.text(stop["name"], color=text(), font_size="13px"),
         rx.spacer(),
@@ -1700,7 +2029,7 @@ class DriverState(rx.State):
 
 def driver_vehicle_button(key, label, color):
     return rx.button(
-        rx.icon(tag="truck", size=22, color="white"),
+        fa_icon(tag="truck", size=22, color="white"),
         rx.text(label, font_size="17px", font_weight="800", color="white"),
         on_click=DriverState.select_vehicle(key, label),
         width="100%",
@@ -1732,7 +2061,7 @@ def driver_upload_box():
     return rx.vstack(
         rx.upload(
             rx.vstack(
-                rx.icon(tag="camera", size=22, color=ACCENT),
+                fa_icon(tag="camera", size=22, color=ACCENT),
                 rx.text(
                     "Нажмите, чтобы сфотографировать накладную",
                     color=muted(), font_size="13px", text_align="center",
@@ -1792,10 +2121,10 @@ def driver_upload_box():
 def driver_stop_card(stop):
     return rx.vstack(
         rx.hstack(
-            rx.icon(
-                tag=rx.cond(stop["status"] == "done", "circle_check", "circle"),
-                size=20,
-                color=rx.cond(stop["status"] == "done", ACCENT, muted()),
+            rx.cond(
+                stop["status"] == "done",
+                fa_icon(tag="circle_check", size=20, color=ACCENT),
+                fa_icon(tag="circle", size=20, color=muted()),
             ),
             rx.text(stop["name"], color=text(), font_size="16px", font_weight="700"),
             rx.spacer(),
@@ -1886,6 +2215,15 @@ def driver_page():
     )
 
 
-app = rx.App(api_transformer=custom_api)
+app = rx.App(
+    api_transformer=custom_api,
+    stylesheets=[
+        "https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700;800&display=swap",
+    ],
+    style={
+        "font_family": "'Roboto', sans-serif",
+        "--default-font-family": "'Roboto', sans-serif",
+    },
+)
 app.add_page(dashboard, route="/", title="Обработка заказов", on_load=State.load_history)
 app.add_page(driver_page, route="/driver", title="Водитель")

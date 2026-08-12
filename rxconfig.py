@@ -13,6 +13,8 @@ import reflex as rx
 _RUNTIME_DIRS = ["orders", "processed_orders", "logs", "tracking_data"]
 _RUNTIME_FILES = [
     "processed_files.json",
+    "volume_history.json",
+    "route_backups.json",
     "settings.json",
     "stores.json",
     "stores_city.json",
