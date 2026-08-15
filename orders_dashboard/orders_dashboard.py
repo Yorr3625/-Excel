@@ -318,21 +318,8 @@ class State(rx.State):
         if not self.mail_configured:
             self.mail_status = "Почта не настроена"
 
-    def check_mail_now(self):
-        """Разовая проверка по кнопке."""
-
-        self.mail_checking = True
-        self.mail_error = ""
-        self.mail_status = "Проверяю почту..."
-
-        try:
-            result = check_mail()
-        except Exception:
-            self.mail_error = traceback.format_exc()
-            self.mail_status = "Ошибка при проверке почты"
-            return
-        finally:
-            self.mail_checking = False
+    def _apply_mail_result(self, result: dict):
+        """Раскладывает ответ check_mail по состоянию. Только внутри `async with self`."""
 
         if not result["ok"]:
             self.mail_error = result["error"]
@@ -368,6 +355,42 @@ class State(rx.State):
                 f"Найдено вложений: {len(found)}, подходящих заказов: {suitable}"
             )
 
+    async def _run_mail_check(self):
+        """Общая проверка для кнопки и автопроверки.
+
+        Поход в почту с разбором вложений занимает секунды (на шести письмах
+        около пятнадцати). Синхронный обработчик на это время подвесил бы
+        весь бэкенд и не показал бы промежуточный статус, поэтому работа
+        уходит в отдельный поток, а состояние обновляется по кусочкам.
+        """
+
+        async with self:
+            if self.mail_checking:
+                return
+
+            self.mail_checking = True
+            self.mail_error = ""
+            self.mail_status = "Проверяю почту..."
+
+        try:
+            result = await asyncio.to_thread(check_mail)
+        except Exception:
+            async with self:
+                self.mail_checking = False
+                self.mail_error = traceback.format_exc()
+                self.mail_status = "Ошибка при проверке почты"
+            return
+
+        async with self:
+            self.mail_checking = False
+            self._apply_mail_result(result)
+
+    @rx.event(background=True)
+    async def check_mail_now(self):
+        """Разовая проверка по кнопке."""
+
+        await self._run_mail_check()
+
     def toggle_mail_auto(self, enabled: bool):
         self.mail_auto = enabled
 
@@ -389,7 +412,8 @@ class State(rx.State):
             async with self:
                 if not self.mail_auto:
                     return
-                self.check_mail_now()
+
+            await self._run_mail_check()
 
     def take_mail_order(self, path: str, filename: str):
         """Берёт найденный файл в обработку на странице «Заказы»."""
