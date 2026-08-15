@@ -184,7 +184,12 @@ def test_attachment_name_is_sanitised_on_extraction():
 # --- сквозная проверка с поддельным IMAP ---
 
 
-def _letter_with_attachment(filename: str, payload: bytes, sender="boss@example.com"):
+def _letter_with_attachment(
+    filename: str,
+    payload: bytes,
+    sender="boss@example.com",
+    subject=mail_watcher.DEFAULT_ORDER_SUBJECT,
+):
     """Собирает настоящее письмо MIME с вложением.
 
     Политика SMTP нужна, чтобы кириллица в теме и имени файла кодировалась
@@ -197,7 +202,7 @@ def _letter_with_attachment(filename: str, payload: bytes, sender="boss@example.
     message = EmailMessage(policy=SMTP)
     message["From"] = sender
     message["To"] = "me@gmail.com"
-    message["Subject"] = "Заказ на завтра"
+    message["Subject"] = subject
     # Message-ID — структурный заголовок, кириллицу в него класть нельзя
     message["Message-ID"] = f"<{abs(hash(filename))}@example.com>"
     message.set_content("Файл во вложении")
@@ -313,6 +318,50 @@ def test_order_from_letter_is_saved_and_accepted(monkeypatch, _stores_for_valida
 
     # почтовый ящик открыт только на чтение — письма не помечаются прочитанными
     assert fake.readonly_used is True
+
+
+def test_valid_excel_with_wrong_subject_is_not_order(monkeypatch, _stores_for_validation):
+    letter = _letter_with_attachment(
+        "заказ.xlsx",
+        _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
+        subject="Заказ на завтра",
+    )
+    monkeypatch.setattr(
+        mail_watcher.imaplib,
+        "IMAP4_SSL",
+        lambda *a, **kw: _FakeIMAP([letter]),
+    )
+
+    result = mail_watcher.check_mail(_config())
+
+    assert result["ok"]
+    item = result["items"][0]
+    assert not item["verdict"]["ok"]
+    assert item["verdict"]["reason"] == (
+        "Тема письма должна быть «Заказ ТС МОЛОКО»"
+    )
+    assert (mail_watcher.ORDERS_FOLDER / "заказ.xlsx").exists()
+
+
+def test_order_subject_ignores_case_and_repeated_spaces(
+    monkeypatch,
+    _stores_for_validation,
+):
+    letter = _letter_with_attachment(
+        "заказ.xlsx",
+        _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
+        subject="заказ   тс молоко",
+    )
+    monkeypatch.setattr(
+        mail_watcher.imaplib,
+        "IMAP4_SSL",
+        lambda *a, **kw: _FakeIMAP([letter]),
+    )
+
+    result = mail_watcher.check_mail(_config())
+
+    assert result["ok"]
+    assert result["items"][0]["verdict"]["ok"]
 
 
 def test_foreign_excel_from_letter_is_saved_but_marked_not_order(monkeypatch, _stores_for_validation):
@@ -435,6 +484,187 @@ def test_invoice_pdf_is_saved_with_received_date(monkeypatch):
     assert item["source_person"] == "Светлана Никифорова"
     assert item["received_display"] == "14.08.2026 09:30"
     assert (mail_watcher.INVOICES_FOLDER / "ФМ 40, МДВ.pdf").exists()
+
+
+def test_city_invoice_candidates_use_name_date_and_one_group():
+    items = [
+        {
+            "kind": "orders",
+            "file": "заказ.xlsx",
+            "received_at": "2026-11-10T18:30:00+03:00",
+            "order_file": "",
+            "verdict": {"ok": True, "mode": "Город"},
+        },
+        {
+            "kind": "invoices",
+            "file": "ФМ 40, МДВ 11.11.2026.pdf",
+            "received_at": "2026-11-11T09:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "ФМ-40 МДВ дубль 10-11-2026.pdf",
+            "received_at": "2026-11-10T20:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "Горловка 10.11.2026.pdf",
+            "received_at": "2026-11-10T12:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "ФМ 40, МДВ 12.11.2026.pdf",
+            "received_at": "2026-11-12T09:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "ФМ 40, МДВ уже привязана.pdf",
+            "received_at": "2026-11-10T10:00:00+03:00",
+            "order_file": "другой заказ.xlsx",
+        },
+    ]
+
+    order_date, order_mode, suggested, other = (
+        mail_watcher.split_invoice_candidates(items, "заказ.xlsx")
+    )
+
+    assert order_date.isoformat() == "2026-11-10"
+    assert order_mode == "Город"
+    assert [item["file"] for item in suggested] == [
+        "ФМ 40, МДВ 11.11.2026.pdf",
+    ]
+    assert suggested[0]["date_relation"] == "На следующий день"
+    assert [item["file"] for item in other] == [
+        "ФМ-40 МДВ дубль 10-11-2026.pdf",
+        "Горловка 10.11.2026.pdf",
+        "ФМ 40, МДВ 12.11.2026.pdf",
+    ]
+
+
+def test_region_invoice_candidates_offer_at_most_three_groups():
+    items = [
+        {
+            "kind": "orders",
+            "file": "область.xlsx",
+            "received_at": "2026-11-10T18:30:00+03:00",
+            "order_file": "",
+            "verdict": {"ok": True, "mode": "Область"},
+        },
+        {
+            "kind": "invoices",
+            "file": "Кировское, Торез, Шахтёрск 10.11.2026.pdf",
+            "received_at": "2026-11-10T20:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "Горловка 11-11-2026.pdf",
+            "received_at": "2026-11-11T09:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "Харцызск, Макеевка 10 ноября.pdf",
+            "received_at": "2026-11-10T21:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "Горловка повторно.pdf",
+            "received_at": "2026-11-10T22:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "ФМ 40, МДВ 10.11.2026.pdf",
+            "received_at": "2026-11-10T12:00:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "неизвестная накладная.pdf",
+            "received_at": "2026-11-10T12:30:00+03:00",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "Торез 12.11.2026.pdf",
+            "received_at": "2026-11-12T09:00:00+03:00",
+            "order_file": "",
+        },
+    ]
+
+    order_date, order_mode, suggested, other = (
+        mail_watcher.split_invoice_candidates(items, "область.xlsx")
+    )
+
+    assert order_date.isoformat() == "2026-11-10"
+    assert order_mode == "Область"
+    assert [item["file"] for item in suggested] == [
+        "Кировское, Торез, Шахтёрск 10.11.2026.pdf",
+        "Харцызск, Макеевка 10 ноября.pdf",
+        "Горловка 11-11-2026.pdf",
+    ]
+    assert [item["date_relation"] for item in suggested] == [
+        "В день заказа",
+        "В день заказа",
+        "На следующий день",
+    ]
+    assert [item["file"] for item in other] == [
+        "Горловка повторно.pdf",
+        "ФМ 40, МДВ 10.11.2026.pdf",
+        "неизвестная накладная.pdf",
+        "Торез 12.11.2026.pdf",
+    ]
+
+
+def test_invoice_candidates_show_all_when_order_date_is_unknown():
+    items = [
+        {
+            "kind": "invoices",
+            "file": "ФМ 40.pdf",
+            "received_at": "2026-11-11T09:00:00+03:00",
+            "order_file": "",
+        },
+    ]
+
+    order_date, order_mode, suggested, other = (
+        mail_watcher.split_invoice_candidates(items, "ручной заказ.xlsx")
+    )
+
+    assert order_date is None
+    assert order_mode == ""
+    assert suggested == []
+    assert [item["file"] for item in other] == ["ФМ 40.pdf"]
+
+
+def test_invoice_candidate_accepts_display_date_from_old_cache():
+    items = [
+        {
+            "kind": "orders",
+            "file": "заказ.xlsx",
+            "received_display": "10.11.2026 18:30",
+            "order_file": "",
+        },
+        {
+            "kind": "invoices",
+            "file": "МДВ.pdf",
+            "received_display": "11.11.2026 09:00",
+            "order_file": "",
+        },
+    ]
+
+    order_date, order_mode, suggested, other = (
+        mail_watcher.split_invoice_candidates(items, "заказ.xlsx")
+    )
+
+    assert order_date.isoformat() == "2026-11-10"
+    assert order_mode == ""
+    assert [item["file"] for item in suggested] == ["МДВ.pdf"]
+    assert other == []
 
 
 def test_invoice_can_be_linked_and_unlinked(monkeypatch):

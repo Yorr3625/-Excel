@@ -10,13 +10,14 @@
   "_app_password": "Для Gmail нужен «пароль приложения», а не обычный пароль: myaccount.google.com/apppasswords (требуется включённая двухэтапная аутентификация). Вводится без пробелов.",
   "app_password": "",
 
-  "_sources": "Источники писем. orders — Excel-заказы, invoices — PDF-накладные.",
+  "_sources": "Источники писем. orders — Excel-заказы с обязательной темой subject, invoices — PDF-накладные.",
   "sources": [
     {
       "name": "Молоко",
       "email": "fyodorova.ekaterina@moloko.com.ru",
       "person": "",
-      "kind": "orders"
+      "kind": "orders",
+      "subject": "Заказ ТС МОЛОКО"
     },
     {
       "name": "Бухгалтер",

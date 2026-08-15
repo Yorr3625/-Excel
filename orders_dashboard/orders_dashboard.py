@@ -29,6 +29,7 @@ from modules.mail_watcher import (
     load_mail_config,
     load_mail_items,
     sources as mail_sources_config,
+    split_invoice_candidates,
     unlink_invoice,
 )
 from modules.pipeline import detect_mode, process_order as run_pipeline
@@ -309,6 +310,10 @@ class State(rx.State):
     order_detail_tab: str = "Накладные"
     order_invoices: list[dict] = []
     available_invoices: list[dict] = []
+    other_invoices: list[dict] = []
+    available_invoices_title: str = "Непривязанные накладные"
+    available_invoices_empty: str = "Новых непривязанных накладных нет"
+    invoice_date_hint: str = ""
     order_detail_status: str = ""
 
     tracking_view: str = "Симуляция"
@@ -375,6 +380,7 @@ class State(rx.State):
             "mode": verdict.get("mode", ""),
             "matches": verdict.get("matches", 0),
             "order_file": item.get("order_file", ""),
+            "date_relation": item.get("date_relation", ""),
         }
 
     def _filter_mail_items(self):
@@ -538,16 +544,60 @@ class State(rx.State):
         self.order_detail_tab = value
 
     def _refresh_order_invoices(self):
+        mail_items = load_mail_items()
         invoices = [
             self._mail_item_for_view(item)
-            for item in load_mail_items()
+            for item in mail_items
             if item.get("kind") == KIND_INVOICES
         ]
         self.order_invoices = [
             item for item in invoices if item["order_file"] == self.selected_order
         ]
+
+        order_date, order_mode, suggested, other = split_invoice_candidates(
+            mail_items,
+            self.selected_order,
+        )
+
+        if order_date is None:
+            self.available_invoices_title = "Непривязанные накладные"
+            self.available_invoices_empty = "Новых непривязанных накладных нет"
+            self.invoice_date_hint = (
+                "Дата получения заказа в почте не найдена — "
+                "показаны все непривязанные накладные."
+            )
+            self.available_invoices = [
+                self._mail_item_for_view(item) for item in other
+            ]
+            self.other_invoices = []
+            return
+
+        next_day = order_date + timedelta(days=1)
+        expected_files = {
+            "Город": "городской файл «ФМ 40, МДВ»",
+            "Область": (
+                "областные файлы по группам: Кировское / Торез / Шахтерск, "
+                "Горловка и Макеевка / Харцызск"
+            ),
+        }.get(order_mode, "накладные подходящего типа")
+        self.available_invoices_title = (
+            f"Подходящие накладные · {order_mode}"
+            if order_mode
+            else "Подходящие накладные"
+        )
+        self.available_invoices_empty = (
+            f"За {order_date:%d.%m.%Y} и {next_day:%d.%m.%Y} "
+            "подходящих непривязанных накладных нет"
+        )
+        self.invoice_date_hint = (
+            f"Заказ получен {order_date:%d.%m.%Y}. Ищем {expected_files} "
+            f"за этот день или за {next_day:%d.%m.%Y}."
+        )
         self.available_invoices = [
-            item for item in invoices if not item["order_file"]
+            self._mail_item_for_view(item) for item in suggested
+        ]
+        self.other_invoices = [
+            self._mail_item_for_view(item) for item in other
         ]
 
     def attach_invoice(self, path: str):
@@ -1615,7 +1665,20 @@ def order_invoice_row(item, linked: bool):
             width="100%",
             align="center",
         ),
-        rx.text("Источник: ", item["source"], color=muted(), font_size="12px"),
+        rx.hstack(
+            rx.text("Источник: ", item["source"], color=muted(), font_size="12px"),
+            rx.cond(
+                item["date_relation"] != "",
+                rx.badge(
+                    item["date_relation"],
+                    color_scheme="green",
+                    variant="soft",
+                ),
+                rx.box(),
+            ),
+            spacing="2",
+            align="center",
+        ),
         rx.cond(
             item["subject"] != "",
             rx.text("Тема: ", item["subject"], color=muted(), font_size="12px"),
@@ -1701,7 +1764,12 @@ def order_details_drawer():
                             rx.text("К этому заказу накладные пока не привязаны", color=muted(), font_size="13px"),
                         ),
                         rx.divider(),
-                        rx.heading("Непривязанные накладные", color=text(), size="4"),
+                        rx.heading(State.available_invoices_title, color=text(), size="4"),
+                        rx.text(
+                            State.invoice_date_hint,
+                            color=muted(),
+                            font_size="12px",
+                        ),
                         rx.cond(
                             State.available_invoices.length() > 0,
                             rx.vstack(
@@ -1712,7 +1780,31 @@ def order_details_drawer():
                                 spacing="2",
                                 width="100%",
                             ),
-                            rx.text("Новых непривязанных накладных нет", color=muted(), font_size="13px"),
+                            rx.text(
+                                State.available_invoices_empty,
+                                color=muted(),
+                                font_size="13px",
+                            ),
+                        ),
+                        rx.cond(
+                            State.other_invoices.length() > 0,
+                            rx.vstack(
+                                rx.divider(),
+                                rx.heading("Другие накладные", color=text(), size="4"),
+                                rx.text(
+                                    "Дата, тип заказа или группа файла не совпали. При необходимости файл можно привязать вручную.",
+                                    color=muted(),
+                                    font_size="12px",
+                                ),
+                                rx.foreach(
+                                    State.other_invoices,
+                                    lambda item: order_invoice_row(item, False),
+                                ),
+                                spacing="2",
+                                width="100%",
+                                align="start",
+                            ),
+                            rx.box(),
                         ),
                         spacing="3",
                         width="100%",

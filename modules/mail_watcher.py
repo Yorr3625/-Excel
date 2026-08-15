@@ -10,7 +10,7 @@ import email
 import imaplib
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -31,6 +31,15 @@ PDF_SUFFIXES = (".pdf",)
 KIND_ORDERS = "orders"
 KIND_INVOICES = "invoices"
 KIND_MESSAGE = "message"
+DEFAULT_ORDER_SUBJECT = "Заказ ТС МОЛОКО"
+
+CITY_INVOICE_MODE = "Город"
+REGION_INVOICE_MODE = "Область"
+REGION_INVOICE_GROUPS = {
+    "Кировское / Торез / Шахтерск": ("кировск", "торез", "шахтер"),
+    "Горловка": ("горлов",),
+    "Макеевка / Харцызск": ("макеев", "харцыз"),
+}
 
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -71,11 +80,15 @@ def sources(config: dict | None = None) -> list[dict]:
         if not email_addr:
             continue
 
+        kind = source.get("kind") or KIND_ORDERS
         result.append({
             "name": source.get("name") or email_addr,
             "email": email_addr,
             "person": source.get("person", ""),
-            "kind": source.get("kind") or KIND_ORDERS,
+            "kind": kind,
+            "subject": source.get("subject") or (
+                DEFAULT_ORDER_SUBJECT if kind == KIND_ORDERS else ""
+            ),
         })
 
     for email_addr in config.get("senders") or []:
@@ -87,6 +100,7 @@ def sources(config: dict | None = None) -> list[dict]:
                 "email": email_addr,
                 "person": "",
                 "kind": KIND_ORDERS,
+                "subject": DEFAULT_ORDER_SUBJECT,
             })
 
     return result
@@ -122,10 +136,147 @@ def _save_seen(seen: list) -> None:
     _write_json(SEEN_FILE, seen[-SEEN_LIMIT:])
 
 
+def _normalise_subject(value: str) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _subject_rejection(expected_subject: str, verdict: dict | None = None) -> dict:
+    result = dict(verdict or {})
+    result.update({
+        "ok": False,
+        "reason": f"Тема письма должна быть «{expected_subject}»",
+    })
+    result.setdefault("mode", "")
+    result.setdefault("matches", 0)
+    result.setdefault("scores", {})
+    return result
+
+
+def _enforce_order_subject(item: dict) -> None:
+    if item.get("kind") != KIND_ORDERS:
+        return
+
+    expected_subject = item.get("expected_subject") or DEFAULT_ORDER_SUBJECT
+
+    if _normalise_subject(item.get("subject", "")) != _normalise_subject(
+        expected_subject
+    ):
+        item["verdict"] = _subject_rejection(
+            expected_subject,
+            item.get("verdict"),
+        )
+
+
 def load_mail_items() -> list[dict]:
     """Возвращает сохранённые письма и вложения, новые сверху."""
 
-    return _read_json(MAIL_ITEMS_FILE, [])
+    items = _read_json(MAIL_ITEMS_FILE, [])
+
+    # Старый кеш мог считать заказом любой подходящий Excel. Применяем новое
+    # правило темы и к уже сохранённым письмам, не заставляя скачивать их снова.
+    for item in items:
+        _enforce_order_subject(item)
+
+    return items
+
+
+def _item_received_date(item: dict) -> date | None:
+    """Возвращает календарную дату письма из нового или старого кеша."""
+
+    try:
+        return datetime.fromisoformat(str(item.get("received_at", ""))).date()
+    except ValueError:
+        pass
+
+    try:
+        return datetime.strptime(
+            str(item.get("received_display", "")),
+            "%d.%m.%Y %H:%M",
+        ).date()
+    except ValueError:
+        return None
+
+
+def _invoice_filename_group(filename: str) -> tuple[str, str]:
+    """Определяет тип заказа и группу накладной по приблизительному имени."""
+
+    name = Path(filename).stem.casefold().replace("ё", "е")
+    name = " ".join(re.findall(r"[0-9a-zа-я]+", name))
+
+    if re.search(r"\bфм\s*40\b", name) and re.search(r"\bмдв\b", name):
+        return CITY_INVOICE_MODE, "ФМ 40 / МДВ"
+
+    for group, markers in REGION_INVOICE_GROUPS.items():
+        if any(marker in name for marker in markers):
+            return REGION_INVOICE_MODE, group
+
+    return "", ""
+
+
+def split_invoice_candidates(
+    items: list[dict],
+    order_file: str,
+) -> tuple[date | None, str, list[dict], list[dict]]:
+    """Делит свободные накладные на подходящие по дате и типу заказа.
+
+    Подходящими считаются PDF, полученные в календарный день заказа или
+    на следующий день. Для города предлагается один файл «ФМ 40, МДВ»,
+    для области — по одному файлу на каждую из трёх групп городов.
+    """
+
+    order_name = Path(order_file).name.casefold()
+    order_item = next(
+        (
+            item
+            for item in items
+            if item.get("kind") == KIND_ORDERS
+            and Path(str(item.get("file", ""))).name.casefold() == order_name
+        ),
+        None,
+    )
+    order_date = _item_received_date(order_item) if order_item else None
+    order_mode = str(((order_item or {}).get("verdict") or {}).get("mode", ""))
+    available = [
+        item
+        for item in items
+        if item.get("kind") == KIND_INVOICES and not item.get("order_file")
+    ]
+
+    if order_date is None:
+        return None, order_mode, [], available
+
+    suggested = []
+    other = []
+    used_groups = set()
+
+    for item in available:
+        invoice_date = _item_received_date(item)
+        day_offset = (invoice_date - order_date).days if invoice_date else None
+        invoice_mode, invoice_group = _invoice_filename_group(
+            str(item.get("file", ""))
+        )
+        mode_matches = not order_mode or invoice_mode == order_mode
+        group_is_free = not order_mode or invoice_group not in used_groups
+
+        if day_offset in (0, 1) and mode_matches and group_is_free:
+            candidate = dict(item)
+            candidate["date_relation"] = (
+                "В день заказа" if day_offset == 0 else "На следующий день"
+            )
+            suggested.append(candidate)
+
+            if order_mode:
+                used_groups.add(invoice_group)
+        else:
+            other.append(item)
+
+    suggested.sort(
+        key=lambda item: (
+            0 if item["date_relation"] == "В день заказа" else 1,
+            str(item.get("received_at", "")),
+        )
+    )
+    return order_date, order_mode, suggested, other
 
 
 def _save_mail_items(items: list[dict]) -> None:
@@ -328,6 +479,7 @@ def _base_item(message, source: dict, message_id: str) -> dict:
         "source_name": source["name"],
         "source_email": source["email"],
         "source_person": source.get("person", ""),
+        "expected_subject": source.get("subject", ""),
         "order_file": "",
     }
 
@@ -416,7 +568,14 @@ def check_mail(config: dict | None = None) -> dict:
                     }
 
                     if kind == KIND_ORDERS:
-                        item["verdict"] = validate_order_file(path)
+                        expected_subject = source.get("subject") or DEFAULT_ORDER_SUBJECT
+
+                        if _normalise_subject(base["subject"]) != _normalise_subject(
+                            expected_subject
+                        ):
+                            item["verdict"] = _subject_rejection(expected_subject)
+                        else:
+                            item["verdict"] = validate_order_file(path)
 
                     letter_items.append(item)
 
