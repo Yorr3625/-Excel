@@ -23,6 +23,7 @@ STORES_REGION_FILE = CONFIG_DIR / "stores_region.json"
 
 # --- data/: рабочие папки ---
 ORDERS_FOLDER = DATA_DIR / "orders"
+INVOICES_FOLDER = DATA_DIR / "invoices"
 PROCESSED_FOLDER = DATA_DIR / "processed_orders"
 LOGS_FOLDER = DATA_DIR / "logs"
 UPLOADS_FOLDER = DATA_DIR / "uploaded_files"

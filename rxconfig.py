@@ -15,6 +15,7 @@ for _dir in (
     paths.CONFIG_DIR,
     paths.DATA_DIR,
     paths.ORDERS_FOLDER,
+    paths.INVOICES_FOLDER,
     paths.PROCESSED_FOLDER,
     paths.LOGS_FOLDER,
     paths.UPLOADS_FOLDER,

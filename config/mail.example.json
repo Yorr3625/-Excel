@@ -10,15 +10,29 @@
   "_app_password": "Для Gmail нужен «пароль приложения», а не обычный пароль: myaccount.google.com/apppasswords (требуется включённая двухэтапная аутентификация). Вводится без пробелов.",
   "app_password": "",
 
-  "_senders": "От кого ждём заказы. Можно несколько адресов.",
-  "senders": [
-    "отправитель@example.com"
+  "_sources": "Источники писем. orders — Excel-заказы, invoices — PDF-накладные.",
+  "sources": [
+    {
+      "name": "Молоко",
+      "email": "fyodorova.ekaterina@moloko.com.ru",
+      "person": "",
+      "kind": "orders"
+    },
+    {
+      "name": "Бухгалтер",
+      "email": "zosya-c@mail.ru",
+      "person": "Светлана Никифорова",
+      "kind": "invoices"
+    }
   ],
 
   "folder": "INBOX",
 
-  "_since_days": "За сколько последних дней просматривать письма.",
-  "since_days": 7,
+  "_since_days": "За сколько последних дней просматривать письма (не больше срока кеша).",
+  "since_days": 14,
+
+  "_cache_days": "Сколько дней хранить локальный список писем. Привязанные накладные не удаляются.",
+  "cache_days": 14,
 
   "_check_interval_minutes": "Как часто дашборд проверяет почту сам, пока открыт.",
   "check_interval_minutes": 10

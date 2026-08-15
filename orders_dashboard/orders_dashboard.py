@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import asyncio
 import json
+import os
 import traceback
 
 import reflex as rx
@@ -18,7 +19,18 @@ from modules.history import (
     record_processing,
     was_processed,
 )
-from modules.mail_watcher import check_mail, is_configured, load_mail_config
+from modules.mail_watcher import (
+    KIND_INVOICES,
+    KIND_MESSAGE,
+    KIND_ORDERS,
+    check_mail,
+    is_configured,
+    link_invoice,
+    load_mail_config,
+    load_mail_items,
+    sources as mail_sources_config,
+    unlink_invoice,
+)
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 from modules.tracking_sim import (
@@ -69,6 +81,7 @@ FA_ICON_MAP = {
     "moon": "FaMoon",
     "upload": "FaUpload",
     "file_spreadsheet": "FaFileExcel",
+    "file_pdf": "FaFilePdf",
     "chart_no_axes_column": "FaChartColumn",
     "map": "FaMap",
     "award": "FaAward",
@@ -282,8 +295,21 @@ class State(rx.State):
     mail_status: str = ""
     mail_error: str = ""
     mail_items: list[dict] = []
+    mail_all_items: list[dict] = []
+    mail_sources: list[str] = ["Все"]
+    mail_source: str = "Все"
+    mail_kind_filter: str = "Все сообщения"
     mail_auto: bool = False
     mail_interval: int = 10
+
+    history_items: list[dict] = []
+    order_details_open: bool = False
+    selected_order: str = ""
+    selected_order_time: str = ""
+    order_detail_tab: str = "Накладные"
+    order_invoices: list[dict] = []
+    available_invoices: list[dict] = []
+    order_detail_status: str = ""
 
     tracking_view: str = "Симуляция"
     real_vehicles: list[dict] = []
@@ -314,9 +340,67 @@ class State(rx.State):
         config = load_mail_config()
         self.mail_configured = is_configured(config)
         self.mail_interval = max(int(config.get("check_interval_minutes", 10)), 1)
+        self.mail_sources = ["Все"] + [item["name"] for item in mail_sources_config(config)]
+
+        if self.mail_source not in self.mail_sources:
+            self.mail_source = "Все"
+
+        self._reload_mail_items()
 
         if not self.mail_configured:
             self.mail_status = "Почта не настроена"
+
+    @staticmethod
+    def _mail_item_for_view(item: dict) -> dict:
+        verdict = item.get("verdict") or {}
+        kind = item.get("kind", KIND_MESSAGE)
+        return {
+            "file": item.get("file") or "Без вложения",
+            "path": item.get("path", ""),
+            "sender": item.get("sender", ""),
+            "subject": item.get("subject", ""),
+            "received": item.get("received_display", "Дата не указана"),
+            "source": item.get("source_name", "Другое"),
+            "person": item.get("source_person", ""),
+            "kind": kind,
+            "kind_label": {
+                KIND_ORDERS: "Заказ",
+                KIND_INVOICES: "Накладная",
+                KIND_MESSAGE: "Письмо",
+            }.get(kind, "Письмо"),
+            "is_order": kind == KIND_ORDERS and bool(verdict.get("ok")),
+            "is_invoice": kind == KIND_INVOICES,
+            "has_file": bool(item.get("path")),
+            "reason": verdict.get("reason", ""),
+            "mode": verdict.get("mode", ""),
+            "matches": verdict.get("matches", 0),
+            "order_file": item.get("order_file", ""),
+        }
+
+    def _filter_mail_items(self):
+        items = self.mail_all_items
+
+        if self.mail_source != "Все":
+            items = [item for item in items if item["source"] == self.mail_source]
+
+        if self.mail_kind_filter == "Только заказы":
+            items = [item for item in items if item["is_order"]]
+
+        self.mail_items = items
+
+    def _reload_mail_items(self):
+        self.mail_all_items = [
+            self._mail_item_for_view(item) for item in load_mail_items()
+        ]
+        self._filter_mail_items()
+
+    def set_mail_source(self, source: str):
+        self.mail_source = source
+        self._filter_mail_items()
+
+    def set_mail_kind_filter(self, value: str):
+        self.mail_kind_filter = value
+        self._filter_mail_items()
 
     def _apply_mail_result(self, result: dict):
         """Раскладывает ответ check_mail по состоянию. Только внутри `async with self`."""
@@ -326,33 +410,21 @@ class State(rx.State):
             self.mail_status = "Проверка не удалась"
             return
 
-        # Reflex не умеет обращаться к вложенному словарю внутри foreach,
-        # поэтому вердикт разворачиваем в плоские поля.
-        found = [
-            {
-                "file": item["file"],
-                "path": item["path"],
-                "sender": item["sender"],
-                "subject": item["subject"],
-                "ok": item["verdict"]["ok"],
-                "reason": item["verdict"]["reason"],
-                "mode": item["verdict"]["mode"],
-                "matches": item["verdict"]["matches"],
-            }
-            for item in result["items"]
-        ]
-
-        # Новые письма кладём наверх, старые находки не теряем.
-        known = {item["path"] for item in found}
-        self.mail_items = found + [i for i in self.mail_items if i["path"] not in known]
-
-        suitable = sum(1 for item in found if item["ok"])
+        self._reload_mail_items()
+        found = result["items"]
+        suitable = sum(
+            1
+            for item in found
+            if item.get("kind") == KIND_ORDERS
+            and (item.get("verdict") or {}).get("ok")
+        )
+        invoices = sum(1 for item in found if item.get("kind") == KIND_INVOICES)
 
         if not found:
-            self.mail_status = "Новых писем с вложениями нет"
+            self.mail_status = "Новых писем нет"
         else:
             self.mail_status = (
-                f"Найдено вложений: {len(found)}, подходящих заказов: {suitable}"
+                f"Найдено: {len(found)} · заказов: {suitable} · накладных: {invoices}"
             )
 
     async def _run_mail_check(self):
@@ -435,6 +507,66 @@ class State(rx.State):
 
         self.detect_and_set_mode()
         self.current_page = "Заказы"
+
+    def open_mail_attachment(self, path: str):
+        attachment = Path(path)
+
+        if not attachment.exists():
+            self.mail_error = f"Файл не найден: {path}"
+            return
+
+        try:
+            os.startfile(attachment.resolve())
+        except OSError as error:
+            self.mail_error = f"Не удалось открыть файл: {error}"
+
+    def open_order_details(self, filename: str, processed_at: str):
+        if filename == "Нет обработок":
+            return
+
+        self.selected_order = filename
+        self.selected_order_time = processed_at
+        self.order_detail_tab = "Накладные"
+        self.order_detail_status = ""
+        self.order_details_open = True
+        self._refresh_order_invoices()
+
+    def close_order_details(self):
+        self.order_details_open = False
+
+    def set_order_detail_tab(self, value: str):
+        self.order_detail_tab = value
+
+    def _refresh_order_invoices(self):
+        invoices = [
+            self._mail_item_for_view(item)
+            for item in load_mail_items()
+            if item.get("kind") == KIND_INVOICES
+        ]
+        self.order_invoices = [
+            item for item in invoices if item["order_file"] == self.selected_order
+        ]
+        self.available_invoices = [
+            item for item in invoices if not item["order_file"]
+        ]
+
+    def attach_invoice(self, path: str):
+        if link_invoice(path, self.selected_order):
+            self.order_detail_status = "Накладная привязана к заказу"
+        else:
+            self.order_detail_status = "Не удалось найти накладную"
+
+        self._refresh_order_invoices()
+        self._reload_mail_items()
+
+    def detach_invoice(self, path: str):
+        if unlink_invoice(path):
+            self.order_detail_status = "Накладная отвязана"
+        else:
+            self.order_detail_status = "Не удалось найти накладную"
+
+        self._refresh_order_invoices()
+        self._reload_mail_items()
 
     @property
     def stores_file(self) -> Path:
@@ -664,7 +796,12 @@ class State(rx.State):
 
     def load_history(self):
         data = load_processed_files()
-        items = sorted(data.items(), key=lambda item: item[1], reverse=True)[:3]
+        all_items = sorted(data.items(), key=lambda item: item[1], reverse=True)
+        self.history_items = [
+            {"file": filename, "time": processed_at}
+            for filename, processed_at in all_items
+        ]
+        items = all_items[:3]
         placeholders = [("Нет обработок", "")] * 3
         items = items + placeholders[len(items):]
 
@@ -1289,6 +1426,9 @@ def history_row(filename, time):
         padding="12px",
         border_radius="10px",
         background=surface_alt(),
+        cursor="pointer",
+        on_click=State.open_order_details(filename, time),
+        _hover={"background": theme_value("#e8edf2", "#1c2a36")},
     )
 
 
@@ -1444,8 +1584,172 @@ def orders_page():
 
 def history_page():
     return page_shell(
-        topbar("История", "Последние обработанные файлы."),
-        history_panel(),
+        topbar("История", "Нажмите на заказ, чтобы открыть его накладные и дополнительные данные."),
+        panel_shell(
+            panel_title("history", "Обработанные заказы"),
+            rx.cond(
+                State.history_items.length() > 0,
+                rx.vstack(
+                    rx.foreach(
+                        State.history_items,
+                        lambda item: history_row(item["file"], item["time"]),
+                    ),
+                    spacing="2",
+                    width="100%",
+                ),
+                rx.text("Обработанных заказов пока нет", color=muted(), font_size="13px"),
+            ),
+        ),
+    )
+
+
+
+
+def order_invoice_row(item, linked: bool):
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="file_pdf", size=16, color="#3b82f6"),
+            rx.text(item["file"], color=text(), font_size="13px", font_weight="700"),
+            rx.spacer(),
+            rx.text(item["received"], color=muted(), font_size="11px"),
+            width="100%",
+            align="center",
+        ),
+        rx.text("Источник: ", item["source"], color=muted(), font_size="12px"),
+        rx.cond(
+            item["subject"] != "",
+            rx.text("Тема: ", item["subject"], color=muted(), font_size="12px"),
+            rx.box(),
+        ),
+        rx.hstack(
+            secondary_button(
+                "Открыть PDF",
+                on_click=State.open_mail_attachment(item["path"]),
+                width="130px",
+            ),
+            secondary_button(
+                "Отвязать" if linked else "Привязать",
+                on_click=(
+                    State.detach_invoice(item["path"])
+                    if linked
+                    else State.attach_invoice(item["path"])
+                ),
+                width="120px",
+            ),
+            spacing="2",
+        ),
+        align="start",
+        spacing="2",
+        width="100%",
+        padding="14px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+    )
+
+
+def order_details_drawer():
+    return rx.cond(
+        State.order_details_open,
+        rx.fragment(
+            rx.box(
+                position="fixed",
+                inset="0",
+                background="rgba(0, 0, 0, 0.48)",
+                z_index="90",
+                on_click=State.close_order_details,
+            ),
+            rx.vstack(
+                rx.hstack(
+                    rx.vstack(
+                        rx.text("ЗАКАЗ", color=muted(), font_size="11px", font_weight="700"),
+                        rx.heading(State.selected_order, color=text(), size="5"),
+                        rx.text("Обработан: ", State.selected_order_time, color=muted(), font_size="12px"),
+                        align="start",
+                        spacing="1",
+                    ),
+                    rx.spacer(),
+                    rx.button(
+                        fa_icon(tag="x", size=16),
+                        on_click=State.close_order_details,
+                        variant="ghost",
+                        color=muted(),
+                        cursor="pointer",
+                    ),
+                    width="100%",
+                    align="start",
+                ),
+                segmented_control(
+                    ["Накладные", "Дополнительно"],
+                    State.order_detail_tab,
+                    State.set_order_detail_tab,
+                ),
+                rx.cond(
+                    State.order_detail_tab == "Накладные",
+                    rx.vstack(
+                        rx.heading("Привязанные накладные", color=text(), size="4"),
+                        rx.cond(
+                            State.order_invoices.length() > 0,
+                            rx.vstack(
+                                rx.foreach(
+                                    State.order_invoices,
+                                    lambda item: order_invoice_row(item, True),
+                                ),
+                                spacing="2",
+                                width="100%",
+                            ),
+                            rx.text("К этому заказу накладные пока не привязаны", color=muted(), font_size="13px"),
+                        ),
+                        rx.divider(),
+                        rx.heading("Непривязанные накладные", color=text(), size="4"),
+                        rx.cond(
+                            State.available_invoices.length() > 0,
+                            rx.vstack(
+                                rx.foreach(
+                                    State.available_invoices,
+                                    lambda item: order_invoice_row(item, False),
+                                ),
+                                spacing="2",
+                                width="100%",
+                            ),
+                            rx.text("Новых непривязанных накладных нет", color=muted(), font_size="13px"),
+                        ),
+                        spacing="3",
+                        width="100%",
+                        align="start",
+                    ),
+                    rx.vstack(
+                        rx.heading("Дополнительные данные", color=text(), size="4"),
+                        rx.text(
+                            "Здесь можно будет добавить комментарии, документы и другие разделы заказа.",
+                            color=muted(),
+                            font_size="13px",
+                        ),
+                        align="start",
+                        spacing="2",
+                    ),
+                ),
+                rx.cond(
+                    State.order_detail_status != "",
+                    rx.text(State.order_detail_status, color=ACCENT, font_size="12px"),
+                    rx.box(),
+                ),
+                align="start",
+                spacing="4",
+                position="fixed",
+                top="0",
+                right="0",
+                width=["100%", "560px"],
+                height="100vh",
+                overflow_y="auto",
+                padding="24px",
+                background=surface(),
+                border_left=f"1px solid {border()}",
+                box_shadow="-16px 0 40px rgba(0, 0, 0, 0.22)",
+                z_index="100",
+            ),
+        ),
+        rx.box(),
     )
 
 
@@ -1494,13 +1798,34 @@ def mail_verdict_badge(is_order):
 def mail_item_row(item):
     return rx.vstack(
         rx.hstack(
-            fa_icon(tag="file_spreadsheet", size=15, color=muted()),
+            rx.cond(
+                item["is_invoice"],
+                fa_icon(tag="file_pdf", size=15, color=muted()),
+                rx.cond(
+                    item["has_file"],
+                    fa_icon(tag="file_spreadsheet", size=15, color=muted()),
+                    fa_icon(tag="mail", size=15, color=muted()),
+                ),
+            ),
             rx.text(item["file"], color=text(), font_size="14px", font_weight="700"),
             rx.spacer(),
-            mail_verdict_badge(item["ok"]),
+            rx.cond(
+                item["is_invoice"],
+                rx.badge("Накладная", color_scheme="blue", variant="soft"),
+                rx.cond(
+                    item["kind"] == KIND_MESSAGE,
+                    rx.badge("Письмо", color_scheme="gray", variant="soft"),
+                    mail_verdict_badge(item["is_order"]),
+                ),
+            ),
             width="100%",
             align="center",
             spacing="2",
+        ),
+        rx.hstack(
+            rx.text("Источник: ", item["source"], color=muted(), font_size="12px"),
+            rx.text("· ", item["received"], color=muted(), font_size="12px"),
+            spacing="1",
         ),
         rx.text("От: ", item["sender"], color=muted(), font_size="12px"),
         rx.cond(
@@ -1509,7 +1834,7 @@ def mail_item_row(item):
             rx.box(),
         ),
         rx.cond(
-            item["ok"],
+            item["is_order"],
             rx.hstack(
                 rx.text(
                     "Режим: ", item["mode"],
@@ -1526,7 +1851,29 @@ def mail_item_row(item):
                 width="100%",
                 align="center",
             ),
-            rx.text(item["reason"], color="#e5484d", font_size="12px"),
+            rx.cond(
+                item["is_invoice"],
+                rx.hstack(
+                    rx.cond(
+                        item["order_file"] != "",
+                        rx.text("Привязана к: ", item["order_file"], color=ACCENT, font_size="12px"),
+                        rx.text("Ещё не привязана к заказу", color=muted(), font_size="12px"),
+                    ),
+                    rx.spacer(),
+                    secondary_button(
+                        "Открыть PDF",
+                        on_click=State.open_mail_attachment(item["path"]),
+                        width="140px",
+                    ),
+                    width="100%",
+                    align="center",
+                ),
+                rx.cond(
+                    item["reason"] != "",
+                    rx.text(item["reason"], color="#e5484d", font_size="12px"),
+                    rx.box(),
+                ),
+            ),
         ),
         align="start",
         spacing="2",
@@ -1586,10 +1933,36 @@ def mail_page():
                         rx.box(),
                     ),
                 ),
+                panel_shell(
+                    rx.hstack(
+                        panel_title("inbox", "Фильтры писем"),
+                        rx.spacer(),
+                        segmented_control(
+                            ["Все сообщения", "Только заказы"],
+                            State.mail_kind_filter,
+                            State.set_mail_kind_filter,
+                        ),
+                        width="100%",
+                        align="center",
+                    ),
+                    rx.flex(
+                        rx.foreach(
+                            State.mail_sources,
+                            lambda source: segment_button(
+                                source,
+                                State.mail_source,
+                                State.set_mail_source(source),
+                            ),
+                        ),
+                        gap="8px",
+                        wrap="wrap",
+                        width="100%",
+                    ),
+                ),
                 rx.cond(
                     State.mail_items.length() > 0,
                     panel_shell(
-                        panel_title("mail", "Найденные вложения"),
+                        panel_title("mail", "Письма и вложения"),
                         rx.vstack(
                             rx.foreach(State.mail_items, mail_item_row),
                             spacing="3",
@@ -2158,13 +2531,16 @@ def main_content():
 
 
 def dashboard():
-    return rx.hstack(
-        sidebar(),
-        main_content(),
-        align="start",
-        spacing="0",
-        min_height="100vh",
-        background=page_bg(),
+    return rx.fragment(
+        rx.hstack(
+            sidebar(),
+            main_content(),
+            align="start",
+            spacing="0",
+            min_height="100vh",
+            background=page_bg(),
+        ),
+        order_details_drawer(),
     )
 
 

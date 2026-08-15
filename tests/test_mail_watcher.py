@@ -9,7 +9,10 @@ from modules import mail_watcher
 def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(mail_watcher, "MAIL_CONFIG_FILE", tmp_path / "mail.json")
     monkeypatch.setattr(mail_watcher, "SEEN_FILE", tmp_path / "mail_seen.json")
+    monkeypatch.setattr(mail_watcher, "MAIL_ITEMS_FILE", tmp_path / "mail_items.json")
+    monkeypatch.setattr(mail_watcher, "MAIL_UID_CACHE_FILE", tmp_path / "mail_uid_cache.json")
     monkeypatch.setattr(mail_watcher, "ORDERS_FOLDER", tmp_path / "orders")
+    monkeypatch.setattr(mail_watcher, "INVOICES_FOLDER", tmp_path / "invoices")
 
 
 def _config(**overrides):
@@ -215,6 +218,7 @@ class _FakeIMAP:
         self._letters = letters
         self.readonly_used = None
         self.logged_in = False
+        self.fetch_calls = 0
 
     def __enter__(self):
         return self
@@ -230,10 +234,21 @@ class _FakeIMAP:
         self.readonly_used = readonly
         return "OK", [b"1"]
 
+    def response(self, name):
+        return name, [b"12345"]
+
+    def uid(self, command, *args):
+        if command == "SEARCH":
+            return self.search(*args)
+        if command == "FETCH":
+            return self.fetch(*args)
+        raise AssertionError(f"Неожиданная UID-команда: {command}")
+
     def search(self, charset, *criteria):
         return "OK", [b" ".join(str(i + 1).encode() for i in range(len(self._letters)))]
 
     def fetch(self, uid, spec):
+        self.fetch_calls += 1
         index = int(uid) - 1
         return "OK", [(b"", self._letters[index].as_bytes())]
 
@@ -327,16 +342,51 @@ def test_foreign_excel_from_letter_is_saved_but_marked_not_order(monkeypatch, _s
 
 def test_same_letter_is_not_downloaded_twice(monkeypatch, _stores_for_validation):
     letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
-    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: _FakeIMAP([letter]))
+    fake = _FakeIMAP([letter])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
 
     first = mail_watcher.check_mail(_config())
     second = mail_watcher.check_mail(_config())
 
     assert len(first["items"]) == 1
     assert second["items"] == []
+    assert fake.fetch_calls == 1
 
 
-def test_letter_without_attachment_is_skipped(monkeypatch, _stores_for_validation):
+def test_seen_letter_missing_from_cache_is_restored(monkeypatch, _stores_for_validation):
+    """Старый mail_seen не должен скрывать письмо, которого нет в mail_items."""
+
+    letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
+    message_id = letter["Message-ID"]
+    mail_watcher._save_seen([message_id])
+    monkeypatch.setattr(
+        mail_watcher.imaplib,
+        "IMAP4_SSL",
+        lambda *a, **kw: _FakeIMAP([letter]),
+    )
+
+    result = mail_watcher.check_mail(_config())
+
+    assert result["ok"]
+    assert len(result["items"]) == 1
+    assert mail_watcher.load_mail_items()[0]["message_id"] == message_id
+
+
+def test_mail_cache_removes_old_messages_but_keeps_linked_invoices():
+    recent = "2026-08-15T09:00:00+03:00"
+    old = "2026-07-01T09:00:00+03:00"
+    items = [
+        {"message_id": "recent", "received_at": recent, "order_file": ""},
+        {"message_id": "old", "received_at": old, "order_file": ""},
+        {"message_id": "linked", "received_at": old, "order_file": "заказ.xlsx"},
+    ]
+
+    kept = mail_watcher._prune_mail_items(items, 14)
+
+    assert [item["message_id"] for item in kept] == ["recent", "linked"]
+
+
+def test_letter_without_attachment_is_kept_as_message(monkeypatch, _stores_for_validation):
     from email.message import EmailMessage
 
     from email.policy import SMTP
@@ -352,4 +402,59 @@ def test_letter_without_attachment_is_skipped(monkeypatch, _stores_for_validatio
     result = mail_watcher.check_mail(_config())
 
     assert result["ok"]
-    assert result["items"] == []
+    assert len(result["items"]) == 1
+    assert result["items"][0]["kind"] == mail_watcher.KIND_MESSAGE
+    assert result["items"][0]["file"] == ""
+
+
+def test_invoice_pdf_is_saved_with_received_date(monkeypatch):
+    letter = _letter_with_attachment(
+        "ФМ 40, МДВ.pdf",
+        b"%PDF-1.4 invoice",
+        sender="zosya-c@mail.ru",
+    )
+    letter["Date"] = "Fri, 14 Aug 2026 09:30:00 +0300"
+    fake = _FakeIMAP([letter])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+
+    config = _config(
+        senders=[],
+        sources=[{
+            "name": "Бухгалтер",
+            "email": "zosya-c@mail.ru",
+            "person": "Светлана Никифорова",
+            "kind": "invoices",
+        }],
+    )
+    result = mail_watcher.check_mail(config)
+
+    assert result["ok"], result["error"]
+    item = result["items"][0]
+    assert item["kind"] == mail_watcher.KIND_INVOICES
+    assert item["source_name"] == "Бухгалтер"
+    assert item["source_person"] == "Светлана Никифорова"
+    assert item["received_display"] == "14.08.2026 09:30"
+    assert (mail_watcher.INVOICES_FOLDER / "ФМ 40, МДВ.pdf").exists()
+
+
+def test_invoice_can_be_linked_and_unlinked(monkeypatch):
+    letter = _letter_with_attachment("ФМ 40.pdf", b"%PDF", sender="zosya-c@mail.ru")
+    monkeypatch.setattr(
+        mail_watcher.imaplib,
+        "IMAP4_SSL",
+        lambda *a, **kw: _FakeIMAP([letter]),
+    )
+    config = _config(
+        senders=[],
+        sources=[{
+            "name": "Бухгалтер",
+            "email": "zosya-c@mail.ru",
+            "kind": "invoices",
+        }],
+    )
+    item = mail_watcher.check_mail(config)["items"][0]
+
+    assert mail_watcher.link_invoice(item["path"], "заказ.xlsx")
+    assert mail_watcher.load_mail_items()[0]["order_file"] == "заказ.xlsx"
+    assert mail_watcher.unlink_invoice(item["path"])
+    assert mail_watcher.load_mail_items()[0]["order_file"] == ""
