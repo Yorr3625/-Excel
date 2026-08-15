@@ -12,7 +12,12 @@ from starlette.routing import Route
 
 from modules import driver_data, paths
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
-from modules.history import load_processed_files, load_volume_history, record_processing
+from modules.history import (
+    load_processed_files,
+    load_volume_history,
+    record_processing,
+    was_processed,
+)
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 from modules.tracking_sim import (
@@ -228,6 +233,7 @@ class State(rx.State):
     uploaded_file_path: str = ""
     mode: str = "Область"
     mode_auto_note: str = ""
+    duplicate_note: str = ""
     theme: str = "dark"
     status: str = "Ожидает загрузки файла"
     is_processing: bool = False
@@ -566,6 +572,16 @@ class State(rx.State):
             self.output_file = ""
             self.log_file = ""
             self.error_text = ""
+
+            # Консольная версия предупреждает о повторной обработке —
+            # в дашборде такого предупреждения не было.
+            processed_at = was_processed(filename)
+            self.duplicate_note = (
+                f"Этот файл уже обрабатывался {processed_at}. "
+                "Повторная обработка обновит суммы, а не добавит их ещё раз."
+                if processed_at
+                else ""
+            )
 
             self.detect_and_set_mode()
 
@@ -957,6 +973,21 @@ def order_panel():
             border=f"1px solid {border()}",
             border_radius="10px",
             background=surface_alt(),
+        ),
+        rx.cond(
+            State.duplicate_note != "",
+            rx.hstack(
+                fa_icon(tag="triangle_alert", size=15, color="#f5a623"),
+                rx.text(State.duplicate_note, color=text(), font_size="12px"),
+                spacing="2",
+                align="center",
+                width="100%",
+                padding="10px 14px",
+                border="1px solid rgba(245, 166, 35, 0.35)",
+                border_radius="10px",
+                background="rgba(245, 166, 35, 0.10)",
+            ),
+            rx.box(),
         ),
         rx.hstack(
             rx.vstack(
