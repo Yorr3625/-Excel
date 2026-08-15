@@ -87,19 +87,32 @@ python gui.py
 
 Веб-дашборд (Reflex):
 
-На новом ПК проще всего запустить `start_dashboard.bat` — он сам
-создаст виртуальное окружение (`.venv`), поставит зависимости из
-`requirements.txt` и запустит дашборд. Нужен только установленный
-Python 3.10+ (с галочкой "Add python.exe to PATH" при установке) и
-интернет при самом первом запуске (Reflex докачивает свой
-frontend-тулчейн).
+На новом **Windows 10/11 x64** ПК проще всего запустить
+`start_dashboard.bat` — он проверит версию Python, создаст виртуальное
+окружение (`.venv`), установит проверенные версии зависимостей из
+`requirements.txt` и запустит дашборд. Нужен только 64-битный Python
+3.10–3.14 с галочкой **Add python.exe to PATH** и интернет при первом
+запуске (Reflex загрузит frontend-тулчейн).
 
-Вручную это те же шаги:
+Если установка или запуск завершатся ошибкой, окно не закроется сразу, а
+покажет понятное сообщение. Повторные запуски используют уже созданное
+окружение.
+
+Вручную на Windows выполняются те же шаги:
 
 ```
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+python -m reflex run
+```
+
+На macOS/Linux веб-дашборд запускается так:
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python -m reflex run
 ```
 
