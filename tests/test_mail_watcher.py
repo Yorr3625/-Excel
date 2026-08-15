@@ -1,0 +1,355 @@
+import json
+
+import pytest
+
+from modules import mail_watcher
+
+
+@pytest.fixture(autouse=True)
+def _isolated(tmp_path, monkeypatch):
+    monkeypatch.setattr(mail_watcher, "MAIL_CONFIG_FILE", tmp_path / "mail.json")
+    monkeypatch.setattr(mail_watcher, "SEEN_FILE", tmp_path / "mail_seen.json")
+    monkeypatch.setattr(mail_watcher, "ORDERS_FOLDER", tmp_path / "orders")
+
+
+def _config(**overrides):
+    config = {
+        "enabled": True,
+        "imap_server": "imap.gmail.com",
+        "imap_port": 993,
+        "email": "me@gmail.com",
+        "app_password": "secret",
+        "senders": ["boss@example.com"],
+        "folder": "INBOX",
+        "since_days": 7,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_missing_config_falls_back_to_defaults():
+    config = mail_watcher.load_mail_config()
+
+    assert config["imap_server"] == "imap.gmail.com"
+    assert config["enabled"] is False
+
+
+def test_broken_config_does_not_crash():
+    mail_watcher.MAIL_CONFIG_FILE.write_text("{сломано", encoding="utf-8")
+
+    assert mail_watcher.load_mail_config()["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"enabled": False},
+        {"email": ""},
+        {"app_password": ""},
+        {"senders": []},
+    ],
+)
+def test_incomplete_config_is_not_ready(overrides):
+    assert not mail_watcher.is_configured(_config(**overrides))
+
+
+def test_full_config_is_ready():
+    assert mail_watcher.is_configured(_config())
+
+
+def test_check_mail_reports_missing_setup_instead_of_connecting():
+    result = mail_watcher.check_mail(_config(enabled=False))
+
+    assert not result["ok"]
+    assert "не настроена" in result["error"]
+
+
+def test_filename_from_letter_cannot_escape_orders_folder():
+    """Имя вложения приходит извне и попадает в путь — его нужно чистить."""
+
+    assert mail_watcher._safe_name("../../../evil.xlsx") == "evil.xlsx"
+    assert mail_watcher._safe_name("C:\\Windows\\system.xlsx") == "system.xlsx"
+    assert "/" not in mail_watcher._safe_name("a/b/c.xlsx")
+    assert mail_watcher._safe_name("") == "вложение.xlsx"
+    assert mail_watcher._safe_name("..") == "вложение.xlsx"
+
+
+def test_unique_path_does_not_overwrite_existing_order(tmp_path):
+    folder = tmp_path / "orders"
+    folder.mkdir()
+    (folder / "заказ.xlsx").write_text("первый", encoding="utf-8")
+
+    path = mail_watcher._unique_path(folder, "заказ.xlsx")
+
+    assert path.name == "заказ (2).xlsx"
+    assert (folder / "заказ.xlsx").read_text(encoding="utf-8") == "первый"
+
+
+def test_search_date_uses_english_month():
+    """IMAP не понимает названия месяцев в локали системы."""
+
+    date = mail_watcher._search_date(1)
+    month = date.split("-")[1]
+
+    assert month in mail_watcher._MONTHS
+
+
+def test_seen_ids_survive_roundtrip():
+    mail_watcher._save_seen(["<a@mail>", "<b@mail>"])
+
+    assert mail_watcher._load_seen() == ["<a@mail>", "<b@mail>"]
+
+
+def test_seen_list_is_capped(monkeypatch):
+    monkeypatch.setattr(mail_watcher, "SEEN_LIMIT", 3)
+
+    mail_watcher._save_seen([f"<{i}@mail>" for i in range(10)])
+
+    seen = mail_watcher._load_seen()
+
+    assert len(seen) == 3
+    assert seen[-1] == "<9@mail>"
+
+
+def test_broken_seen_file_does_not_crash():
+    mail_watcher.SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    mail_watcher.SEEN_FILE.write_text("не json", encoding="utf-8")
+
+    assert mail_watcher._load_seen() == []
+
+
+def test_decode_handles_encoded_subject():
+    encoded = "=?utf-8?b?0JfQsNC60LDQtw==?="
+
+    assert mail_watcher._decode(encoded) == "Заказ"
+
+
+def test_decode_survives_broken_header():
+    assert mail_watcher._decode("обычный текст") == "обычный текст"
+    assert mail_watcher._decode("") == ""
+
+
+class _FakePart:
+    def __init__(self, filename, payload, maintype="application"):
+        self._filename = filename
+        self._payload = payload
+        self._maintype = maintype
+
+    def get_content_maintype(self):
+        return self._maintype
+
+    def get_filename(self):
+        return self._filename
+
+    def get_payload(self, decode=False):
+        return self._payload
+
+
+class _FakeMessage:
+    def __init__(self, parts):
+        self._parts = parts
+
+    def walk(self):
+        return self._parts
+
+
+def test_only_excel_attachments_are_taken():
+    """Из письма забираем только таблицы: подпись, картинка, pdf — мимо."""
+
+    message = _FakeMessage([
+        _FakePart(None, None, maintype="multipart"),
+        _FakePart("заказ.xlsx", b"xlsx"),
+        _FakePart("подпись.png", b"png"),
+        _FakePart("накладная.pdf", b"pdf"),
+        _FakePart("данные.xlsm", b"xlsm"),
+        _FakePart(None, b"message body"),
+    ])
+
+    found = mail_watcher._attachments(message)
+
+    assert [name for name, _ in found] == ["заказ.xlsx", "данные.xlsm"]
+
+
+def test_attachment_name_is_sanitised_on_extraction():
+    message = _FakeMessage([_FakePart("../../evil.xlsx", b"xlsx")])
+
+    found = mail_watcher._attachments(message)
+
+    assert found[0][0] == "evil.xlsx"
+
+
+# --- сквозная проверка с поддельным IMAP ---
+
+
+def _letter_with_attachment(filename: str, payload: bytes, sender="boss@example.com"):
+    """Собирает настоящее письмо MIME с вложением.
+
+    Политика SMTP нужна, чтобы кириллица в теме и имени файла кодировалась
+    по RFC 2047 — именно в таком виде письма и приходят с почтового сервера.
+    """
+
+    from email.message import EmailMessage
+    from email.policy import SMTP
+
+    message = EmailMessage(policy=SMTP)
+    message["From"] = sender
+    message["To"] = "me@gmail.com"
+    message["Subject"] = "Заказ на завтра"
+    # Message-ID — структурный заголовок, кириллицу в него класть нельзя
+    message["Message-ID"] = f"<{abs(hash(filename))}@example.com>"
+    message.set_content("Файл во вложении")
+    message.add_attachment(
+        payload,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+    return message
+
+
+class _FakeIMAP:
+    """Минимальный IMAP-сервер, отдающий заранее заданные письма."""
+
+    def __init__(self, letters):
+        self._letters = letters
+        self.readonly_used = None
+        self.logged_in = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def login(self, email_addr, password):
+        self.logged_in = True
+        return "OK", [b""]
+
+    def select(self, folder, readonly=False):
+        self.readonly_used = readonly
+        return "OK", [b"1"]
+
+    def search(self, charset, *criteria):
+        return "OK", [b" ".join(str(i + 1).encode() for i in range(len(self._letters)))]
+
+    def fetch(self, uid, spec):
+        index = int(uid) - 1
+        return "OK", [(b"", self._letters[index].as_bytes())]
+
+
+def _order_xlsx_bytes(stores):
+    """xlsx со структурой заказа (строка 2 и столбцы 2-3 — служебные)."""
+
+    import io
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Товар", "служебный1", "служебный2", *stores])
+    ws.append(["служебная строка", "", "", *[""] * len(stores)])
+    ws.append(["Товар A", "", "", *[1] * len(stores)])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def _stores_for_validation(tmp_path, monkeypatch):
+    from modules import order_validator
+
+    region = tmp_path / "stores_region.json"
+    city = tmp_path / "stores_city.json"
+
+    region.write_text(
+        json.dumps({"route_1": ["фм 10", "фм 14", "фм 17"], "route_2": [], "route_3": [], "route_4": []}),
+        encoding="utf-8",
+    )
+    city.write_text(
+        json.dumps({"route_1": [], "route_2": [], "route_3": [], "route_4": []}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        order_validator,
+        "stores_file_for",
+        lambda mode: city if mode == "Город" else region,
+    )
+
+
+def test_order_from_letter_is_saved_and_accepted(monkeypatch, _stores_for_validation):
+    letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
+    fake = _FakeIMAP([letter])
+
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+
+    result = mail_watcher.check_mail(_config())
+
+    assert result["ok"], result["error"]
+    assert len(result["items"]) == 1
+
+    item = result["items"][0]
+    assert item["file"] == "заказ.xlsx"
+    assert item["verdict"]["ok"]
+    assert item["verdict"]["mode"] == "Область"
+    assert (mail_watcher.ORDERS_FOLDER / "заказ.xlsx").exists()
+
+    # почтовый ящик открыт только на чтение — письма не помечаются прочитанными
+    assert fake.readonly_used is True
+
+
+def test_foreign_excel_from_letter_is_saved_but_marked_not_order(monkeypatch, _stores_for_validation):
+    """Прислали Excel, но не заказ — файл виден, однако помечен как непригодный."""
+
+    import io
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Наименование", "Цена"])
+    ws.append(["Гвозди", 100])
+    buffer = io.BytesIO()
+    wb.save(buffer)
+
+    letter = _letter_with_attachment("прайс.xlsx", buffer.getvalue())
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: _FakeIMAP([letter]))
+
+    result = mail_watcher.check_mail(_config())
+
+    assert result["ok"]
+    assert len(result["items"]) == 1
+    assert not result["items"][0]["verdict"]["ok"]
+    assert "Не похоже на заказ" in result["items"][0]["verdict"]["reason"]
+
+
+def test_same_letter_is_not_downloaded_twice(monkeypatch, _stores_for_validation):
+    letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: _FakeIMAP([letter]))
+
+    first = mail_watcher.check_mail(_config())
+    second = mail_watcher.check_mail(_config())
+
+    assert len(first["items"]) == 1
+    assert second["items"] == []
+
+
+def test_letter_without_attachment_is_skipped(monkeypatch, _stores_for_validation):
+    from email.message import EmailMessage
+
+    from email.policy import SMTP
+
+    message = EmailMessage(policy=SMTP)
+    message["From"] = "boss@example.com"
+    message["Subject"] = "Просто письмо"
+    message["Message-ID"] = "<plain@example.com>"
+    message.set_content("Без вложений")
+
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: _FakeIMAP([message]))
+
+    result = mail_watcher.check_mail(_config())
+
+    assert result["ok"]
+    assert result["items"] == []

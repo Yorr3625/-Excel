@@ -1,0 +1,25 @@
+{
+  "_комментарий": "Скопируйте этот файл в config/mail.json и заполните. mail.json не попадает в git — в нём пароль.",
+
+  "enabled": false,
+
+  "imap_server": "imap.gmail.com",
+  "imap_port": 993,
+
+  "email": "ваш-адрес@gmail.com",
+  "_app_password": "Для Gmail нужен «пароль приложения», а не обычный пароль: myaccount.google.com/apppasswords (требуется включённая двухэтапная аутентификация). Вводится без пробелов.",
+  "app_password": "",
+
+  "_senders": "От кого ждём заказы. Можно несколько адресов.",
+  "senders": [
+    "отправитель@example.com"
+  ],
+
+  "folder": "INBOX",
+
+  "_since_days": "За сколько последних дней просматривать письма.",
+  "since_days": 7,
+
+  "_check_interval_minutes": "Как часто дашборд проверяет почту сам, пока открыт.",
+  "check_interval_minutes": 10
+}

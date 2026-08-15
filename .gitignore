@@ -20,6 +20,9 @@ reflex.lock/
 data/*
 !data/.gitkeep
 
+# Настройки почты — в них пароль приложения. В git только шаблон.
+config/mail.json
+
 # Ignore Excel files
 *.xlsx
 *.xls

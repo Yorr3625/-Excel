@@ -18,6 +18,7 @@ from modules.history import (
     record_processing,
     was_processed,
 )
+from modules.mail_watcher import check_mail, is_configured, load_mail_config
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 from modules.tracking_sim import (
@@ -73,6 +74,10 @@ FA_ICON_MAP = {
     "award": "FaAward",
     "list": "FaList",
     "map_pin": "FaLocationDot",
+    "mail": "FaEnvelope",
+    "inbox": "FaInbox",
+    "refresh": "FaRotate",
+    "circle_x": "FaCircleXmark",
     "x": "FaXmark",
     "plus": "FaPlus",
     "camera": "FaCamera",
@@ -115,6 +120,7 @@ VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3
 NAV_ITEMS = [
     ("Dashboard", "layout_dashboard"),
     ("Заказы", "package"),
+    ("Почта", "mail"),
     ("Маршруты", "route"),
     ("Трекинг", "truck"),
     ("История", "history"),
@@ -271,6 +277,14 @@ class State(rx.State):
     vehicles: list[dict] = []
     tracking_event_log: list[str] = []
 
+    mail_configured: bool = False
+    mail_checking: bool = False
+    mail_status: str = ""
+    mail_error: str = ""
+    mail_items: list[dict] = []
+    mail_auto: bool = False
+    mail_interval: int = 10
+
     tracking_view: str = "Симуляция"
     real_vehicles: list[dict] = []
     real_watching: bool = False
@@ -293,6 +307,110 @@ class State(rx.State):
             self.load_settings_form()
         elif page == "Трекинг" and not self.vehicles:
             self.init_tracking()
+        elif page == "Почта":
+            self.refresh_mail_config()
+
+    def refresh_mail_config(self):
+        config = load_mail_config()
+        self.mail_configured = is_configured(config)
+        self.mail_interval = max(int(config.get("check_interval_minutes", 10)), 1)
+
+        if not self.mail_configured:
+            self.mail_status = "Почта не настроена"
+
+    def check_mail_now(self):
+        """Разовая проверка по кнопке."""
+
+        self.mail_checking = True
+        self.mail_error = ""
+        self.mail_status = "Проверяю почту..."
+
+        try:
+            result = check_mail()
+        except Exception:
+            self.mail_error = traceback.format_exc()
+            self.mail_status = "Ошибка при проверке почты"
+            return
+        finally:
+            self.mail_checking = False
+
+        if not result["ok"]:
+            self.mail_error = result["error"]
+            self.mail_status = "Проверка не удалась"
+            return
+
+        # Reflex не умеет обращаться к вложенному словарю внутри foreach,
+        # поэтому вердикт разворачиваем в плоские поля.
+        found = [
+            {
+                "file": item["file"],
+                "path": item["path"],
+                "sender": item["sender"],
+                "subject": item["subject"],
+                "ok": item["verdict"]["ok"],
+                "reason": item["verdict"]["reason"],
+                "mode": item["verdict"]["mode"],
+                "matches": item["verdict"]["matches"],
+            }
+            for item in result["items"]
+        ]
+
+        # Новые письма кладём наверх, старые находки не теряем.
+        known = {item["path"] for item in found}
+        self.mail_items = found + [i for i in self.mail_items if i["path"] not in known]
+
+        suitable = sum(1 for item in found if item["ok"])
+
+        if not found:
+            self.mail_status = "Новых писем с вложениями нет"
+        else:
+            self.mail_status = (
+                f"Найдено вложений: {len(found)}, подходящих заказов: {suitable}"
+            )
+
+    def toggle_mail_auto(self, enabled: bool):
+        self.mail_auto = enabled
+
+        if enabled:
+            return State.watch_mail
+
+    @rx.event(background=True)
+    async def watch_mail(self):
+        """Периодическая проверка, пока дашборд открыт и переключатель включён."""
+
+        while True:
+            async with self:
+                if not self.mail_auto:
+                    return
+                interval = self.mail_interval
+
+            await asyncio.sleep(max(interval, 1) * 60)
+
+            async with self:
+                if not self.mail_auto:
+                    return
+                self.check_mail_now()
+
+    def take_mail_order(self, path: str, filename: str):
+        """Берёт найденный файл в обработку на странице «Заказы»."""
+
+        self.selected_file = filename
+        self.uploaded_file_path = path
+        self.output_file = ""
+        self.log_file = ""
+        self.error_text = ""
+        self.status = f"Файл из почты: {filename}"
+
+        processed_at = was_processed(filename)
+        self.duplicate_note = (
+            f"Этот файл уже обрабатывался {processed_at}. "
+            "Повторная обработка обновит суммы, а не добавит их ещё раз."
+            if processed_at
+            else ""
+        )
+
+        self.detect_and_set_mode()
+        self.current_page = "Заказы"
 
     @property
     def stores_file(self) -> Path:
@@ -1307,6 +1425,163 @@ def history_page():
     )
 
 
+def mail_setup_hint():
+    return panel_shell(
+        panel_title("mail", "Почта не настроена"),
+        rx.text(
+            "Скопируйте config/mail.example.json в config/mail.json и заполните: "
+            "адрес почты, пароль приложения и от кого ждём заказы.",
+            color=muted(),
+            font_size="13px",
+        ),
+        rx.text(
+            "Для Gmail нужен именно «пароль приложения» — обычный пароль Google "
+            "для почтовых программ больше не подходит. Создаётся на "
+            "myaccount.google.com/apppasswords при включённой двухэтапной аутентификации.",
+            color=muted(),
+            font_size="12px",
+        ),
+        rx.text(
+            "config/mail.json не попадает в git — пароль остаётся только на этом компьютере.",
+            color=muted(),
+            font_size="12px",
+        ),
+    )
+
+
+def mail_verdict_badge(is_order):
+    return rx.cond(
+        is_order,
+        rx.hstack(
+            fa_icon(tag="circle_check", size=13, color=ACCENT),
+            rx.text("Похоже на заказ", color=ACCENT, font_size="12px", font_weight="700"),
+            spacing="2",
+            align="center",
+        ),
+        rx.hstack(
+            fa_icon(tag="circle_x", size=13, color="#e5484d"),
+            rx.text("Не заказ", color="#e5484d", font_size="12px", font_weight="700"),
+            spacing="2",
+            align="center",
+        ),
+    )
+
+
+def mail_item_row(item):
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="file_spreadsheet", size=15, color=muted()),
+            rx.text(item["file"], color=text(), font_size="14px", font_weight="700"),
+            rx.spacer(),
+            mail_verdict_badge(item["ok"]),
+            width="100%",
+            align="center",
+            spacing="2",
+        ),
+        rx.text("От: ", item["sender"], color=muted(), font_size="12px"),
+        rx.cond(
+            item["subject"] != "",
+            rx.text("Тема: ", item["subject"], color=muted(), font_size="12px"),
+            rx.box(),
+        ),
+        rx.cond(
+            item["ok"],
+            rx.hstack(
+                rx.text(
+                    "Режим: ", item["mode"],
+                    " · магазинов найдено: ", item["matches"],
+                    color=muted(),
+                    font_size="12px",
+                ),
+                rx.spacer(),
+                secondary_button(
+                    "Взять в обработку",
+                    on_click=State.take_mail_order(item["path"], item["file"]),
+                    width="180px",
+                ),
+                width="100%",
+                align="center",
+            ),
+            rx.text(item["reason"], color="#e5484d", font_size="12px"),
+        ),
+        align="start",
+        spacing="2",
+        width="100%",
+        padding="14px 16px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+    )
+
+
+def mail_page():
+    return page_shell(
+        topbar(
+            "Почта",
+            "Заказы, пришедшие письмом. Файл скачивается и проверяется, "
+            "обработка — по кнопке.",
+        ),
+        rx.cond(
+            State.mail_configured,
+            rx.vstack(
+                panel_shell(
+                    rx.hstack(
+                        panel_title("inbox", "Проверка почты"),
+                        rx.spacer(),
+                        rx.hstack(
+                            rx.text(
+                                "Проверять каждые ", State.mail_interval, " мин",
+                                color=muted(),
+                                font_size="12px",
+                            ),
+                            rx.switch(
+                                checked=State.mail_auto,
+                                on_change=State.toggle_mail_auto,
+                                color_scheme="green",
+                            ),
+                            spacing="2",
+                            align="center",
+                        ),
+                        width="100%",
+                        align="center",
+                    ),
+                    rx.hstack(
+                        primary_button(
+                            rx.cond(State.mail_checking, "Проверяю...", "Проверить почту"),
+                            on_click=State.check_mail_now,
+                            width="200px",
+                        ),
+                        rx.text(State.mail_status, color=muted(), font_size="13px"),
+                        spacing="4",
+                        align="center",
+                        width="100%",
+                    ),
+                    rx.cond(
+                        State.mail_error != "",
+                        rx.text(State.mail_error, color="#e5484d", font_size="12px"),
+                        rx.box(),
+                    ),
+                ),
+                rx.cond(
+                    State.mail_items.length() > 0,
+                    panel_shell(
+                        panel_title("mail", "Найденные вложения"),
+                        rx.vstack(
+                            rx.foreach(State.mail_items, mail_item_row),
+                            spacing="3",
+                            width="100%",
+                        ),
+                    ),
+                    rx.box(),
+                ),
+                spacing="4",
+                width="100%",
+            ),
+            mail_setup_hint(),
+        ),
+    )
+
+
 def store_row(name, on_remove):
     return rx.hstack(
         fa_icon(tag="map_pin", size=13, color=muted()),
@@ -1849,6 +2124,7 @@ def main_content():
     return rx.match(
         State.current_page,
         ("Заказы", orders_page()),
+        ("Почта", mail_page()),
         ("Маршруты", routes_page()),
         ("Трекинг", tracking_page()),
         ("История", history_page()),
