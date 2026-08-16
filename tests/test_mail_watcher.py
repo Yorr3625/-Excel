@@ -8,11 +8,29 @@ from modules import mail_watcher
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(mail_watcher, "MAIL_CONFIG_FILE", tmp_path / "mail.json")
+    monkeypatch.setattr(
+        mail_watcher,
+        "MAIL_EXAMPLE_CONFIG_FILE",
+        tmp_path / "mail.example.json",
+    )
     monkeypatch.setattr(mail_watcher, "SEEN_FILE", tmp_path / "mail_seen.json")
     monkeypatch.setattr(mail_watcher, "MAIL_ITEMS_FILE", tmp_path / "mail_items.json")
     monkeypatch.setattr(mail_watcher, "MAIL_UID_CACHE_FILE", tmp_path / "mail_uid_cache.json")
     monkeypatch.setattr(mail_watcher, "ORDERS_FOLDER", tmp_path / "orders")
     monkeypatch.setattr(mail_watcher, "INVOICES_FOLDER", tmp_path / "invoices")
+
+
+def _write_example_sources():
+    mail_watcher.MAIL_EXAMPLE_CONFIG_FILE.write_text(
+        json.dumps({
+            "sources": [{
+                "name": "Заказы",
+                "email": "orders@example.com",
+                "kind": "orders",
+            }],
+        }),
+        encoding="utf-8",
+    )
 
 
 def _config(**overrides):
@@ -41,6 +59,49 @@ def test_broken_config_does_not_crash():
     mail_watcher.MAIL_CONFIG_FILE.write_text("{сломано", encoding="utf-8")
 
     assert mail_watcher.load_mail_config()["enabled"] is False
+
+
+def test_save_credentials_normalises_key_and_uses_template_sources():
+    _write_example_sources()
+
+    ok, message = mail_watcher.save_mail_credentials(
+        "  me@example.com ",
+        "abcd efgh ijkl mnop",
+    )
+
+    assert ok
+    assert message == "Данные почты сохранены"
+    saved = mail_watcher.load_mail_config()
+    assert saved["enabled"] is True
+    assert saved["email"] == "me@example.com"
+    assert saved["app_password"] == "abcdefghijklmnop"
+    assert saved["sources"][0]["email"] == "orders@example.com"
+
+
+def test_save_credentials_rejects_missing_values():
+    _write_example_sources()
+
+    ok, message = mail_watcher.save_mail_credentials("", "secret")
+    assert not ok
+    assert message == "Введите адрес электронной почты"
+
+    ok, message = mail_watcher.save_mail_credentials("me@example.com", "")
+    assert not ok
+    assert message == "Введите ключ приложения"
+    assert not mail_watcher.MAIL_CONFIG_FILE.exists()
+
+
+def test_save_credentials_keeps_existing_key_when_edit_field_is_empty():
+    _write_example_sources()
+    first_ok, _ = mail_watcher.save_mail_credentials("old@example.com", "old key")
+    assert first_ok
+
+    second_ok, _ = mail_watcher.save_mail_credentials("new@example.com", "")
+
+    assert second_ok
+    saved = mail_watcher.load_mail_config()
+    assert saved["email"] == "new@example.com"
+    assert saved["app_password"] == "oldkey"
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,7 @@ from modules.paths import CONFIG_DIR, DATA_DIR, INVOICES_FOLDER, ORDERS_FOLDER
 
 
 MAIL_CONFIG_FILE = CONFIG_DIR / "mail.json"
+MAIL_EXAMPLE_CONFIG_FILE = CONFIG_DIR / "mail.example.json"
 SEEN_FILE = DATA_DIR / "mail_seen.json"
 MAIL_ITEMS_FILE = DATA_DIR / "mail_items.json"
 MAIL_UID_CACHE_FILE = DATA_DIR / "mail_uid_cache.json"
@@ -66,6 +67,48 @@ def load_mail_config() -> dict:
         pass
 
     return config
+
+
+def _normalise_app_password(value: str) -> str:
+    """Убирает пробелы из ключа приложения, показанного группами."""
+
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def save_mail_credentials(email_addr: str, app_password: str) -> tuple[bool, str]:
+    """Сохраняет адрес и пароль приложения, не раскрывая пароль наружу."""
+
+    email_addr = str(email_addr or "").strip()
+    config = load_mail_config()
+    password = _normalise_app_password(app_password)
+
+    if not email_addr:
+        return False, "Введите адрес электронной почты"
+
+    # При редактировании пустое поле означает «оставить текущий ключ».
+    if not password:
+        password = _normalise_app_password(config.get("app_password"))
+
+    if not password:
+        return False, "Введите ключ приложения"
+
+    if not sources(config):
+        template = _read_json(MAIL_EXAMPLE_CONFIG_FILE, {})
+        template_sources = template.get("sources") or []
+
+        if template_sources:
+            config["sources"] = template_sources
+
+    if not sources(config):
+        return False, "Не настроены отправители заказов и накладных"
+
+    config.update({
+        "enabled": True,
+        "email": email_addr,
+        "app_password": password,
+    })
+    _write_json(MAIL_CONFIG_FILE, config)
+    return True, "Данные почты сохранены"
 
 
 def sources(config: dict | None = None) -> list[dict]:

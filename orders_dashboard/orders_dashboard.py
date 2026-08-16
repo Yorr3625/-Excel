@@ -28,6 +28,7 @@ from modules.mail_watcher import (
     link_invoice,
     load_mail_config,
     load_mail_items,
+    save_mail_credentials as save_mail_credentials_config,
     sources as mail_sources_config,
     split_invoice_candidates,
     unlink_invoice,
@@ -100,6 +101,7 @@ FA_ICON_MAP = {
     "store": "FaStore",
     "fuel": "FaGasPump",
     "triangle_alert": "FaTriangleExclamation",
+    "key": "FaKey",
 }
 
 
@@ -124,6 +126,7 @@ fa_icon = FaIcon.create
 
 ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
+MAIL_APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
 VOLUME_CHART_DAYS = 31
@@ -292,6 +295,10 @@ class State(rx.State):
     tracking_event_log: list[str] = []
 
     mail_configured: bool = False
+    mail_credentials_editing: bool = False
+    mail_email: str = ""
+    mail_app_password: str = ""
+    mail_credentials_status: str = ""
     mail_checking: bool = False
     mail_status: str = ""
     mail_error: str = ""
@@ -344,6 +351,8 @@ class State(rx.State):
     def refresh_mail_config(self):
         config = load_mail_config()
         self.mail_configured = is_configured(config)
+        self.mail_email = str(config.get("email", ""))
+        self.mail_app_password = ""
         self.mail_interval = max(int(config.get("check_interval_minutes", 10)), 1)
         self.mail_sources = ["Все"] + [item["name"] for item in mail_sources_config(config)]
 
@@ -353,7 +362,36 @@ class State(rx.State):
         self._reload_mail_items()
 
         if not self.mail_configured:
+            self.mail_credentials_editing = True
             self.mail_status = "Почта не настроена"
+
+    def set_mail_email(self, value: str):
+        self.mail_email = value
+        self.mail_credentials_status = ""
+
+    def set_mail_app_password(self, value: str):
+        self.mail_app_password = value
+        self.mail_credentials_status = ""
+
+    def edit_mail_credentials(self):
+        self.mail_credentials_editing = True
+        self.mail_app_password = ""
+        self.mail_credentials_status = ""
+
+    def save_mail_credentials_form(self):
+        ok, message = save_mail_credentials_config(
+            self.mail_email,
+            self.mail_app_password,
+        )
+        self.mail_credentials_status = message
+
+        if not ok:
+            return
+
+        self.mail_app_password = ""
+        self.mail_credentials_editing = False
+        self.refresh_mail_config()
+        self.mail_status = "Данные сохранены. Нажмите «Проверить почту»"
 
     @staticmethod
     def _mail_item_for_view(item: dict) -> dict:
@@ -1847,22 +1885,103 @@ def order_details_drawer():
 
 def mail_setup_hint():
     return panel_shell(
-        panel_title("mail", "Почта не настроена"),
+        panel_title("key", "Подключение к почте"),
         rx.text(
-            "Скопируйте config/mail.example.json в config/mail.json и заполните: "
-            "адрес почты, пароль приложения и от кого ждём заказы.",
+            "Введите адрес Gmail и ключ приложения — файл настроек создастся автоматически.",
             color=muted(),
             font_size="13px",
         ),
-        rx.text(
-            "Для Gmail нужен именно «пароль приложения» — обычный пароль Google "
-            "для почтовых программ больше не подходит. Создаётся на "
-            "myaccount.google.com/apppasswords при включённой двухэтапной аутентификации.",
-            color=muted(),
-            font_size="12px",
+        rx.vstack(
+            rx.text(
+                "Электронная почта",
+                color=text(),
+                font_size="13px",
+                font_weight="700",
+            ),
+            rx.input(
+                value=State.mail_email,
+                on_change=State.set_mail_email,
+                placeholder="your-address@gmail.com",
+                type="email",
+                width="100%",
+                height="44px",
+            ),
+            align="start",
+            spacing="2",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text(
+                "Ключ приложения (пароль приложения)",
+                color=text(),
+                font_size="13px",
+                font_weight="700",
+            ),
+            rx.input(
+                value=State.mail_app_password,
+                on_change=State.set_mail_app_password,
+                placeholder="xxxx xxxx xxxx xxxx",
+                type="password",
+                width="100%",
+                height="44px",
+            ),
+            rx.cond(
+                State.mail_configured,
+                rx.text(
+                    "Оставьте поле пустым, чтобы сохранить действующий ключ.",
+                    color=muted(),
+                    font_size="12px",
+                ),
+                rx.text(
+                    "Обычный пароль Google не подходит — нужен отдельный ключ приложения.",
+                    color=muted(),
+                    font_size="12px",
+                ),
+            ),
+            align="start",
+            spacing="2",
+            width="100%",
+        ),
+        rx.flex(
+            primary_button(
+                "Сохранить и подключить",
+                on_click=State.save_mail_credentials_form,
+                width="230px",
+            ),
+            rx.link(
+                rx.hstack(
+                    fa_icon(tag="key", size=14, color=ACCENT),
+                    rx.text("Получить ключ приложения Google"),
+                    spacing="2",
+                    align="center",
+                ),
+                href=MAIL_APP_PASSWORD_URL,
+                target="_blank",
+                color=ACCENT,
+                font_size="13px",
+                font_weight="700",
+                text_decoration="none",
+            ),
+            gap="16px",
+            align="center",
+            wrap="wrap",
+            width="100%",
+        ),
+        rx.cond(
+            State.mail_credentials_status != "",
+            rx.text(
+                State.mail_credentials_status,
+                color=rx.cond(
+                    State.mail_credentials_status == "Данные почты сохранены",
+                    ACCENT,
+                    "#e5484d",
+                ),
+                font_size="12px",
+            ),
+            rx.box(),
         ),
         rx.text(
-            "config/mail.json не попадает в git — пароль остаётся только на этом компьютере.",
+            "Адрес и ключ сохраняются только на этом компьютере в config/mail.json; файл не попадает в git.",
             color=muted(),
             font_size="12px",
         ),
@@ -1987,10 +2106,20 @@ def mail_page():
         rx.cond(
             State.mail_configured,
             rx.vstack(
+                rx.cond(
+                    State.mail_credentials_editing,
+                    mail_setup_hint(),
+                    rx.box(),
+                ),
                 panel_shell(
                     rx.hstack(
                         panel_title("inbox", "Проверка почты"),
                         rx.spacer(),
+                        secondary_button(
+                            "Изменить вход",
+                            on_click=State.edit_mail_credentials,
+                            width="150px",
+                        ),
                         rx.hstack(
                             rx.text(
                                 "Проверять каждые ", State.mail_interval, " мин",
