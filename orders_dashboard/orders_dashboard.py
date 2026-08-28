@@ -13,6 +13,7 @@ from starlette.routing import Route
 
 from modules import driver_data, paths
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
+from modules.excel_io import EXCEL_MIME_TYPES, is_excel_file
 from modules.history import (
     load_processed_files,
     load_volume_history,
@@ -133,6 +134,7 @@ VOLUME_CHART_DAYS = 31
 ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
 VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3", "Маршрут 4"]
+SUPPORTED_EXCEL_LABEL = ".xlsx, .xlsm, .xlsb, .xls, .xltx, .xltm"
 
 NAV_ITEMS = [
     ("Dashboard", "layout_dashboard"),
@@ -926,23 +928,30 @@ class State(rx.State):
             return
 
         for file in files:
-            data = await file.read()
             filename = getattr(file, "filename", None) or file.name
+
+            if not is_excel_file(filename):
+                self.status = (
+                    f"Неподдерживаемый формат файла: {Path(filename).suffix or 'без расширения'}"
+                )
+                return
+
+            data = await file.read()
             upload_dir = rx.get_upload_dir()
             upload_dir.mkdir(parents=True, exist_ok=True)
-            output_path = upload_dir / filename
+            output_path = upload_dir / Path(filename).name
             output_path.write_bytes(data)
 
-            self.selected_file = filename
+            self.selected_file = output_path.name
             self.uploaded_file_path = str(output_path)
-            self.status = f"Файл загружен: {filename}"
+            self.status = f"Файл загружен: {output_path.name}"
             self.output_file = ""
             self.log_file = ""
             self.error_text = ""
 
             # Консольная версия предупреждает о повторной обработке —
             # в дашборде такого предупреждения не было.
-            processed_at = was_processed(filename)
+            processed_at = was_processed(output_path.name)
             self.duplicate_note = (
                 f"Этот файл уже обрабатывался {processed_at}. "
                 "Повторная обработка обновит суммы, а не добавит их ещё раз."
@@ -1274,7 +1283,7 @@ def upload_area():
             ),
             rx.vstack(
                 rx.text("1. Выберите Excel-файл", color=text(), font_size="15px", font_weight="800"),
-                rx.text("Нажмите на эту область или перетащите сюда файл .xlsx", color=muted(), font_size="12px"),
+                rx.text(f"Поддерживаются форматы: {SUPPORTED_EXCEL_LABEL}", color=muted(), font_size="12px"),
                 rx.vstack(
                     rx.foreach(
                         rx.selected_files(UPLOAD_ID),
@@ -1294,9 +1303,7 @@ def upload_area():
             width="100%",
         ),
         id=UPLOAD_ID,
-        accept={
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
-        },
+        accept=EXCEL_MIME_TYPES,
         max_files=1,
         border=f"1px dashed {border()}",
         border_radius="10px",

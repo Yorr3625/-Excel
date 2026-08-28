@@ -12,12 +12,14 @@ config/stores_*.json. У постороннего файла совпадени�
 from pathlib import Path
 
 from modules.config import build_groups, load_stores
+from modules.excel_io import EXCEL_SUFFIXES, is_excel_file
 from modules.paths import stores_file_for
 from modules.pipeline import detect_mode
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 
 
-ALLOWED_SUFFIXES = (".xlsx", ".xlsm")
+# Backwards-compatible name used by the mail watcher and integrations.
+ALLOWED_SUFFIXES = EXCEL_SUFFIXES
 
 # Ниже этого числа найденных магазинов файл считаем не заказом. Реальные
 # заказы дают десятки совпадений, случайное срабатывание на постороннем
@@ -51,7 +53,7 @@ def validate_order_file(path) -> dict:
         verdict["reason"] = "Файл не найден"
         return verdict
 
-    if path.suffix.lower() not in ALLOWED_SUFFIXES:
+    if not is_excel_file(path):
         verdict["reason"] = f"Не Excel-файл ({path.suffix or 'без расширения'})"
         return verdict
 

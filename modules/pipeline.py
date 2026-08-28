@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from openpyxl import load_workbook
+from modules.excel_io import load_workbook
 
 from modules.excel_cleaner import (
     remove_unused_rows_and_cols,

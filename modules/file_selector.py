@@ -1,5 +1,6 @@
 import os
 
+from modules.excel_io import is_excel_file
 from modules.paths import ORDERS_FOLDER
 
 
@@ -13,7 +14,7 @@ def select_order_file():
 
     for file in os.listdir(ORDERS_FOLDER):
 
-        if file.endswith((".xlsx", ".xlsm")):
+        if is_excel_file(file):
 
             files.append(file)
 

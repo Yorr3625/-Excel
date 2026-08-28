@@ -19,6 +19,7 @@ from modules.styles import (
     conflict_fill,
 )
 from modules.history import record_processing
+from modules.excel_io import excel_glob_pattern, is_excel_file
 from modules.file_selector import ORDERS_FOLDER
 from modules.output_writer import PROCESSED_FOLDER
 from modules.logger import LOGS_FOLDER
@@ -168,7 +169,7 @@ class App:
         path = filedialog.askopenfilename(
             title="Выберите файл заказа",
             initialdir=ORDERS_FOLDER,
-            filetypes=[("Excel файлы", "*.xlsx *.xlsm")],
+            filetypes=[("Excel файлы", excel_glob_pattern())],
         )
 
         if path:
@@ -268,7 +269,7 @@ class App:
                 if name.startswith("~$"):
                     continue
 
-                if name.endswith((".xlsx", ".xlsm")):
+                if is_excel_file(name):
 
                     full_path = os.path.join(root_dir, name)
                     found.append(full_path)

@@ -1,6 +1,6 @@
 import os
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from modules.pipeline import process_order, detect_mode
 from modules.styles import conflict_fill
@@ -37,6 +37,32 @@ def test_process_order_respects_open_file_setting(tmp_path, monkeypatch, groups,
     output_file, _, _ = process_order(str(input_file), settings, groups, conflict_fill)
 
     assert calls == [output_file]
+
+
+def test_process_order_handles_a_converted_binary_workbook(
+    tmp_path, monkeypatch, groups
+):
+    monkeypatch.chdir(tmp_path)
+    input_file = tmp_path / "заказ.xlsb"
+    input_file.write_bytes(b"binary fixture")
+
+    converted = Workbook()
+    worksheet = converted.active
+    worksheet.append(["Товар", "служебный1", "служебный2", "фм 4", "фм 42"])
+    worksheet.append(["служебная строка", "", "", "", ""])
+    worksheet.append(["Товар A", "", "", 5, 3])
+    monkeypatch.setattr("modules.pipeline.load_workbook", lambda path: converted)
+
+    output_file, _, stats = process_order(
+        str(input_file),
+        {"open_file_after_processing": False, "open_folder_after_processing": False},
+        groups,
+        conflict_fill,
+    )
+
+    assert output_file.endswith(".xlsx")
+    assert stats["route_totals"] == {"Маршрут №1": 5, "Маршрут №2": 3}
+    assert "Маршрут №1" in load_workbook(output_file).sheetnames
 
 
 def test_detect_mode_picks_group_set_with_more_matches(tmp_path, groups, sample_order_workbook):

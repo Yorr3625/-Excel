@@ -6,6 +6,13 @@ from openpyxl import Workbook
 from modules import order_validator, paths
 
 
+def test_all_excel_book_suffixes_are_allowed():
+    for suffix in (".xlsx", ".xlsm", ".xlsb", ".xls", ".xltx", ".xltm"):
+        assert suffix in order_validator.ALLOWED_SUFFIXES
+
+    assert ".csv" not in order_validator.ALLOWED_SUFFIXES
+
+
 STORES = {
     "route_1": ["фм 10", "фм 14", "фм 17"],
     "route_2": ["фм 13", "фм 32"],

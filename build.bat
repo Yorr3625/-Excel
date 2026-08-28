@@ -11,11 +11,11 @@ echo =====================================
 echo.
 
 echo Проверка PyInstaller (если не установлен)...
-pip install pyinstaller openpyxl
+pip install pyinstaller -r requirements.txt
 
 echo.
 echo Создание exe из gui.py...
-pyinstaller --onefile --windowed --name "Обработка заказов" gui.py
+pyinstaller --onefile --windowed --collect-all python_calamine --name "Обработка заказов" gui.py
 
 echo.
 echo =====================================

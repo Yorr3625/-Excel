@@ -226,12 +226,29 @@ def test_only_excel_attachments_are_taken():
         _FakePart("подпись.png", b"png"),
         _FakePart("накладная.pdf", b"pdf"),
         _FakePart("данные.xlsm", b"xlsm"),
+        _FakePart("старый.xls", b"xls"),
+        _FakePart("бинарный.xlsb", b"xlsb"),
+        _FakePart("шаблон.xltx", b"xltx"),
+        _FakePart("макро-шаблон.xltm", b"xltm"),
         _FakePart(None, b"message body"),
     ])
 
     found = mail_watcher._attachments(message)
 
-    assert [name for name, _ in found] == ["заказ.xlsx", "данные.xlsm"]
+    assert [name for name, _ in found] == [
+        "заказ.xlsx",
+        "данные.xlsm",
+        "старый.xls",
+        "бинарный.xlsb",
+        "шаблон.xltx",
+        "макро-шаблон.xltm",
+    ]
+
+
+def test_excel_attachment_suffix_matching_is_case_insensitive():
+    message = _FakeMessage([_FakePart("ЗАКАЗ.XLSB", b"xlsb")])
+
+    assert mail_watcher._attachments(message)[0][0] == "ЗАКАЗ.XLSB"
 
 
 def test_attachment_name_is_sanitised_on_extraction():
