@@ -1,0 +1,19 @@
+{
+  "env": {
+    "CLAUDE_CODE_GLOB_NO_IGNORE": "false"
+  },
+  "permissions": {
+    "deny": [
+      "Read(/.git/**)",
+      "Read(/.venv/**)",
+      "Read(/.web/**)",
+      "Read(/data/**)",
+      "Read(/.pytest_cache/**)",
+      "Read(/__pycache__/**)",
+      "Read(/build/**)",
+      "Read(/dist/**)",
+      "Read(/config/mail.json)",
+      "Read(/~/**)"
+    ]
+  }
+}

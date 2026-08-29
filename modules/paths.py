@@ -33,6 +33,7 @@ TRACKING_FOLDER = DATA_DIR / "tracking_data"
 PROCESSED_FILES_FILE = DATA_DIR / "processed_files.json"
 VOLUME_HISTORY_FILE = DATA_DIR / "volume_history.json"
 ROUTE_BACKUPS_FILE = DATA_DIR / "route_backups.json"
+BACKUP_SETTINGS_FILE = CONFIG_DIR / "backup.json"
 
 
 def stores_file_for(mode: str) -> Path:

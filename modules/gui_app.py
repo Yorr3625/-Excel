@@ -4,6 +4,14 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from modules.backup import (
+    BackupError,
+    create_backup,
+    list_backups,
+    load_backup_directory,
+    restore_backup,
+    save_backup_directory,
+)
 from modules.config import (
     load_settings,
     load_stores,
@@ -65,14 +73,17 @@ class App:
         self.process_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
         self.routes_tab = ttk.Frame(notebook)
+        self.backups_tab = ttk.Frame(notebook)
 
         notebook.add(self.process_tab, text="Обработка")
         notebook.add(self.settings_tab, text="Настройки")
         notebook.add(self.routes_tab, text="Маршруты")
+        notebook.add(self.backups_tab, text="Резервные копии")
 
         self._build_process_tab()
         self._build_settings_tab()
         self._build_routes_tab()
+        self._build_backups_tab()
 
         self.refresh_recent_files()
 
@@ -464,6 +475,132 @@ class App:
             widget.destroy()
 
         self._build_routes_tab()
+
+    # ==========================================================
+    # ВКЛАДКА "РЕЗЕРВНЫЕ КОПИИ"
+    # ==========================================================
+
+    def _build_backups_tab(self):
+        container = ttk.Frame(self.backups_tab)
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ttk.Label(
+            container,
+            text=(
+                "Сохраняются статистика, история почты, списки маршрутов и настройки. "
+                "Рабочие книги, PDF и логи не копируются."
+            ),
+            wraplength=900,
+        ).pack(anchor="w", pady=(0, 10))
+
+        folder_row = ttk.Frame(container)
+        folder_row.pack(fill="x", pady=(0, 12))
+        ttk.Label(folder_row, text="Папка:").pack(side="left")
+        self.backup_directory_var = tk.StringVar(value=str(load_backup_directory()))
+        ttk.Entry(folder_row, textvariable=self.backup_directory_var).pack(
+            side="left", fill="x", expand=True, padx=8
+        )
+        ttk.Button(folder_row, text="Выбрать...", command=self.choose_backup_directory).pack(side="left")
+        ttk.Button(
+            folder_row,
+            text="Сохранить папку",
+            command=self.save_backup_directory_tab,
+        ).pack(side="left", padx=(6, 0))
+
+        action_row = ttk.Frame(container)
+        action_row.pack(fill="x", pady=(0, 8))
+        ttk.Button(action_row, text="Создать копию", command=self.create_backup_tab).pack(side="left")
+        ttk.Button(
+            action_row,
+            text="Обновить список",
+            command=self.refresh_backup_list,
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            action_row,
+            text="Восстановить выбранную",
+            command=self.restore_selected_backup,
+        ).pack(side="left")
+
+        self.backup_list = tk.Listbox(container, height=14)
+        self.backup_list.pack(fill="both", expand=True)
+        self.backup_list.bind("<Double-Button-1>", lambda _event: self.restore_selected_backup())
+        self.backup_status_var = tk.StringVar()
+        ttk.Label(container, textvariable=self.backup_status_var).pack(anchor="w", pady=(8, 0))
+        self.refresh_backup_list()
+
+    def choose_backup_directory(self):
+        selected = filedialog.askdirectory(
+            title="Выберите папку для резервных копий",
+            initialdir=self.backup_directory_var.get() or os.getcwd(),
+        )
+        if selected:
+            self.backup_directory_var.set(selected)
+
+    def save_backup_directory_tab(self):
+        try:
+            directory = save_backup_directory(self.backup_directory_var.get())
+            self.backup_directory_var.set(str(directory))
+            self.refresh_backup_list()
+            self.backup_status_var.set("Папка резервных копий сохранена.")
+        except BackupError as error:
+            messagebox.showerror("Резервные копии", str(error))
+
+    def refresh_backup_list(self):
+        if not hasattr(self, "backup_list"):
+            return
+        try:
+            items = list_backups(self.backup_directory_var.get())
+        except BackupError as error:
+            self.backup_status_var.set(str(error))
+            return
+
+        self._backup_items = items
+        self.backup_list.delete(0, "end")
+        for item in items:
+            if item.valid:
+                warning = " · содержит mail.json" if item.contains_secrets else ""
+                label = f"{item.name} · {item.file_count} файлов · {item.size_bytes} байт{warning}"
+            else:
+                label = f"{item.name} · ПОВРЕЖДЕНА: {item.error}"
+            self.backup_list.insert("end", label)
+
+    def create_backup_tab(self):
+        try:
+            info = create_backup(self.backup_directory_var.get(), reason="вручную")
+            self.refresh_backup_list()
+            self.backup_status_var.set(f"Копия создана: {info.name}")
+        except BackupError as error:
+            messagebox.showerror("Резервные копии", str(error))
+
+    def restore_selected_backup(self):
+        selection = self.backup_list.curselection()
+        if not selection:
+            messagebox.showinfo("Резервные копии", "Выберите корректную копию.")
+            return
+
+        item = self._backup_items[selection[0]]
+        if not item.valid:
+            messagebox.showerror("Резервные копии", "Выбранная копия повреждена.")
+            return
+
+        if not messagebox.askyesno(
+            "Подтвердите восстановление",
+            (
+                "Текущие статистика, история почты, списки маршрутов и настройки "
+                "будут заменены. Перед этим создастся страховочная копия. Продолжить?"
+            ),
+        ):
+            return
+
+        try:
+            result = restore_backup(item.path)
+            safety = f" Страховочная копия: {result.safety_backup.name}." if result.safety_backup else ""
+            self.refresh_backup_list()
+            self.reload_settings_tab()
+            self.reload_routes_tab()
+            self.backup_status_var.set(f"Состояние восстановлено.{safety}")
+        except BackupError as error:
+            messagebox.showerror("Резервные копии", str(error))
 
 
 def _parse_value(text):

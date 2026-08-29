@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -16,6 +17,7 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(mail_watcher, "SEEN_FILE", tmp_path / "mail_seen.json")
     monkeypatch.setattr(mail_watcher, "MAIL_ITEMS_FILE", tmp_path / "mail_items.json")
     monkeypatch.setattr(mail_watcher, "MAIL_UID_CACHE_FILE", tmp_path / "mail_uid_cache.json")
+    monkeypatch.setattr(mail_watcher, "MAIL_ERROR_LOG_FILE", tmp_path / "mail_errors.json")
     monkeypatch.setattr(mail_watcher, "ORDERS_FOLDER", tmp_path / "orders")
     monkeypatch.setattr(mail_watcher, "INVOICES_FOLDER", tmp_path / "invoices")
 
@@ -302,6 +304,7 @@ class _FakeIMAP:
         self.readonly_used = None
         self.logged_in = False
         self.fetch_calls = 0
+        self.search_calls = 0
 
     def __enter__(self):
         return self
@@ -328,12 +331,118 @@ class _FakeIMAP:
         raise AssertionError(f"Неожиданная UID-команда: {command}")
 
     def search(self, charset, *criteria):
+        self.search_calls += 1
         return "OK", [b" ".join(str(i + 1).encode() for i in range(len(self._letters)))]
 
     def fetch(self, uid, spec):
         self.fetch_calls += 1
         index = int(uid) - 1
         return "OK", [(b"", self._letters[index].as_bytes())]
+
+
+def test_check_connection_logs_in_without_searching(monkeypatch):
+    fake = _FakeIMAP([])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+
+    result = mail_watcher.check_mail_connection(_config())
+
+    assert result == {"ok": True, "error": "", "retryable": False}
+    assert fake.logged_in is True
+    assert fake.readonly_used is True
+    assert fake.search_calls == 0
+    assert fake.fetch_calls == 0
+
+
+def test_check_connection_does_not_retry_authentication_error(monkeypatch):
+    class AuthenticationFailure(_FakeIMAP):
+        def login(self, email_addr, password):
+            raise mail_watcher.imaplib.IMAP4.error("AUTHENTICATIONFAILED")
+
+    monkeypatch.setattr(
+        mail_watcher.imaplib,
+        "IMAP4_SSL",
+        lambda *a, **kw: AuthenticationFailure([]),
+    )
+
+    result = mail_watcher.check_mail_connection(_config())
+
+    assert result["ok"] is False
+    assert result["retryable"] is False
+    assert len(mail_watcher.load_mail_error_log()) == 1
+
+
+def test_mail_retry_stops_after_success(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def fake_check(config):
+        calls.append(config)
+        if len(calls) < 3:
+            return {
+                "ok": False,
+                "error": "временный сбой",
+                "items": [],
+                "retryable": True,
+            }
+        return {"ok": True, "error": "", "items": [], "retryable": False}
+
+    monkeypatch.setattr(mail_watcher, "check_mail", fake_check)
+    monkeypatch.setattr(mail_watcher.time, "sleep", sleeps.append)
+
+    result = mail_watcher.check_mail_with_retry(
+        _config(retry_attempts=5, retry_delay_seconds=0.25)
+    )
+
+    assert result["ok"] is True
+    assert result["attempts"] == 3
+    assert len(calls) == 3
+    assert sleeps == [0.25, 0.25]
+
+
+def test_mail_retry_does_not_repeat_permanent_error(monkeypatch):
+    calls = []
+
+    def fake_check(config):
+        calls.append(config)
+        return {
+            "ok": False,
+            "error": "неверный пароль",
+            "items": [],
+            "retryable": False,
+        }
+
+    monkeypatch.setattr(mail_watcher, "check_mail", fake_check)
+
+    result = mail_watcher.check_mail_with_retry(_config(retry_attempts=5))
+
+    assert result["attempts"] == 1
+    assert len(calls) == 1
+
+
+def test_mail_error_log_masks_credentials_limits_and_clears(monkeypatch):
+    monkeypatch.setattr(mail_watcher, "MAIL_ERROR_LOG_LIMIT", 2)
+    config = _config(email="private@example.com", app_password="top secret")
+
+    for index in range(3):
+        mail_watcher.append_mail_error(
+            "Проверка",
+            f"Ошибка {index}: private@example.com / top secret / topsecret",
+            config,
+        )
+
+    entries = mail_watcher.load_mail_error_log()
+    combined = json.dumps(entries, ensure_ascii=False)
+
+    assert len(entries) == 2
+    assert entries[0]["error"].startswith("Ошибка 2")
+    assert "private@example.com" not in combined
+    assert "top secret" not in combined
+    assert "topsecret" not in combined
+    assert "***" in combined
+
+    mail_watcher.clear_mail_error_log()
+
+    assert mail_watcher.load_mail_error_log() == []
 
 
 def _order_xlsx_bytes(stores):
@@ -500,8 +609,9 @@ def test_seen_letter_missing_from_cache_is_restored(monkeypatch, _stores_for_val
 
 
 def test_mail_cache_removes_old_messages_but_keeps_linked_invoices():
-    recent = "2026-08-15T09:00:00+03:00"
-    old = "2026-07-01T09:00:00+03:00"
+    now = datetime.now().astimezone()
+    recent = (now - timedelta(days=2)).isoformat()
+    old = (now - timedelta(days=30)).isoformat()
     items = [
         {"message_id": "recent", "received_at": recent, "order_file": ""},
         {"message_id": "old", "received_at": old, "order_file": ""},

@@ -36,5 +36,11 @@
   "cache_days": 14,
 
   "_check_interval_minutes": "Как часто дашборд проверяет почту сам, пока открыт.",
-  "check_interval_minutes": 10
+  "check_interval_minutes": 10,
+
+  "_retry_attempts": "Сколько попыток делает только автоматическая проверка при временной ошибке (от 1 до 5).",
+  "retry_attempts": 3,
+
+  "_retry_delay_seconds": "Пауза между автоматическими попытками в секундах.",
+  "retry_delay_seconds": 5
 }

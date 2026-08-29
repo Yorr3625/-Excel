@@ -12,6 +12,14 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from modules import driver_data, paths
+from modules.backup import (
+    BackupError,
+    create_backup,
+    list_backups,
+    load_backup_directory,
+    restore_backup,
+    save_backup_directory,
+)
 from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
 from modules.excel_io import EXCEL_MIME_TYPES, is_excel_file
 from modules.history import (
@@ -24,10 +32,16 @@ from modules.mail_watcher import (
     KIND_INVOICES,
     KIND_MESSAGE,
     KIND_ORDERS,
+    MailErrorEntry,
+    append_mail_error,
     check_mail,
+    check_mail_connection,
+    check_mail_with_retry,
+    clear_mail_error_log,
     is_configured,
     link_invoice,
     load_mail_config,
+    load_mail_error_log,
     load_mail_items,
     save_mail_credentials as save_mail_credentials_config,
     sources as mail_sources_config,
@@ -36,6 +50,8 @@ from modules.mail_watcher import (
 )
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
+from modules.version import APP_NAME, APP_VERSION, Release, load_changelog
+from modules.updater import check_for_update as check_remote_update, update_project
 from modules.tracking_sim import (
     ROUTE_COLORS,
     ROUTE_KEYS,
@@ -103,6 +119,9 @@ FA_ICON_MAP = {
     "fuel": "FaGasPump",
     "triangle_alert": "FaTriangleExclamation",
     "key": "FaKey",
+    "info": "FaCircleInfo",
+    "save": "FaFloppyDisk",
+    "folder": "FaFolderOpen",
 }
 
 
@@ -135,6 +154,7 @@ ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
 VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3", "Маршрут 4"]
 SUPPORTED_EXCEL_LABEL = ".xlsx, .xlsm, .xlsb, .xls, .xltx, .xltm"
+VERSION_HISTORY = load_changelog()
 
 NAV_ITEMS = [
     ("Dashboard", "layout_dashboard"),
@@ -144,6 +164,8 @@ NAV_ITEMS = [
     ("Трекинг", "truck"),
     ("История", "history"),
     ("Настройки", "settings"),
+    ("Версия", "info"),
+    ("Резервные копии", "save"),
 ]
 
 ICON_TINTS = {
@@ -253,6 +275,15 @@ def format_number(value):
     return f"{float(value):,.0f}".replace(",", " ")
 
 
+def format_bytes(value):
+    size = float(value or 0)
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{size:.1f} {unit}" if unit != "Б" else f"{int(size)} {unit}"
+        size /= 1024
+
+    return "0 Б"
+
 class State(rx.State):
     selected_file: str = "Файл не выбран"
     uploaded_file_path: str = ""
@@ -281,6 +312,14 @@ class State(rx.State):
     stores_total_count: int = 0
     volume_chart_data: list[dict] = []
 
+    current_version: str = APP_VERSION
+    version_history: list[Release] = VERSION_HISTORY
+    remote_version: str = ""
+    update_status: str = "Проверка ещё не выполнялась."
+    checking_update: bool = False
+    updating_app: bool = False
+    update_available: bool = False
+
     current_page: str = "Dashboard"
 
     routes_source: str = "Область"
@@ -290,6 +329,13 @@ class State(rx.State):
     routes_status: str = ""
     route_backup_labels: list[str] = []
     selected_route_backup: str = ""
+
+    backup_directory: str = ""
+    backup_items: list[dict] = []
+    backup_labels: list[str] = []
+    backup_status: str = ""
+    selected_backup: str = ""
+    restore_confirmation_open: bool = False
 
     tracking_source: str = "Область"
     tracking_running: bool = False
@@ -302,8 +348,13 @@ class State(rx.State):
     mail_app_password: str = ""
     mail_credentials_status: str = ""
     mail_checking: bool = False
+    mail_connection_checking: bool = False
     mail_status: str = ""
     mail_error: str = ""
+    mail_last_check: str = "Ещё не выполнялась"
+    mail_error_log: list[MailErrorEntry] = []
+    mail_new_orders_count: int = 0
+    mail_notification: str = ""
     mail_items: list[dict] = []
     mail_all_items: list[dict] = []
     mail_sources: list[str] = ["Все"]
@@ -323,6 +374,7 @@ class State(rx.State):
     available_invoices_title: str = "Непривязанные накладные"
     available_invoices_empty: str = "Новых непривязанных накладных нет"
     invoice_date_hint: str = ""
+    invoice_search: str = ""
     order_detail_status: str = ""
 
     tracking_view: str = "Симуляция"
@@ -345,12 +397,170 @@ class State(rx.State):
             self.load_routes()
         elif page == "Настройки":
             self.load_settings_form()
+        elif page == "Резервные копии":
+            self.load_backups()
         elif page == "Трекинг" and not self.vehicles:
             self.init_tracking()
         elif page == "Почта":
             self.refresh_mail_config()
 
-    def refresh_mail_config(self):
+    def load_backups(self):
+        self.backup_status = ""
+        self.backup_directory = str(load_backup_directory())
+        self.refresh_backups()
+
+    def refresh_backups(self):
+        try:
+            self.backup_items = [
+                {
+                    "name": item.name,
+                    "created_at": item.created_at.replace("T", " ")[:19],
+                    "size": format_bytes(item.size_bytes),
+                    "files": item.file_count,
+                    "valid": item.valid,
+                    "error": item.error,
+                    "contains_secrets": item.contains_secrets,
+                }
+                for item in list_backups(self.backup_directory or None)
+            ]
+            self.backup_labels = [item["name"] for item in self.backup_items if item["valid"]]
+        except BackupError as error:
+            self.backup_items = []
+            self.backup_labels = []
+            self.backup_status = str(error)
+
+    def set_backup_directory(self, value: str):
+        self.backup_directory = value
+        self.backup_status = ""
+
+    def save_backup_directory_form(self):
+        try:
+            directory = save_backup_directory(self.backup_directory)
+            self.backup_directory = str(directory)
+            self.refresh_backups()
+            self.backup_status = "Папка резервных копий сохранена"
+        except BackupError as error:
+            self.backup_status = str(error)
+
+    def create_full_backup(self):
+        try:
+            info = create_backup(self.backup_directory or None, reason="вручную")
+            self.refresh_backups()
+            self.selected_backup = info.name
+            self.backup_status = f"Копия создана: {info.name}"
+        except BackupError as error:
+            self.backup_status = str(error)
+
+    def set_selected_backup(self, value: str):
+        self.selected_backup = value
+        self.restore_confirmation_open = False
+
+    def ask_restore_backup(self):
+        if not self.selected_backup:
+            self.backup_status = "Сначала выберите резервную копию"
+            return
+        selected = next(
+            (item for item in self.backup_items if item["name"] == self.selected_backup),
+            None,
+        )
+        if not selected or not selected["valid"]:
+            self.backup_status = "Выбранная копия повреждена или недоступна"
+            return
+        self.restore_confirmation_open = True
+
+    def cancel_restore_backup(self):
+        self.restore_confirmation_open = False
+
+    def confirm_restore_backup(self):
+        if self.selected_backup not in self.backup_labels:
+            self.restore_confirmation_open = False
+            self.backup_status = "Выбранная копия больше недоступна"
+            return
+
+        archive = Path(self.backup_directory).resolve() / self.selected_backup
+        try:
+            result = restore_backup(archive)
+            self.restore_confirmation_open = False
+            self.load_history()
+            self.load_settings_form()
+            self.load_routes()
+            self.refresh_mail_config()
+            self.backup_directory = str(load_backup_directory())
+            self.refresh_backups()
+            safety = (
+                f" Страховочная копия: {result.safety_backup.name}."
+                if result.safety_backup
+                else ""
+            )
+            self.backup_status = f"Состояние восстановлено из {self.selected_backup}.{safety}"
+        except BackupError as error:
+            self.restore_confirmation_open = False
+            self.backup_status = str(error)
+
+    @rx.event(background=True)
+    async def check_for_update(self):
+        """Проверяет версию в GitHub, не блокируя интерфейс дашборда."""
+
+        async with self:
+            if self.checking_update or self.updating_app:
+                return
+            self.checking_update = True
+            self.remote_version = ""
+            self.update_available = False
+            self.update_status = "Проверяю обновления..."
+
+        try:
+            result = await asyncio.to_thread(
+                check_remote_update,
+                self.current_version,
+            )
+        except Exception:
+            async with self:
+                self.checking_update = False
+                self.update_status = "Не удалось проверить обновления."
+            return
+
+        async with self:
+            self.checking_update = False
+            self.remote_version = result.latest_version
+            self.update_available = result.ok and result.update_available
+            self.update_status = result.message
+
+    @rx.event(background=True)
+    async def update_application(self):
+        """Устанавливает найденное обновление только через fast-forward Git."""
+
+        async with self:
+            if self.updating_app or self.checking_update:
+                return
+            if not self.update_available:
+                self.update_status = "Сначала проверьте наличие новой версии."
+                return
+            self.updating_app = True
+            self.update_status = "Загружаю обновление..."
+
+        try:
+            result = await asyncio.to_thread(update_project)
+        except Exception:
+            async with self:
+                self.updating_app = False
+                self.update_status = "Не удалось установить обновление."
+            return
+
+        async with self:
+            self.updating_app = False
+            self.update_status = result.message
+            if not result.ok or not result.changed:
+                return
+            self.update_status = (
+                f"{result.message} Если страница не перезагрузилась, "
+                "закройте окно и снова запустите start_dashboard.bat."
+            )
+
+        return rx.call_script(
+            "setTimeout(() => window.location.reload(), 1200);"
+        )
+
         config = load_mail_config()
         self.mail_configured = is_configured(config)
         self.mail_email = str(config.get("email", ""))
@@ -362,6 +572,7 @@ class State(rx.State):
             self.mail_source = "Все"
 
         self._reload_mail_items()
+        self.mail_error_log = load_mail_error_log()
 
         if not self.mail_configured:
             self.mail_credentials_editing = True
@@ -431,6 +642,12 @@ class State(rx.State):
 
         if self.mail_kind_filter == "Только заказы":
             items = [item for item in items if item["is_order"]]
+        elif self.mail_kind_filter == "Только непривязанные накладные":
+            items = [
+                item
+                for item in items
+                if item["is_invoice"] and not item["order_file"]
+            ]
 
         self.mail_items = items
 
@@ -451,11 +668,14 @@ class State(rx.State):
     def _apply_mail_result(self, result: dict):
         """Раскладывает ответ check_mail по состоянию. Только внутри `async with self`."""
 
+        self.mail_error_log = load_mail_error_log()
+
         if not result["ok"]:
             self.mail_error = result["error"]
             self.mail_status = "Проверка не удалась"
             return
 
+        self.mail_error = ""
         self._reload_mail_items()
         found = result["items"]
         suitable = sum(
@@ -466,6 +686,13 @@ class State(rx.State):
         )
         invoices = sum(1 for item in found if item.get("kind") == KIND_INVOICES)
 
+        if suitable:
+            self.mail_new_orders_count += suitable
+            self.mail_notification = (
+                f"Новых заказов: {self.mail_new_orders_count}. "
+                "Они готовы к обработке."
+            )
+
         if not found:
             self.mail_status = "Новых писем нет"
         else:
@@ -473,41 +700,88 @@ class State(rx.State):
                 f"Найдено: {len(found)} · заказов: {suitable} · накладных: {invoices}"
             )
 
-    async def _run_mail_check(self):
-        """Общая проверка для кнопки и автопроверки.
+        attempts = int(result.get("attempts", 1))
+        if attempts > 1:
+            self.mail_status += f" · попыток: {attempts}"
 
-        Поход в почту с разбором вложений занимает секунды (на шести письмах
-        около пятнадцати). Синхронный обработчик на это время подвесил бы
-        весь бэкенд и не показал бы промежуточный статус, поэтому работа
-        уходит в отдельный поток, а состояние обновляется по кусочкам.
-        """
+    async def _run_mail_check(self, with_retry: bool = False):
+        """Выполняет ручную или автоматическую проверку вне потока Reflex."""
 
         async with self:
-            if self.mail_checking:
+            if self.mail_checking or self.mail_connection_checking:
                 return
 
             self.mail_checking = True
             self.mail_error = ""
-            self.mail_status = "Проверяю почту..."
+            self.mail_status = (
+                "Проверяю почту с автоматическим повтором..."
+                if with_retry
+                else "Проверяю почту..."
+            )
+
+        operation = check_mail_with_retry if with_retry else check_mail
 
         try:
-            result = await asyncio.to_thread(check_mail)
-        except Exception:
+            result = await asyncio.to_thread(operation)
+        except Exception as error:
+            append_mail_error("Проверка почты", error)
             async with self:
                 self.mail_checking = False
-                self.mail_error = traceback.format_exc()
+                self.mail_last_check = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                self.mail_error_log = load_mail_error_log()
+                self.mail_error = "Неожиданная ошибка при проверке почты"
                 self.mail_status = "Ошибка при проверке почты"
             return
 
         async with self:
             self.mail_checking = False
+            self.mail_last_check = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             self._apply_mail_result(result)
 
     @rx.event(background=True)
+    async def check_mail_connection_now(self):
+        """Проверяет вход и доступ к папке, не загружая письма."""
+
+        async with self:
+            if self.mail_checking or self.mail_connection_checking:
+                return
+            self.mail_connection_checking = True
+            self.mail_error = ""
+            self.mail_status = "Проверяю соединение..."
+
+        try:
+            result = await asyncio.to_thread(check_mail_connection)
+        except Exception as error:
+            append_mail_error("Проверка соединения", error)
+            result = {
+                "ok": False,
+                "error": "Неожиданная ошибка при проверке соединения",
+            }
+
+        async with self:
+            self.mail_connection_checking = False
+            self.mail_last_check = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            self.mail_error_log = load_mail_error_log()
+            self.mail_error = "" if result["ok"] else result["error"]
+            self.mail_status = (
+                "Соединение установлено"
+                if result["ok"]
+                else "Проверка соединения не удалась"
+            )
+
+    @rx.event(background=True)
     async def check_mail_now(self):
-        """Разовая проверка по кнопке."""
+        """Разовая проверка по кнопке без длительных повторов."""
 
         await self._run_mail_check()
+
+    def clear_mail_notification(self):
+        self.mail_new_orders_count = 0
+        self.mail_notification = ""
+
+    def clear_mail_errors(self):
+        clear_mail_error_log()
+        self.mail_error_log = []
 
     def toggle_mail_auto(self, enabled: bool):
         self.mail_auto = enabled
@@ -531,7 +805,7 @@ class State(rx.State):
                 if not self.mail_auto:
                     return
 
-            await self._run_mail_check()
+            await self._run_mail_check(with_retry=True)
 
     def take_mail_order(self, path: str, filename: str):
         """Берёт найденный файл в обработку на странице «Заказы»."""
@@ -574,6 +848,7 @@ class State(rx.State):
         self.selected_order_time = processed_at
         self.order_detail_tab = "Накладные"
         self.order_detail_status = ""
+        self.invoice_search = ""
         self.order_details_open = True
         self._refresh_order_invoices()
 
@@ -610,6 +885,7 @@ class State(rx.State):
                 self._mail_item_for_view(item) for item in other
             ]
             self.other_invoices = []
+            self._filter_invoice_candidates()
             return
 
         next_day = order_date + timedelta(days=1)
@@ -639,6 +915,36 @@ class State(rx.State):
         self.other_invoices = [
             self._mail_item_for_view(item) for item in other
         ]
+        self._filter_invoice_candidates()
+
+    def set_invoice_search(self, value: str):
+        self.invoice_search = value
+        self._refresh_order_invoices()
+
+    def _filter_invoice_candidates(self):
+        query = self.invoice_search.strip().casefold()
+
+        if not query:
+            return
+
+        def matches(item: dict) -> bool:
+            searchable = " ".join((
+                str(item.get("file", "")),
+                str(item.get("source", "")),
+                str(item.get("subject", "")),
+                str(item.get("person", "")),
+            )).casefold()
+            return query in searchable
+
+        self.available_invoices = [
+            item for item in self.available_invoices if matches(item)
+        ]
+        self.other_invoices = [
+            item for item in self.other_invoices if matches(item)
+        ]
+        self.available_invoices_empty = (
+            f"По запросу «{self.invoice_search.strip()}» накладные не найдены"
+        )
 
     def attach_invoice(self, path: str):
         if link_invoice(path, self.selected_order):
@@ -1078,11 +1384,12 @@ def button_base(**props):
     }
 
 
-def primary_button(label: str, on_click=None, width: str = "230px"):
+def primary_button(label: str, on_click=None, width: str = "230px", disabled=False):
     return rx.button(
         label,
         on_click=on_click,
         width=width,
+        disabled=disabled,
         color="white",
         background=ACCENT,
         _hover={"background": ACCENT_HOVER},
@@ -1090,11 +1397,12 @@ def primary_button(label: str, on_click=None, width: str = "230px"):
     )
 
 
-def secondary_button(label: str, on_click=None, width: str = "156px"):
+def secondary_button(label: str, on_click=None, width: str = "156px", disabled=False):
     return rx.button(
         label,
         on_click=on_click,
         width=width,
+        disabled=disabled,
         color=text(),
         background=surface_alt(),
         border=f"1px solid {border()}",
@@ -1106,9 +1414,27 @@ def secondary_button(label: str, on_click=None, width: str = "156px"):
 def nav_button(label: str, icon: str):
     active = State.current_page == label
 
-    return rx.button(
+    children = [
         fa_icon(tag=icon, size=17),
         rx.text(label, font_size="14px"),
+    ]
+    if label == "Почта":
+        children.extend([
+            rx.spacer(),
+            rx.cond(
+                State.mail_new_orders_count > 0,
+                rx.badge(
+                    State.mail_new_orders_count,
+                    color_scheme="red",
+                    variant="solid",
+                    border_radius="999px",
+                ),
+                rx.box(),
+            ),
+        ])
+
+    return rx.button(
+        *children,
         on_click=State.set_page(label),
         width="100%",
         justify_content="flex-start",
@@ -1815,6 +2141,13 @@ def order_details_drawer():
                             color=muted(),
                             font_size="12px",
                         ),
+                        rx.input(
+                            value=State.invoice_search,
+                            on_change=State.set_invoice_search,
+                            placeholder="Поиск по файлу, источнику или теме",
+                            width="100%",
+                            height="42px",
+                        ),
                         rx.cond(
                             State.available_invoices.length() > 0,
                             rx.vstack(
@@ -2143,17 +2476,36 @@ def mail_page():
                         ),
                         width="100%",
                         align="center",
+                        wrap="wrap",
                     ),
-                    rx.hstack(
+                    rx.flex(
+                        secondary_button(
+                            rx.cond(
+                                State.mail_connection_checking,
+                                "Проверяю...",
+                                "Проверить соединение",
+                            ),
+                            on_click=State.check_mail_connection_now,
+                            width="210px",
+                            disabled=State.mail_checking | State.mail_connection_checking,
+                        ),
                         primary_button(
                             rx.cond(State.mail_checking, "Проверяю...", "Проверить почту"),
                             on_click=State.check_mail_now,
                             width="200px",
+                            disabled=State.mail_checking | State.mail_connection_checking,
                         ),
                         rx.text(State.mail_status, color=muted(), font_size="13px"),
-                        spacing="4",
+                        gap="14px",
                         align="center",
+                        wrap="wrap",
                         width="100%",
+                    ),
+                    rx.text(
+                        "Последняя проверка: ",
+                        State.mail_last_check,
+                        color=muted(),
+                        font_size="12px",
                     ),
                     rx.cond(
                         State.mail_error != "",
@@ -2161,12 +2513,104 @@ def mail_page():
                         rx.box(),
                     ),
                 ),
+                rx.cond(
+                    State.mail_notification != "",
+                    panel_shell(
+                        rx.hstack(
+                            panel_title("circle_check", "Новые заказы"),
+                            rx.spacer(),
+                            rx.badge(
+                                State.mail_new_orders_count,
+                                color_scheme="green",
+                                variant="solid",
+                            ),
+                            secondary_button(
+                                "Скрыть",
+                                on_click=State.clear_mail_notification,
+                                width="100px",
+                            ),
+                            width="100%",
+                            align="center",
+                        ),
+                        rx.text(
+                            State.mail_notification,
+                            color=ACCENT,
+                            font_size="13px",
+                            font_weight="700",
+                        ),
+                    ),
+                    rx.box(),
+                ),
+                panel_shell(
+                    rx.hstack(
+                        panel_title("triangle_alert", "Журнал ошибок подключения"),
+                        rx.spacer(),
+                        secondary_button(
+                            "Очистить журнал",
+                            on_click=State.clear_mail_errors,
+                            width="170px",
+                            disabled=State.mail_error_log.length() == 0,
+                        ),
+                        width="100%",
+                        align="center",
+                    ),
+                    rx.cond(
+                        State.mail_error_log.length() > 0,
+                        rx.vstack(
+                            rx.foreach(
+                                State.mail_error_log,
+                                lambda entry: rx.vstack(
+                                    rx.hstack(
+                                        rx.text(
+                                            entry["operation"],
+                                            color=text(),
+                                            font_size="13px",
+                                            font_weight="700",
+                                        ),
+                                        rx.spacer(),
+                                        rx.text(
+                                            entry["display_time"],
+                                            color=muted(),
+                                            font_size="11px",
+                                        ),
+                                        width="100%",
+                                    ),
+                                    rx.text(
+                                        entry["error"],
+                                        color="#e5484d",
+                                        font_size="12px",
+                                    ),
+                                    align="start",
+                                    spacing="1",
+                                    width="100%",
+                                    padding="10px 12px",
+                                    border=f"1px solid {border()}",
+                                    border_radius="8px",
+                                    background=surface_alt(),
+                                ),
+                            ),
+                            spacing="2",
+                            width="100%",
+                            max_height="260px",
+                            overflow_y="auto",
+                        ),
+                        rx.text(
+                            "Ошибок подключения пока нет",
+                            color=muted(),
+                            font_size="13px",
+                        ),
+                    ),
+                ),
                 panel_shell(
                     rx.hstack(
                         panel_title("inbox", "Фильтры писем"),
                         rx.spacer(),
                         segmented_control(
-                            ["Все сообщения", "Только заказы"],
+                            [
+                                "Все сообщения",
+                                "Только заказы",
+                                "Только непривязанные накладные",
+                            ],
                             State.mail_kind_filter,
                             State.set_mail_kind_filter,
                         ),
@@ -2720,6 +3164,353 @@ def settings_toggle_row(label, hint, value, on_change):
     )
 
 
+def version_release_card(release):
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading(release["version"], color=text(), size="4"),
+                rx.cond(
+                    release["date"] != "",
+                    rx.badge(release["date"], color_scheme="green", variant="soft"),
+                    rx.box(),
+                ),
+                align="start",
+                spacing="2",
+            ),
+            rx.spacer(),
+            fa_icon(tag="history", size=18, color=muted()),
+            width="100%",
+            align="center",
+        ),
+        rx.vstack(
+            rx.foreach(
+                release["changes"],
+                lambda change: rx.hstack(
+                    fa_icon(tag="circle_check", size=14, color=ACCENT),
+                    rx.text(change, color=text(), font_size="13px"),
+                    align="start",
+                    spacing="2",
+                    width="100%",
+                ),
+            ),
+            align="start",
+            spacing="2",
+            width="100%",
+        ),
+        align="start",
+        spacing="3",
+        padding="18px",
+        border=f"1px solid {border()}",
+        border_radius="12px",
+        background=surface_alt(),
+        width="100%",
+    )
+
+
+def version_page():
+    return page_shell(
+        topbar(
+            "Версия",
+            "Текущая версия приложения и история обновлений.",
+        ),
+        panel_shell(
+            panel_title("info", "Текущая версия"),
+            rx.hstack(
+                rx.vstack(
+                    rx.text(APP_NAME, color=muted(), font_size="13px"),
+                    rx.heading(State.current_version, color=text(), size="8"),
+                    rx.text(
+                        "Версия хранится в modules/version.py. Журнал изменений — в CHANGELOG.md.",
+                        color=muted(),
+                        font_size="12px",
+                    ),
+                    align="start",
+                    spacing="1",
+                ),
+                rx.spacer(),
+                fa_icon(tag="circle_check", size=32, color=ACCENT),
+                width="100%",
+                align="center",
+            ),
+        ),
+        panel_shell(
+            panel_title("refresh", "Обновления"),
+            rx.vstack(
+                rx.hstack(
+                    rx.vstack(
+                        rx.text(
+                            "Текущая версия",
+                            color=muted(),
+                            font_size="12px",
+                        ),
+                        rx.text(State.current_version, color=text(), font_weight="700"),
+                        align="start",
+                        spacing="1",
+                    ),
+                    rx.vstack(
+                        rx.text(
+                            rx.cond(
+                                State.remote_version != "",
+                                "Версия на GitHub",
+                                "Удалённая версия",
+                            ),
+                            color=muted(),
+                            font_size="12px",
+                        ),
+                        rx.text(
+                            rx.cond(State.remote_version != "", State.remote_version, "—"),
+                            color=text(),
+                            font_weight="700",
+                        ),
+                        align="start",
+                        spacing="1",
+                    ),
+                    rx.spacer(),
+                    fa_icon(tag="refresh", size=26, color=ACCENT),
+                    width="100%",
+                    align="center",
+                    spacing="6",
+                ),
+                rx.text(State.update_status, color=muted(), font_size="13px"),
+                rx.hstack(
+                    primary_button(
+                        rx.cond(
+                            State.checking_update,
+                            "Проверяю...",
+                            "Проверить обновления",
+                        ),
+                        on_click=State.check_for_update,
+                        width="220px",
+                        disabled=State.checking_update | State.updating_app,
+                    ),
+                    secondary_button(
+                        rx.cond(State.updating_app, "Обновляю...", "Обновить"),
+                        on_click=State.update_application,
+                        width="150px",
+                        disabled=(
+                            ~State.update_available
+                            | State.checking_update
+                            | State.updating_app
+                        ),
+                    ),
+                    spacing="3",
+                    wrap="wrap",
+                ),
+                rx.cond(
+                    State.update_available,
+                    rx.text(
+                        "Новая версия готова к установке. После обновления страница перезагрузится.",
+                        color=ACCENT,
+                        font_size="12px",
+                    ),
+                    rx.box(),
+                ),
+                align="start",
+                spacing="3",
+                width="100%",
+            ),
+        ),
+        panel_shell(
+            panel_title("history", "История обновлений"),
+            rx.cond(
+                State.version_history.length() > 0,
+                rx.vstack(
+                    rx.foreach(State.version_history, version_release_card),
+                    spacing="3",
+                    width="100%",
+                ),
+                rx.text(
+                    "Журнал обновлений пока пуст.",
+                    color=muted(),
+                    font_size="13px",
+                ),
+            ),
+        ),
+    )
+
+
+def backup_item_row(item):
+    return rx.vstack(
+        rx.hstack(
+            rx.cond(
+                item["valid"],
+                fa_icon(tag="circle_check", size=16, color=ACCENT),
+                fa_icon(tag="triangle_alert", size=16, color="#e5484d"),
+            ),
+            rx.text(item["name"], color=text(), font_size="13px", font_weight="700"),
+            rx.spacer(),
+            rx.text(item["created_at"], color=muted(), font_size="11px"),
+            width="100%",
+            align="center",
+            spacing="2",
+        ),
+        rx.cond(
+            item["valid"],
+            rx.hstack(
+                rx.text("Файлов: ", item["files"], color=muted(), font_size="12px"),
+                rx.text("Размер: ", item["size"], color=muted(), font_size="12px"),
+                rx.cond(
+                    item["contains_secrets"],
+                    rx.text(
+                        "Содержит config/mail.json — в архиве может быть пароль приложения",
+                        color="#f5a623",
+                        font_size="12px",
+                    ),
+                    rx.box(),
+                ),
+                spacing="3",
+                wrap="wrap",
+                width="100%",
+            ),
+            rx.text(item["error"], color="#e5484d", font_size="12px"),
+        ),
+        align="start",
+        spacing="2",
+        width="100%",
+        padding="12px",
+        border=f"1px solid {border()}",
+        border_radius="9px",
+        background=surface_alt(),
+    )
+
+
+def backup_page():
+    return page_shell(
+        topbar(
+            "Резервные копии",
+            "Сохраняйте статистику, историю и настройки перед важными изменениями.",
+        ),
+        panel_shell(
+            panel_title("folder", "Папка хранения"),
+            rx.text(
+                "В архив попадают JSON-файлы состояния и списки маршрутов. Рабочие Excel-файлы, PDF и логи не копируются.",
+                color=muted(),
+                font_size="13px",
+            ),
+            rx.hstack(
+                rx.input(
+                    value=State.backup_directory,
+                    on_change=State.set_backup_directory,
+                    placeholder="Путь к папке резервных копий",
+                    width="100%",
+                    height="42px",
+                ),
+                primary_button(
+                    "Сохранить папку",
+                    on_click=State.save_backup_directory_form,
+                    width="170px",
+                ),
+                width="100%",
+                align="center",
+                spacing="2",
+            ),
+            rx.text(
+                "По умолчанию: data/backups. В веб-дашборде укажите путь на компьютере, где запущено приложение.",
+                color=muted(),
+                font_size="12px",
+            ),
+        ),
+        panel_shell(
+            rx.hstack(
+                panel_title("save", "Снимок состояния"),
+                rx.spacer(),
+                secondary_button(
+                    "Обновить список",
+                    on_click=State.refresh_backups,
+                    width="160px",
+                ),
+                primary_button(
+                    "Создать копию",
+                    on_click=State.create_full_backup,
+                    width="160px",
+                ),
+                width="100%",
+                align="center",
+                wrap="wrap",
+            ),
+            rx.text(
+                "Рекомендуется создавать копию перед обновлением приложения или массовым изменением маршрутов.",
+                color=muted(),
+                font_size="12px",
+            ),
+            rx.cond(
+                State.backup_items.length() > 0,
+                rx.vstack(
+                    rx.foreach(State.backup_items, backup_item_row),
+                    spacing="2",
+                    width="100%",
+                    max_height="420px",
+                    overflow_y="auto",
+                ),
+                rx.text("Резервных копий пока нет", color=muted(), font_size="13px"),
+            ),
+        ),
+        panel_shell(
+            panel_title("history", "Восстановление"),
+            rx.hstack(
+                rx.select(
+                    State.backup_labels,
+                    value=State.selected_backup,
+                    on_change=State.set_selected_backup,
+                    placeholder="Выберите корректную копию",
+                    width="100%",
+                ),
+                secondary_button(
+                    "Восстановить",
+                    on_click=State.ask_restore_backup,
+                    width="160px",
+                    disabled=State.backup_labels.length() == 0,
+                ),
+                width="100%",
+                align="center",
+                spacing="2",
+            ),
+            rx.cond(
+                State.restore_confirmation_open,
+                rx.vstack(
+                    rx.text(
+                        "Внимание: восстановление заменит текущую статистику, историю почты, списки маршрутов и настройки. Перед заменой будет создана страховочная копия текущего состояния.",
+                        color="#f5a623",
+                        font_size="13px",
+                        font_weight="700",
+                    ),
+                    rx.hstack(
+                        primary_button(
+                            "Да, восстановить",
+                            on_click=State.confirm_restore_backup,
+                            width="180px",
+                        ),
+                        secondary_button(
+                            "Отмена",
+                            on_click=State.cancel_restore_backup,
+                            width="120px",
+                        ),
+                        spacing="2",
+                    ),
+                    align="start",
+                    spacing="3",
+                    width="100%",
+                    padding="12px",
+                    border="1px solid rgba(245, 166, 35, 0.35)",
+                    border_radius="9px",
+                    background="rgba(245, 166, 35, 0.10)",
+                ),
+                rx.box(),
+            ),
+            rx.text(
+                "config/mail.json может содержать пароль приложения. Не передавайте такой архив другим людям.",
+                color=muted(),
+                font_size="12px",
+            ),
+            rx.cond(
+                State.backup_status != "",
+                rx.text(State.backup_status, color=muted(), font_size="13px"),
+                rx.box(),
+            ),
+        ),
+    )
+
+
 def settings_page():
     return page_shell(
         topbar("Настройки", "Поведение программы при обработке заказов."),
@@ -2754,6 +3545,8 @@ def main_content():
         ("Трекинг", tracking_page()),
         ("История", history_page()),
         ("Настройки", settings_page()),
+        ("Версия", version_page()),
+        ("Резервные копии", backup_page()),
         overview_page(),
     )
 

@@ -10,6 +10,9 @@ build/
 dist/
 *.spec
 
+# Accidental shell/home artifacts
+~/
+
 # Reflex (веб-дашборд orders_dashboard)
 .web/
 reflex.lock/
@@ -22,10 +25,15 @@ data/*
 
 # Настройки почты — в них пароль приложения. В git только шаблон.
 config/mail.json
+config/backup.json
 
 # Ignore Excel files
 *.xlsx
 *.xls
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
 
 venv/
 .venv/
@@ -34,7 +42,10 @@ venv/
 
 .vscode/
 .idea/
-.claude/
+# Claude Code: keep shared project instructions, ignore local settings
+.claude/*
+!.claude/
+!.claude/settings.json
 
 Thumbs.db
 .DS_Store

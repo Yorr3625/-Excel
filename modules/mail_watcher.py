@@ -10,10 +10,12 @@ import email
 import imaplib
 import json
 import re
+import time
 from datetime import date, datetime, timedelta
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from typing import TypedDict
 
 from modules.order_validator import ALLOWED_SUFFIXES, validate_order_file
 from modules.paths import CONFIG_DIR, DATA_DIR, INVOICES_FOLDER, ORDERS_FOLDER
@@ -24,10 +26,14 @@ MAIL_EXAMPLE_CONFIG_FILE = CONFIG_DIR / "mail.example.json"
 SEEN_FILE = DATA_DIR / "mail_seen.json"
 MAIL_ITEMS_FILE = DATA_DIR / "mail_items.json"
 MAIL_UID_CACHE_FILE = DATA_DIR / "mail_uid_cache.json"
+MAIL_ERROR_LOG_FILE = DATA_DIR / "mail_errors.json"
 
 SEEN_LIMIT = 500
 MAIL_ITEMS_LIMIT = 1000
+MAIL_ERROR_LOG_LIMIT = 50
 DEFAULT_CACHE_DAYS = 14
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY_SECONDS = 5.0
 PDF_SUFFIXES = (".pdf",)
 KIND_ORDERS = "orders"
 KIND_INVOICES = "invoices"
@@ -42,6 +48,14 @@ REGION_INVOICE_GROUPS = {
     "Макеевка / Харцызск": ("макеев", "харцыз"),
 }
 
+
+class MailErrorEntry(TypedDict):
+    timestamp: str
+    display_time: str
+    operation: str
+    error: str
+
+
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 DEFAULT_CONFIG = {
@@ -55,6 +69,8 @@ DEFAULT_CONFIG = {
     "since_days": 14,
     "cache_days": DEFAULT_CACHE_DAYS,
     "check_interval_minutes": 10,
+    "retry_attempts": DEFAULT_RETRY_ATTEMPTS,
+    "retry_delay_seconds": DEFAULT_RETRY_DELAY_SECONDS,
 }
 
 
@@ -169,6 +185,148 @@ def _read_json(path: Path, default):
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _safe_error_text(error: object, config: dict | None = None) -> str:
+    """Убирает учётные данные из текста перед показом и журналированием."""
+
+    text = str(error or "Неизвестная ошибка")
+    config = config or {}
+    secrets = {
+        str(config.get("email", "")).strip(),
+        str(config.get("app_password", "")).strip(),
+        _normalise_app_password(config.get("app_password", "")),
+    }
+
+    for secret in sorted((value for value in secrets if value), key=len, reverse=True):
+        text = text.replace(secret, "***")
+
+    return text
+
+
+def load_mail_error_log() -> list[MailErrorEntry]:
+    """Возвращает последние ошибки подключения, новые сверху."""
+
+    entries = _read_json(MAIL_ERROR_LOG_FILE, [])
+    if not isinstance(entries, list):
+        return []
+
+    result = []
+    for entry in entries[:MAIL_ERROR_LOG_LIMIT]:
+        if not isinstance(entry, dict):
+            continue
+        result.append({
+            "timestamp": str(entry.get("timestamp", "")),
+            "display_time": str(entry.get("display_time", "")),
+            "operation": str(entry.get("operation", "Проверка почты")),
+            "error": str(entry.get("error", "Неизвестная ошибка")),
+        })
+
+    return result
+
+
+def append_mail_error(
+    operation: str,
+    error: object,
+    config: dict | None = None,
+) -> MailErrorEntry:
+    """Сохраняет безопасное описание ошибки без адреса и ключа приложения."""
+
+    safe_config = config if config is not None else load_mail_config()
+    now = datetime.now().astimezone()
+    entry: MailErrorEntry = {
+        "timestamp": now.isoformat(),
+        "display_time": now.strftime("%d.%m.%Y %H:%M:%S"),
+        "operation": str(operation or "Проверка почты"),
+        "error": _safe_error_text(error, safe_config),
+    }
+    _write_json(
+        MAIL_ERROR_LOG_FILE,
+        [entry, *load_mail_error_log()][:MAIL_ERROR_LOG_LIMIT],
+    )
+    return entry
+
+
+def clear_mail_error_log() -> None:
+    """Очищает только журнал ошибок, не затрагивая письма и вложения."""
+
+    _write_json(MAIL_ERROR_LOG_FILE, [])
+
+
+def _imap_error_is_retryable(error: object) -> bool:
+    text = str(error).casefold()
+    authentication_markers = (
+        "authenticationfailed",
+        "authentication failed",
+        "invalid credentials",
+        "login failed",
+        "authorization failed",
+        "bad credentials",
+        "неверн",
+        "парол",
+    )
+    return not any(marker in text for marker in authentication_markers)
+
+
+def _retry_settings(config: dict) -> tuple[int, float]:
+    try:
+        attempts = int(config.get("retry_attempts", DEFAULT_RETRY_ATTEMPTS))
+    except (TypeError, ValueError):
+        attempts = DEFAULT_RETRY_ATTEMPTS
+
+    try:
+        delay = float(config.get("retry_delay_seconds", DEFAULT_RETRY_DELAY_SECONDS))
+    except (TypeError, ValueError):
+        delay = DEFAULT_RETRY_DELAY_SECONDS
+
+    return min(max(attempts, 1), 5), min(max(delay, 0.0), 300.0)
+
+
+def check_mail_connection(config: dict | None = None) -> dict:
+    """Проверяет вход в IMAP, не ищет письма и не скачивает вложения."""
+
+    config = config or load_mail_config()
+    result = {"ok": False, "error": "", "retryable": False}
+
+    if not is_configured(config):
+        result["error"] = "Почта не настроена — заполните данные подключения"
+        append_mail_error("Проверка соединения", result["error"], config)
+        return result
+
+    try:
+        with imaplib.IMAP4_SSL(config["imap_server"], int(config["imap_port"])) as imap:
+            login_status, _login_data = imap.login(
+                config["email"], config["app_password"]
+            )
+            if login_status != "OK":
+                raise imaplib.IMAP4.error("Сервер отклонил вход")
+
+            select_status, _select_data = imap.select(
+                config.get("folder") or "INBOX",
+                readonly=True,
+            )
+            if select_status != "OK":
+                raise imaplib.IMAP4.error("Сервер не открыл папку почты")
+    except imaplib.IMAP4.error as error:
+        safe_error = _safe_error_text(error, config)
+        result["error"] = f"Почтовый сервер отказал: {safe_error}"
+        result["retryable"] = _imap_error_is_retryable(error)
+        append_mail_error("Проверка соединения", result["error"], config)
+        return result
+    except (OSError, TimeoutError) as error:
+        safe_error = _safe_error_text(error, config)
+        result["error"] = f"Не удалось подключиться к почте: {safe_error}"
+        result["retryable"] = True
+        append_mail_error("Проверка соединения", result["error"], config)
+        return result
+    except (TypeError, ValueError) as error:
+        safe_error = _safe_error_text(error, config)
+        result["error"] = f"Некорректные настройки почты: {safe_error}"
+        append_mail_error("Проверка соединения", result["error"], config)
+        return result
+
+    result["ok"] = True
+    return result
 
 
 def _load_seen() -> list:
@@ -531,10 +689,11 @@ def check_mail(config: dict | None = None) -> dict:
     """Обновляет локальный кеш писем и скачивает только ещё не виденные UID."""
 
     config = config or load_mail_config()
-    result = {"ok": False, "error": "", "items": []}
+    result = {"ok": False, "error": "", "items": [], "retryable": False}
 
     if not is_configured(config):
         result["error"] = "Почта не настроена — заполните config/mail.json"
+        append_mail_error("Проверка почты", result["error"], config)
         return result
 
     seen = _load_seen()
@@ -641,10 +800,21 @@ def check_mail(config: dict | None = None) -> dict:
             _save_uid_cache(cache_key, completed_uids)
 
     except imaplib.IMAP4.error as error:
-        result["error"] = f"Почтовый сервер отказал: {error}"
+        safe_error = _safe_error_text(error, config)
+        result["error"] = f"Почтовый сервер отказал: {safe_error}"
+        result["retryable"] = _imap_error_is_retryable(error)
+        append_mail_error("Проверка почты", result["error"], config)
         return result
-    except (OSError, ValueError) as error:
-        result["error"] = f"Не удалось подключиться к почте: {error}"
+    except (OSError, TimeoutError) as error:
+        safe_error = _safe_error_text(error, config)
+        result["error"] = f"Не удалось подключиться к почте: {safe_error}"
+        result["retryable"] = True
+        append_mail_error("Проверка почты", result["error"], config)
+        return result
+    except (TypeError, ValueError) as error:
+        safe_error = _safe_error_text(error, config)
+        result["error"] = f"Некорректные настройки почты: {safe_error}"
+        append_mail_error("Проверка почты", result["error"], config)
         return result
 
     _save_mail_items(stored_items)
@@ -653,4 +823,24 @@ def check_mail(config: dict | None = None) -> dict:
         _save_seen(new_seen)
 
     result["ok"] = True
+    return result
+
+
+def check_mail_with_retry(config: dict | None = None) -> dict:
+    """Повторяет автоматическую проверку только при временных сбоях."""
+
+    config = config or load_mail_config()
+    max_attempts, delay = _retry_settings(config)
+    result = {"ok": False, "error": "", "items": [], "retryable": False}
+
+    for attempt in range(1, max_attempts + 1):
+        result = check_mail(config)
+        result["attempts"] = attempt
+
+        if result.get("ok") or not result.get("retryable") or attempt == max_attempts:
+            return result
+
+        if delay:
+            time.sleep(delay)
+
     return result
