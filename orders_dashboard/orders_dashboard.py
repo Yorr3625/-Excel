@@ -49,6 +49,7 @@ from modules.mail_watcher import (
     unlink_invoice,
 )
 from modules.pipeline import detect_mode, process_order as run_pipeline
+from modules.order_preview import PreviewError, build_order_preview
 from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
 from modules.version import APP_NAME, APP_VERSION, Release, load_changelog
 from modules.updater import check_for_update as check_remote_update, update_project
@@ -289,10 +290,27 @@ class State(rx.State):
     uploaded_file_path: str = ""
     mode: str = "Область"
     mode_auto_note: str = ""
+    mode_detection_warning: str = ""
     duplicate_note: str = ""
     theme: str = "dark"
     status: str = "Ожидает загрузки файла"
     is_processing: bool = False
+    is_previewing: bool = False
+    preview_ready: bool = False
+    preview_source: str = ""
+    preview_mode: str = ""
+    preview_status: str = ""
+    preview_file_info: str = ""
+    preview_sheet_info: str = ""
+    preview_document_type: str = ""
+    preview_order_rows: int = 0
+    preview_match_count: int = 0
+    preview_grand_total: str = "0"
+    preview_route_rows: list[str] = []
+    preview_found_stores: list[str] = []
+    preview_warnings: list[str] = []
+    preview_conflicts: list[str] = []
+    preview_unknown_stores: list[str] = []
     output_file: str = ""
     log_file: str = ""
     grand_total: str = "0"
@@ -367,6 +385,7 @@ class State(rx.State):
     order_details_open: bool = False
     selected_order: str = ""
     selected_order_time: str = ""
+    selected_order_time_label: str = "Обработан"
     order_detail_tab: str = "Накладные"
     order_invoices: list[dict] = []
     available_invoices: list[dict] = []
@@ -561,6 +580,7 @@ class State(rx.State):
             "setTimeout(() => window.location.reload(), 1200);"
         )
 
+    def refresh_mail_config(self):
         config = load_mail_config()
         self.mail_configured = is_configured(config)
         self.mail_email = str(config.get("email", ""))
@@ -807,7 +827,7 @@ class State(rx.State):
 
             await self._run_mail_check(with_retry=True)
 
-    def take_mail_order(self, path: str, filename: str):
+    def take_mail_order(self, path: str, filename: str, received: str):
         """Берёт найденный файл в обработку на странице «Заказы»."""
 
         self.selected_file = filename
@@ -827,6 +847,7 @@ class State(rx.State):
 
         self.detect_and_set_mode()
         self.current_page = "Заказы"
+        self._show_order_details(filename, received, "Получен")
 
     def open_mail_attachment(self, path: str):
         attachment = Path(path)
@@ -840,17 +861,26 @@ class State(rx.State):
         except OSError as error:
             self.mail_error = f"Не удалось открыть файл: {error}"
 
-    def open_order_details(self, filename: str, processed_at: str):
-        if filename == "Нет обработок":
-            return
-
+    def _show_order_details(
+        self,
+        filename: str,
+        displayed_at: str,
+        time_label: str,
+    ):
         self.selected_order = filename
-        self.selected_order_time = processed_at
+        self.selected_order_time = displayed_at
+        self.selected_order_time_label = time_label
         self.order_detail_tab = "Накладные"
         self.order_detail_status = ""
         self.invoice_search = ""
         self.order_details_open = True
         self._refresh_order_invoices()
+
+    def open_order_details(self, filename: str, processed_at: str):
+        if filename == "Нет обработок":
+            return
+
+        self._show_order_details(filename, processed_at, "Обработан")
 
     def close_order_details(self):
         self.order_details_open = False
@@ -1228,6 +1258,24 @@ class State(rx.State):
 
         self.stores_total_count = total
 
+    def _reset_preview(self):
+        self.is_previewing = False
+        self.preview_ready = False
+        self.preview_source = ""
+        self.preview_mode = ""
+        self.preview_status = ""
+        self.preview_file_info = ""
+        self.preview_sheet_info = ""
+        self.preview_document_type = ""
+        self.preview_order_rows = 0
+        self.preview_match_count = 0
+        self.preview_grand_total = "0"
+        self.preview_route_rows = []
+        self.preview_found_stores = []
+        self.preview_warnings = []
+        self.preview_conflicts = []
+        self.preview_unknown_stores = []
+
     async def handle_upload(self, files: list[rx.UploadFile]):
         if not files:
             self.status = "Сначала выберите Excel-файл"
@@ -1248,6 +1296,7 @@ class State(rx.State):
             output_path = upload_dir / Path(filename).name
             output_path.write_bytes(data)
 
+            self._reset_preview()
             self.selected_file = output_path.name
             self.uploaded_file_path = str(output_path)
             self.status = f"Файл загружен: {output_path.name}"
@@ -1269,6 +1318,7 @@ class State(rx.State):
 
     def detect_and_set_mode(self):
         self.mode_auto_note = ""
+        self.mode_detection_warning = ""
 
         try:
             fills = [green_fill, yellow_fill, blue_fill, purple_fill]
@@ -1280,17 +1330,36 @@ class State(rx.State):
             mode, scores = detect_mode(self.uploaded_file_path, mode_groups, conflict_fill)
 
             self.mode = mode
-            self.mode_auto_note = (
-                f"Определено автоматически: «{mode}» "
-                f"(совпадений — Город: {scores['Город']}, Область: {scores['Область']})"
+            score_note = (
+                f"совпадений — Город: {scores['Город']}, "
+                f"Область: {scores['Область']}"
             )
 
+            if scores["Город"] == scores["Область"]:
+                self.mode_detection_warning = (
+                    "Режим определён неоднозначно: оба справочника дали "
+                    f"одинаковый результат ({score_note}). Проверьте режим вручную."
+                )
+                self.mode_auto_note = self.mode_detection_warning
+            else:
+                self.mode_auto_note = (
+                    f"Определено автоматически: «{mode}» ({score_note})"
+                )
+
         except Exception:
-            self.mode_auto_note = "Не удалось определить режим автоматически, выберите вручную"
+            self.mode_detection_warning = (
+                "Не удалось определить режим автоматически. Проверьте выбранный режим вручную."
+            )
+            self.mode_auto_note = self.mode_detection_warning
 
     def set_mode(self, mode: str):
         self.mode = mode
         self.mode_auto_note = ""
+        self.mode_detection_warning = ""
+        self._reset_preview()
+
+        if self.uploaded_file_path:
+            self.status = "Режим изменён. Постройте предварительный просмотр заново."
 
     def set_theme(self, theme: str):
         self.theme = theme
@@ -1298,9 +1367,118 @@ class State(rx.State):
     def set_dark_mode(self, enabled: bool):
         self.theme = "dark" if enabled else "light"
 
+    def preview_order(self):
+        if not self.uploaded_file_path:
+            self.status = "Сначала загрузите Excel-файл"
+            return
+
+        self.is_previewing = True
+        self.preview_ready = False
+        self.preview_status = "Анализ книги..."
+        self.status = "Построение предварительного просмотра..."
+        self.error_text = ""
+
+        try:
+            stores_file = paths.stores_file_for(self.mode)
+            stores = load_stores(stores_file)
+            fills = [green_fill, yellow_fill, blue_fill, purple_fill]
+            groups = build_groups(stores, fills)
+            preview = build_order_preview(
+                self.uploaded_file_path,
+                groups,
+                conflict_fill,
+                self.mode,
+            )
+
+            self.preview_source = self.uploaded_file_path
+            self.preview_mode = self.mode
+            self.preview_file_info = (
+                f"{preview['file_name']} · {preview['file_extension']} · "
+                f"{format_bytes(preview['file_size'])}"
+            )
+            self.preview_sheet_info = (
+                f"Активный лист: {preview['sheet_name']} · "
+                f"листов в книге: {preview['sheet_count']}"
+            )
+            self.preview_document_type = preview["document_type"]
+            self.preview_order_rows = int(preview["order_rows"])
+            self.preview_match_count = int(preview["total_found"])
+            self.preview_grand_total = format_number(preview["grand_total"])
+            self.preview_route_rows = [
+                (
+                    f"{route['name']}: строк — {route['rows']}, "
+                    f"совпадений — {route['matches']}, "
+                    f"объём — {format_number(route['total'])}"
+                )
+                for route in preview["route_rows"]
+            ]
+            found_stores = [
+                f"{route['name']}: {store}"
+                for route in preview["route_rows"]
+                for store in route["stores"]
+            ]
+            self.preview_found_stores = found_stores[:20]
+            self.preview_warnings = list(preview["warnings"])
+
+            if self.mode_detection_warning:
+                self.preview_warnings.append(self.mode_detection_warning)
+            if self.duplicate_note:
+                self.preview_warnings.append(self.duplicate_note)
+
+            self.preview_unknown_stores = list(preview["unknown_stores"][:20])
+            self.preview_conflicts = [
+                (
+                    f"{item['cell']} | {item['text']} | "
+                    f"{', '.join(item['routes'])}"
+                )
+                for item in preview["conflicts"][:20]
+            ]
+
+            hidden_found = len(found_stores) - len(self.preview_found_stores)
+            hidden_unknown = len(preview["unknown_stores"]) - len(self.preview_unknown_stores)
+            hidden_conflicts = len(preview["conflicts"]) - len(self.preview_conflicts)
+
+            if hidden_found:
+                self.preview_warnings.append(
+                    f"Ещё найденных магазинов не показано: {hidden_found}."
+                )
+            if hidden_unknown:
+                self.preview_warnings.append(
+                    f"Ещё неизвестных магазинов не показано: {hidden_unknown}."
+                )
+            if hidden_conflicts:
+                self.preview_warnings.append(
+                    f"Ещё конфликтов не показано: {hidden_conflicts}."
+                )
+
+            self.preview_ready = True
+            self.preview_status = "Предварительный просмотр готов"
+            self.status = "Проверьте сводку и подтвердите обработку"
+
+        except PreviewError as error:
+            self._reset_preview()
+            self.preview_status = "Не удалось построить предварительный просмотр"
+            self.status = "Ошибка предварительного просмотра"
+            self.error_text = str(error)
+        except Exception:
+            self._reset_preview()
+            self.preview_status = "Не удалось построить предварительный просмотр"
+            self.status = "Ошибка предварительного просмотра"
+            self.error_text = traceback.format_exc()
+        finally:
+            self.is_previewing = False
+
     def process_order(self):
         if not self.uploaded_file_path:
             self.status = "Сначала загрузите Excel-файл"
+            return
+
+        if (
+            not self.preview_ready
+            or self.preview_source != self.uploaded_file_path
+            or self.preview_mode != self.mode
+        ):
+            self.status = "Сначала постройте предварительный просмотр для этого режима"
             return
 
         self.is_processing = True
@@ -1335,7 +1513,13 @@ class State(rx.State):
             self.status = "Обработка завершена"
 
             record_processing(self.selected_file, stats)
+            processed_at = was_processed(self.selected_file)
+            self.duplicate_note = (
+                f"Этот файл уже обрабатывался {processed_at}. "
+                "Повторная обработка обновит суммы, а не добавит их ещё раз."
+            )
             self.load_history()
+            self._reset_preview()
 
         except Exception:
             self.status = "Ошибка обработки"
@@ -1702,9 +1886,11 @@ def order_panel():
                 spacing="2",
             ),
             rx.spacer(),
-            primary_button(
-                rx.cond(State.is_processing, "Обработка...", "Обработать заказ"),
-                on_click=State.process_order,
+            secondary_button(
+                rx.cond(State.is_previewing, "Анализ...", "Показать просмотр"),
+                on_click=State.preview_order,
+                width="190px",
+                disabled=State.is_processing,
             ),
             width="100%",
             align="center",
@@ -1712,6 +1898,17 @@ def order_panel():
             border=f"1px solid {border()}",
             border_radius="10px",
             background=surface_alt(),
+        ),
+        rx.cond(
+            State.preview_ready,
+            order_preview_panel(),
+            rx.box(),
+        ),
+        primary_button(
+            rx.cond(State.is_processing, "Обработка...", "Подтвердить обработку"),
+            on_click=State.process_order,
+            disabled=State.is_processing,
+            width="100%",
         ),
         rx.text(State.status, color=muted(), font_size="13px"),
         rx.cond(State.output_file != "", processing_summary(), rx.box()),
@@ -1759,6 +1956,145 @@ def route_result(label: str, value):
         padding="11px 12px",
         border_radius="9px",
         background=surface_alt(),
+    )
+
+
+def preview_metric(label: str, value):
+    return rx.vstack(
+        rx.text(label, color=muted(), font_size="12px"),
+        rx.text(value, color=text(), font_size="20px", font_weight="800"),
+        align="start",
+        spacing="1",
+        padding="12px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+        width="100%",
+    )
+
+
+def order_preview_panel():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Предварительный просмотр", color=text(), size="4"),
+                rx.text(State.preview_status, color=muted(), font_size="12px"),
+                align="start",
+                spacing="1",
+            ),
+            rx.spacer(),
+            secondary_button(
+                "Обновить просмотр",
+                on_click=State.preview_order,
+                width="190px",
+                disabled=State.is_previewing,
+            ),
+            width="100%",
+            align="center",
+        ),
+        rx.text(State.preview_file_info, color=text(), font_size="13px", font_weight="700"),
+        rx.text(State.preview_sheet_info, color=muted(), font_size="12px"),
+        rx.text(
+            "Режим: ",
+            State.preview_mode,
+            color=text(),
+            font_size="13px",
+            font_weight="700",
+        ),
+        rx.text(
+            rx.cond(
+                State.preview_document_type != "",
+                State.preview_document_type,
+                "",
+            ),
+            color=text(),
+            font_size="13px",
+        ),
+        rx.grid(
+            preview_metric("Строк заказа", State.preview_order_rows),
+            preview_metric("Найдено совпадений", State.preview_match_count),
+            preview_metric("Общий объём", State.preview_grand_total),
+            columns="3",
+            spacing="3",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text("По маршрутам", color=text(), font_size="13px", font_weight="800"),
+            rx.foreach(
+                State.preview_route_rows,
+                lambda route: rx.text(route, color=text(), font_size="13px"),
+            ),
+            align="start",
+            spacing="1",
+            width="100%",
+        ),
+        rx.cond(
+            State.preview_found_stores.length() > 0,
+            rx.vstack(
+                rx.text("Найденные магазины", color=text(), font_size="13px", font_weight="800"),
+                rx.foreach(
+                    State.preview_found_stores,
+                    lambda store: rx.text(store, color=muted(), font_size="12px"),
+                ),
+                align="start",
+                spacing="1",
+                width="100%",
+            ),
+            rx.box(),
+        ),
+        rx.cond(
+            State.preview_warnings.length() > 0,
+            rx.vstack(
+                rx.text("Предупреждения", color="#f5a623", font_size="13px", font_weight="800"),
+                rx.foreach(
+                    State.preview_warnings,
+                    lambda warning: rx.text(f"⚠ {warning}", color=text(), font_size="12px"),
+                ),
+                align="start",
+                spacing="1",
+                width="100%",
+                padding="10px 12px",
+                border="1px solid rgba(245, 166, 35, 0.35)",
+                border_radius="10px",
+                background="rgba(245, 166, 35, 0.10)",
+            ),
+            rx.box(),
+        ),
+        rx.cond(
+            State.preview_unknown_stores.length() > 0,
+            rx.vstack(
+                rx.text("Неизвестные магазины", color=text(), font_size="13px", font_weight="800"),
+                rx.foreach(
+                    State.preview_unknown_stores,
+                    lambda store: rx.text(store, color=muted(), font_size="12px"),
+                ),
+                align="start",
+                spacing="1",
+                width="100%",
+            ),
+            rx.box(),
+        ),
+        rx.cond(
+            State.preview_conflicts.length() > 0,
+            rx.vstack(
+                rx.text("Конфликты", color=text(), font_size="13px", font_weight="800"),
+                rx.foreach(
+                    State.preview_conflicts,
+                    lambda item: rx.text(item, color=muted(), font_size="12px"),
+                ),
+                align="start",
+                spacing="1",
+                width="100%",
+            ),
+            rx.box(),
+        ),
+        padding="16px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+        align="start",
+        spacing="3",
+        width="100%",
     )
 
 
@@ -2098,7 +2434,13 @@ def order_details_drawer():
                     rx.vstack(
                         rx.text("ЗАКАЗ", color=muted(), font_size="11px", font_weight="700"),
                         rx.heading(State.selected_order, color=text(), size="5"),
-                        rx.text("Обработан: ", State.selected_order_time, color=muted(), font_size="12px"),
+                        rx.text(
+                            State.selected_order_time_label,
+                            ": ",
+                            State.selected_order_time,
+                            color=muted(),
+                            font_size="12px",
+                        ),
                         align="start",
                         spacing="1",
                     ),
@@ -2396,7 +2738,11 @@ def mail_item_row(item):
                 rx.spacer(),
                 secondary_button(
                     "Взять в обработку",
-                    on_click=State.take_mail_order(item["path"], item["file"]),
+                    on_click=State.take_mail_order(
+                        item["path"],
+                        item["file"],
+                        item["received"],
+                    ),
                     width="180px",
                 ),
                 width="100%",

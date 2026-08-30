@@ -15,6 +15,7 @@ def test_single_route_match_fills_cell_and_counts(groups):
     assert cell.fill.start_color.rgb == groups[0]["fill"].start_color.rgb
     assert stats["route_count"]["Маршрут №1"] == 1
     assert stats["route_count"]["Маршрут №2"] == 0
+    assert stats["route_stores"]["Маршрут №1"] == ["фм 4"]
     assert stats["total_found"] == 1
     assert stats["conflict_count"] == 0
 

@@ -8,6 +8,7 @@ def find_and_mark_routes(ws, groups, conflict_fill):
 
     Возвращает словарь со статистикой обработки:
         route_count    - сколько адресов найдено по каждому маршруту
+        route_stores   - какие магазины из шапки найдены по каждому маршруту
         conflict_count - количество конфликтов (адрес попал в несколько маршрутов)
         conflict_list  - подробности по каждому конфликту
         total_found    - всего успешно определено адресов
@@ -15,6 +16,7 @@ def find_and_mark_routes(ws, groups, conflict_fill):
     """
 
     route_count = {group["name"]: 0 for group in groups}
+    route_stores = {group["name"]: [] for group in groups}
     conflict_list = []
     unknown_stores = []
     conflict_count = 0
@@ -29,9 +31,13 @@ def find_and_mark_routes(ws, groups, conflict_fill):
 
             # один маршрут
             if len(matches) == 1:
+                route_name = matches[0]["name"]
                 cell.fill = matches[0]["fill"]
-                route_count[matches[0]["name"]] += 1
+                route_count[route_name] += 1
                 total_found += 1
+
+                if cell.row == 1 and cell.column > 1:
+                    route_stores[route_name].append(str(cell.value))
 
             # конфликт
             elif len(matches) > 1:
@@ -56,6 +62,7 @@ def find_and_mark_routes(ws, groups, conflict_fill):
 
     return {
         "route_count": route_count,
+        "route_stores": route_stores,
         "conflict_count": conflict_count,
         "conflict_list": conflict_list,
         "total_found": total_found,

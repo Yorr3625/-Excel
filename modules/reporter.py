@@ -3,6 +3,80 @@ from colorama import init, Fore, Style
 init(autoreset=True)
 
 
+def _format_preview_number(value):
+    return f"{value:,.0f}".replace(",", " ")
+
+
+def _format_file_size(value):
+    size = float(value or 0)
+
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{int(size)} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+
+    return "0 Б"
+
+
+def format_preview(preview):
+    """Формирует текст предварительного просмотра без побочных эффектов."""
+
+    lines = [
+        "ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР",
+        "=" * 35,
+        f"Файл: {preview['file_name']}",
+        f"Формат и размер: {preview['file_extension']}, "
+        f"{_format_file_size(preview['file_size'])}",
+        f"Лист: {preview['sheet_name']} (листов в книге: {preview['sheet_count']})",
+        f"Тип: {preview['document_type']}",
+        f"Режим: {preview.get('mode') or 'не указан'}",
+        f"Строк заказа: {preview['order_rows']}",
+        f"Найдено совпадений: {preview['total_found']}",
+        "",
+        "ИТОГИ ПО МАРШРУТАМ",
+    ]
+
+    for route in preview["route_rows"]:
+        lines.append(
+            f"{route['name']}: "
+            f"строк — {route['rows']}, "
+            f"совпадений — {route['matches']}, "
+            f"объём — {_format_preview_number(route['total'])}"
+        )
+
+        if route.get("stores"):
+            lines.append(f"  Магазины: {', '.join(route['stores'])}")
+
+    lines.extend(
+        [
+            f"Общий объём: {_format_preview_number(preview['grand_total'])}",
+            f"Конфликтов: {preview['conflict_count']}",
+            f"Неизвестных магазинов: {len(preview['unknown_stores'])}",
+        ]
+    )
+
+    warnings = preview.get("warnings", [])
+
+    if warnings:
+        lines.extend(["", "ПРЕДУПРЕЖДЕНИЯ:"])
+        lines.extend(f"⚠ {warning}" for warning in warnings)
+
+    if preview.get("unknown_stores"):
+        lines.extend(["", "Неизвестные магазины:"])
+        lines.extend(f"- {store}" for store in preview["unknown_stores"])
+
+    if preview.get("conflicts"):
+        lines.extend(["", "Конфликтующие адреса:"])
+        lines.extend(
+            f"- {item['cell']} | {item['text']} | {', '.join(item['routes'])}"
+            for item in preview["conflicts"]
+        )
+
+    lines.extend(["", "Для запуска обработки требуется явное подтверждение."])
+
+    return "\n".join(lines)
+
+
 def format_summary(output_file, stats, log_file):
     """Формирует текст итоговой сводки по результатам обработки."""
 

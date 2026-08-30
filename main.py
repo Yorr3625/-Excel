@@ -11,46 +11,32 @@ from modules.styles import (
     conflict_fill,
 )
 from modules.file_selector import select_order_file
+from modules.order_preview import PreviewError, build_order_preview
 from modules.pipeline import process_order
-from modules.reporter import print_summary
+from modules.reporter import format_preview, print_summary
 
 
 def main():
-
     settings = load_settings()
     input_file = select_order_file()
 
     print(f"\nВыбран файл: {Path(input_file).name}")
 
-    confirm = input(
-        "\nНачать обработку? (Y/N): "
-    ).strip().lower()
-
-    if confirm != "y":
-        print("Обработка отменена.")
-        return
-
     processed_files = load_processed_files()
-
     filename = Path(input_file).name
 
-    if filename in processed_files:
+    processed_at = processed_files.get(filename, "")
 
+    if processed_at:
         print("\n⚠ ВНИМАНИЕ!")
         print("Файл уже обрабатывался ранее.")
+        print(f"Дата обработки: {processed_at}")
 
-        print(
-            f"Дата обработки: "
-            f"{processed_files[filename]}"
-        )
-
-        confirm = input(
-            "\nПовторно обработать файл? (Y/N): "
-        ).strip().lower()
-
+        confirm = input("\nПовторно обработать файл? (Y/N): ").strip().lower()
         if confirm != "y":
             print("Обработка отменена.")
             return
+
     print("\n========================")
     print(" Выберите вариант")
     print("========================")
@@ -68,13 +54,36 @@ def main():
         return
 
     stores_file = paths.stores_file_for(mode_name)
-
     print(f"\nВыбран режим: {mode_name}")
     print(f"Файл магазинов: {stores_file}")
 
     stores = load_stores(stores_file)
     fills = [green_fill, yellow_fill, blue_fill, purple_fill]
     groups = build_groups(stores, fills)
+
+    try:
+        preview = build_order_preview(
+            input_file,
+            groups,
+            conflict_fill,
+            mode_name,
+        )
+    except PreviewError as error:
+        print(f"\nОШИБКА предварительного просмотра: {error}")
+        return
+
+    if processed_at:
+        preview["warnings"].append(
+            f"Файл уже обрабатывался {processed_at}. "
+            "Повторная обработка обновит статистику."
+        )
+
+    print("\n" + format_preview(preview))
+    confirm = input("\nНачать обработку после просмотра? (Y/N): ").strip().lower()
+
+    if confirm != "y":
+        print("Обработка отменена.")
+        return
 
     output_file, log_file, stats = process_order(
         input_file,

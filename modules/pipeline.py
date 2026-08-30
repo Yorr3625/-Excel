@@ -19,6 +19,25 @@ DELETE_TEXT = [
 ]
 
 
+def prepare_order(input_file, groups, conflict_fill):
+    """Загружает и подготавливает книгу для анализа или обработки.
+
+    Книга и возвращённый лист остаются только в памяти. Сохранение результата,
+    открытие файла и запись лога выполняются исключительно в ``process_order``.
+    """
+
+    wb = load_workbook(input_file)
+    ws = wb.active
+
+    remove_unused_rows_and_cols(ws)
+    delete_columns_by_text(ws, DELETE_TEXT)
+    delete_total_rows(ws)
+
+    stats = find_and_mark_routes(ws, groups, conflict_fill)
+
+    return wb, ws, stats
+
+
 def detect_mode(input_file, mode_groups, conflict_fill):
     """
     Определяет, какой набор маршрутов (например, {"Город": groups, "Область": groups})
@@ -31,14 +50,7 @@ def detect_mode(input_file, mode_groups, conflict_fill):
 
     for mode, groups in mode_groups.items():
 
-        wb = load_workbook(input_file)
-        ws = wb.active
-
-        remove_unused_rows_and_cols(ws)
-        delete_columns_by_text(ws, DELETE_TEXT)
-        delete_total_rows(ws)
-
-        stats = find_and_mark_routes(ws, groups, conflict_fill)
+        _wb, _ws, stats = prepare_order(input_file, groups, conflict_fill)
         scores[mode] = stats["total_found"]
 
     best_mode = max(scores, key=scores.get)
@@ -55,14 +67,7 @@ def process_order(input_file, settings, groups, conflict_fill):
     Возвращает (output_file, log_file, stats).
     """
 
-    wb = load_workbook(input_file)
-    ws = wb.active
-
-    remove_unused_rows_and_cols(ws)
-    delete_columns_by_text(ws, DELETE_TEXT)
-    delete_total_rows(ws)
-
-    stats = find_and_mark_routes(ws, groups, conflict_fill)
+    wb, ws, stats = prepare_order(input_file, groups, conflict_fill)
 
     now = datetime.now()
     output_file, date_folder = build_output_path(now)

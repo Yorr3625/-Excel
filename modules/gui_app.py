@@ -26,13 +26,14 @@ from modules.styles import (
     purple_fill,
     conflict_fill,
 )
-from modules.history import record_processing
+from modules.history import record_processing, was_processed
 from modules.excel_io import excel_glob_pattern, is_excel_file
 from modules.file_selector import ORDERS_FOLDER
 from modules.output_writer import PROCESSED_FOLDER
 from modules.logger import LOGS_FOLDER
+from modules.order_preview import PreviewError, build_order_preview
 from modules.pipeline import process_order
-from modules.reporter import format_summary
+from modules.reporter import format_preview, format_summary
 
 
 # понятные подписи для известных ключей settings.json
@@ -199,10 +200,10 @@ class App:
 
         self.process_button.configure(state="disabled")
         self.progress.start(12)
-        self._set_log_text("Обработка...")
+        self._set_log_text("Проверка файла перед обработкой...")
 
         thread = threading.Thread(
-            target=self._run_processing,
+            target=self._run_preview,
             args=(input_file,),
             daemon=True,
         )
@@ -210,13 +211,37 @@ class App:
 
         self.root.after(100, self._poll_result)
 
-    def _run_processing(self, input_file):
+    def _build_groups(self):
+        settings = load_settings()
+        stores = load_stores()
+        fills = [green_fill, yellow_fill, blue_fill, purple_fill]
+        return settings, build_groups(stores, fills)
+
+    def _run_preview(self, input_file):
 
         try:
-            settings = load_settings()
-            stores = load_stores()
-            fills = [green_fill, yellow_fill, blue_fill, purple_fill]
-            groups = build_groups(stores, fills)
+            settings, groups = self._build_groups()
+            preview = build_order_preview(input_file, groups, conflict_fill)
+            processed_at = was_processed(os.path.basename(input_file))
+
+            if processed_at:
+                preview["warnings"].append(
+                    "Файл уже обрабатывался "
+                    f"{processed_at}. Повторная обработка обновит статистику."
+                )
+
+            self.result_queue.put(("preview", (input_file, settings, groups, preview)))
+
+        except PreviewError as error:
+            self.result_queue.put(("error", str(error)))
+        except Exception as error:
+            self.result_queue.put(("error", str(error)))
+
+    def _run_processing(self, input_file, settings=None, groups=None):
+
+        try:
+            if settings is None or groups is None:
+                settings, groups = self._build_groups()
 
             output_file, log_file, stats = process_order(
                 input_file,
@@ -244,6 +269,33 @@ class App:
 
         self.progress.stop()
         self.process_button.configure(state="normal")
+
+        if status == "preview":
+            input_file, settings, groups, preview = message
+
+            if input_file != self.selected_file.get():
+                self._set_log_text(
+                    "Выбран другой файл. Постройте предварительный просмотр заново."
+                )
+                return
+
+            self._set_log_text(format_preview(preview))
+
+            if messagebox.askyesno(
+                "Подтверждение обработки",
+                "Предварительный просмотр готов. Продолжить обработку?",
+            ):
+                self.process_button.configure(state="disabled")
+                self.progress.start(12)
+                self._set_log_text("Обработка...")
+                thread = threading.Thread(
+                    target=self._run_processing,
+                    args=(input_file, settings, groups),
+                    daemon=True,
+                )
+                thread.start()
+                self.root.after(100, self._poll_result)
+            return
 
         if status == "ok":
             self._set_log_text(message)
