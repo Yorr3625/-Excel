@@ -23,7 +23,8 @@ def test_refresh_mail_config_is_registered_and_loads_state(monkeypatch):
         mail_source="Старый источник",
         mail_credentials_editing=False,
         mail_status="",
-        _reload_mail_items=lambda: reload_calls.append(True),
+        _set_mail_categories=lambda source_configs: None,
+        _reload_mail_items=lambda source_configs=None: reload_calls.append(True),
     )
 
     dashboard.State.refresh_mail_config.fn(state)
@@ -101,6 +102,98 @@ def test_take_mail_order_opens_invoice_details(monkeypatch):
     assert state.available_invoices_title == "Подходящие накладные · Город"
     assert [item["file"] for item in state.available_invoices] == [
         "ФМ 40, МДВ 11.11.2026.pdf"
+    ]
+
+
+def test_accountant_category_filter_separates_uncategorized_items(monkeypatch):
+    source_configs = [
+        {
+            "name": "Бухгалтер",
+            "email": "zosya-c@mail.ru",
+            "kind": "invoices",
+            "categories": [
+                {"name": "Молоко", "markers": ("фм 40", "мдв")},
+                {"name": "Парус", "markers": ("парус",)},
+                {"name": "Краймери", "markers": ("краймар", "краймери")},
+            ],
+        },
+    ]
+    items = [
+        {
+            "kind": "invoices",
+            "file": "накладная.pdf",
+            "subject": "ПАРУС",
+            "source_name": "Бухгалтер",
+        },
+        {
+            "kind": "invoices",
+            "file": "накладная.pdf",
+            "subject": "КРАЙМАР",
+            "source_name": "Бухгалтер",
+        },
+        {
+            "kind": "invoices",
+            "file": "накладная.pdf",
+            "subject": "ФМ 40, МДВ",
+            "source_name": "Бухгалтер",
+        },
+        {
+            "kind": "invoices",
+            "file": "неизвестная накладная.pdf",
+            "source_name": "Бухгалтер",
+        },
+        {
+            "kind": "message",
+            "file": "",
+            "subject": "Спецификация27.08.26 ПАРУС.xls",
+            "source_name": "Бухгалтер",
+        },
+    ]
+    state = SimpleNamespace(
+        mail_source="Бухгалтер",
+        mail_category="Все",
+        mail_kind_filter="Все сообщения",
+    )
+    state._filter_mail_items = dashboard.State._filter_mail_items.__get__(state)
+    state._set_mail_categories = dashboard.State._set_mail_categories.__get__(state)
+    state._reload_mail_items = dashboard.State._reload_mail_items.__get__(state)
+    state._mail_item_for_view = dashboard.State._mail_item_for_view
+    monkeypatch.setattr(dashboard, "mail_sources_config", lambda config=None: source_configs)
+    monkeypatch.setattr(dashboard, "load_mail_config", lambda: {})
+    monkeypatch.setattr(dashboard, "load_mail_items", lambda: items)
+
+    state._set_mail_categories(source_configs)
+    state._reload_mail_items(source_configs)
+
+    assert state.mail_categories == [
+        "Все",
+        "Молоко",
+        "Парус",
+        "Краймери",
+        "Без категории",
+    ]
+    assert [item["category"] for item in state.mail_all_items] == [
+        "Парус",
+        "Краймери",
+        "Молоко",
+        "",
+        "",
+    ]
+
+    for category, expected_subject in (
+        ("Молоко", "ФМ 40, МДВ"),
+        ("Парус", "ПАРУС"),
+        ("Краймери", "КРАЙМАР"),
+    ):
+        dashboard.State.set_mail_category.fn(state, category)
+        assert [item["subject"] for item in state.mail_items] == [expected_subject]
+        assert all(item["is_invoice"] for item in state.mail_items)
+
+    dashboard.State.set_mail_category.fn(state, "Без категории")
+
+    assert [item["file"] for item in state.mail_items] == [
+        "неизвестная накладная.pdf",
+        "Без вложения",
     ]
 
 

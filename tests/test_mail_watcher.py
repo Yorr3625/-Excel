@@ -63,6 +63,63 @@ def test_broken_config_does_not_crash():
     assert mail_watcher.load_mail_config()["enabled"] is False
 
 
+def test_sources_add_categories_and_olga_to_legacy_mail_config():
+    configured = mail_watcher.sources({
+        "sources": [
+            {
+                "name": "Молоко",
+                "email": mail_watcher.DEFAULT_MILK_ORDER_EMAIL,
+                "kind": "orders",
+            },
+            {
+                "name": "Бухгалтер",
+                "email": "zosya-c@mail.ru",
+                "kind": "invoices",
+            },
+            {
+                "name": "Старый источник",
+                "email": "old@example.com",
+                "kind": "invoices",
+            },
+        ],
+    })
+
+    assert configured[0]["categories"] == []
+    assert configured[1]["categories"] == [
+        {"name": "Молоко", "markers": ("фм 40", "фм40", "мдв")},
+        {"name": "Парус", "markers": ("парус",)},
+        {"name": "Краймери", "markers": ("краймер", "краймар")},
+    ]
+    assert configured[2]["categories"] == []
+    assert configured[3] == mail_watcher.OLGA_ORDER_SOURCE
+
+
+def test_empty_config_does_not_add_mail_sources():
+    assert mail_watcher.sources({}) == []
+
+
+def test_invoice_category_prefers_subject_and_uses_filename_as_fallback():
+    categories = [
+        {"name": "Молоко", "markers": ["фм 40", "мдв"]},
+        {"name": "Парус", "markers": ["парус"]},
+        {"name": "Краймери", "markers": ["краймар", "краймери"]},
+    ]
+
+    assert mail_watcher.invoice_category(
+        "накладная.pdf", categories, "ПАРУС на завтра"
+    ) == "Парус"
+    assert mail_watcher.invoice_category(
+        "ФМ40, МДВ.pdf", categories
+    ) == "Молоко"
+    assert mail_watcher.invoice_category(
+        "КРАЙМАР 01.pdf", categories
+    ) == "Краймери"
+    assert mail_watcher.invoice_category("накладная.pdf", categories) == ""
+    assert mail_watcher.invoice_category(
+        "", categories, "Спецификация ПАРУС.xls", mail_watcher.KIND_MESSAGE
+    ) == ""
+
+
 def test_save_credentials_normalises_key_and_uses_template_sources():
     _write_example_sources()
 
@@ -649,6 +706,7 @@ def test_invoice_pdf_is_saved_with_received_date(monkeypatch):
         "ФМ 40, МДВ.pdf",
         b"%PDF-1.4 invoice",
         sender="zosya-c@mail.ru",
+        subject="",
     )
     letter["Date"] = "Fri, 14 Aug 2026 09:30:00 +0300"
     fake = _FakeIMAP([letter])
@@ -670,6 +728,7 @@ def test_invoice_pdf_is_saved_with_received_date(monkeypatch):
     assert item["kind"] == mail_watcher.KIND_INVOICES
     assert item["source_name"] == "Бухгалтер"
     assert item["source_person"] == "Светлана Никифорова"
+    assert item["subject"] == ""
     assert item["received_display"] == "14.08.2026 09:30"
     assert (mail_watcher.INVOICES_FOLDER / "ФМ 40, МДВ.pdf").exists()
 

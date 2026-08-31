@@ -39,9 +39,36 @@ KIND_ORDERS = "orders"
 KIND_INVOICES = "invoices"
 KIND_MESSAGE = "message"
 DEFAULT_ORDER_SUBJECT = "Заказ ТС МОЛОКО"
+DEFAULT_MILK_ORDER_EMAIL = "fyodorova.ekaterina@moloko.com.ru"
 
 CITY_INVOICE_MODE = "Город"
 REGION_INVOICE_MODE = "Область"
+INVOICE_CATEGORY_MILK = "Молоко"
+INVOICE_CATEGORY_PARUS = "Парус"
+INVOICE_CATEGORY_KRAIMERI = "Краймери"
+INVOICE_CATEGORY_UNCATEGORIZED = "Без категории"
+ACCOUNTANT_INVOICE_CATEGORIES = (
+    {
+        "name": INVOICE_CATEGORY_MILK,
+        "markers": ("фм 40", "фм40", "мдв"),
+    },
+    {
+        "name": INVOICE_CATEGORY_PARUS,
+        "markers": ("парус",),
+    },
+    {
+        "name": INVOICE_CATEGORY_KRAIMERI,
+        "markers": ("краймер", "краймар"),
+    },
+)
+OLGA_ORDER_SOURCE = {
+    "name": "Ольга",
+    "email": "o_solenkova@mail.ru",
+    "person": "Ольга Соленкова",
+    "kind": KIND_ORDERS,
+    "subject": DEFAULT_ORDER_SUBJECT,
+    "categories": [],
+}
 REGION_INVOICE_GROUPS = {
     "Кировское / Торез / Шахтерск": ("кировск", "торез", "шахтер"),
     "Горловка": ("горлов",),
@@ -140,6 +167,13 @@ def sources(config: dict | None = None) -> list[dict]:
             continue
 
         kind = source.get("kind") or KIND_ORDERS
+        categories = _normalise_invoice_categories(source.get("categories"))
+        if (
+            kind == KIND_INVOICES
+            and not categories
+            and str(source.get("name") or "").strip().casefold() == "бухгалтер"
+        ):
+            categories = [dict(category) for category in ACCOUNTANT_INVOICE_CATEGORIES]
         result.append({
             "name": source.get("name") or email_addr,
             "email": email_addr,
@@ -148,6 +182,7 @@ def sources(config: dict | None = None) -> list[dict]:
             "subject": source.get("subject") or (
                 DEFAULT_ORDER_SUBJECT if kind == KIND_ORDERS else ""
             ),
+            "categories": categories,
         })
 
     for email_addr in config.get("senders") or []:
@@ -160,7 +195,18 @@ def sources(config: dict | None = None) -> list[dict]:
                 "person": "",
                 "kind": KIND_ORDERS,
                 "subject": DEFAULT_ORDER_SUBJECT,
+                "categories": [],
             })
+
+    has_default_milk_source = any(
+        item["email"].casefold() == DEFAULT_MILK_ORDER_EMAIL
+        for item in result
+    )
+    if has_default_milk_source and not any(
+        item["email"].casefold() == OLGA_ORDER_SOURCE["email"].casefold()
+        for item in result
+    ):
+        result.append(dict(OLGA_ORDER_SOURCE))
 
     return result
 
@@ -335,6 +381,68 @@ def _load_seen() -> list:
 
 def _save_seen(seen: list) -> None:
     _write_json(SEEN_FILE, seen[-SEEN_LIMIT:])
+
+
+def _normalise_category_marker(value: str) -> str:
+    return " ".join(
+        re.findall(r"[0-9a-zа-я]+", str(value or "").casefold().replace("ё", "е"))
+    )
+
+
+def _normalise_invoice_categories(value) -> list[dict]:
+    categories = []
+
+    for category in value or []:
+        if isinstance(category, str):
+            name = category.strip()
+            markers = ()
+        elif isinstance(category, dict):
+            name = str(category.get("name") or "").strip()
+            markers = tuple(
+                _normalise_category_marker(marker)
+                for marker in category.get("markers") or []
+                if _normalise_category_marker(marker)
+            )
+        else:
+            continue
+
+        if name and not any(item["name"] == name for item in categories):
+            categories.append({"name": name, "markers": markers})
+
+    return categories
+
+
+def _category_matches(value: str, marker: str) -> bool:
+    value = _normalise_category_marker(value)
+    marker = _normalise_category_marker(marker)
+    return marker in value or marker.replace(" ", "") in value.replace(" ", "")
+
+
+def invoice_category(
+    filename: str,
+    categories=None,
+    subject: str = "",
+    kind: str = KIND_INVOICES,
+) -> str:
+    """Определяет категорию PDF сначала по теме письма, затем по имени файла."""
+
+    if kind != KIND_INVOICES:
+        return ""
+
+    categories = _normalise_invoice_categories(categories)
+
+    for value in (subject, Path(filename).stem):
+
+        if not value:
+            continue
+        for category in categories:
+            if any(
+                _category_matches(value, marker)
+                for marker in category["markers"]
+            ):
+                return category["name"]
+
+    return ""
 
 
 def _normalise_subject(value: str) -> str:

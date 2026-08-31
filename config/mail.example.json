@@ -23,7 +23,28 @@
       "name": "Бухгалтер",
       "email": "zosya-c@mail.ru",
       "person": "Светлана Никифорова",
-      "kind": "invoices"
+      "kind": "invoices",
+      "categories": [
+        {
+          "name": "Молоко",
+          "markers": ["ФМ 40", "МДВ"]
+        },
+        {
+          "name": "Парус",
+          "markers": ["ПАРУС"]
+        },
+        {
+          "name": "Краймери",
+          "markers": ["КРАЙМАР", "КРАЙМЕРИ"]
+        }
+      ]
+    },
+    {
+      "name": "Ольга",
+      "email": "o_solenkova@mail.ru",
+      "person": "Ольга Соленкова",
+      "kind": "orders",
+      "subject": "Заказ ТС МОЛОКО"
     }
   ],
 

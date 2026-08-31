@@ -29,6 +29,7 @@ from modules.history import (
     was_processed,
 )
 from modules.mail_watcher import (
+    INVOICE_CATEGORY_UNCATEGORIZED,
     KIND_INVOICES,
     KIND_MESSAGE,
     KIND_ORDERS,
@@ -39,6 +40,7 @@ from modules.mail_watcher import (
     check_mail_with_retry,
     clear_mail_error_log,
     is_configured,
+    invoice_category,
     link_invoice,
     load_mail_config,
     load_mail_error_log,
@@ -377,6 +379,8 @@ class State(rx.State):
     mail_all_items: list[dict] = []
     mail_sources: list[str] = ["Все"]
     mail_source: str = "Все"
+    mail_categories: list[str] = ["Все"]
+    mail_category: str = "Все"
     mail_kind_filter: str = "Все сообщения"
     mail_auto: bool = False
     mail_interval: int = 10
@@ -580,18 +584,41 @@ class State(rx.State):
             "setTimeout(() => window.location.reload(), 1200);"
         )
 
+    def _set_mail_categories(self, source_configs=None):
+        source_configs = source_configs or mail_sources_config(load_mail_config())
+        categories = next(
+            (
+                source.get("categories") or []
+                for source in source_configs
+                if source.get("name") == self.mail_source
+            ),
+            [],
+        )
+        self.mail_categories = ["Все"] + [
+            category["name"] if isinstance(category, dict) else str(category)
+            for category in categories
+        ]
+        if categories:
+            self.mail_categories.append(INVOICE_CATEGORY_UNCATEGORIZED)
+        if self.mail_category not in self.mail_categories:
+            self.mail_category = "Все"
+
     def refresh_mail_config(self):
         config = load_mail_config()
         self.mail_configured = is_configured(config)
         self.mail_email = str(config.get("email", ""))
         self.mail_app_password = ""
         self.mail_interval = max(int(config.get("check_interval_minutes", 10)), 1)
-        self.mail_sources = ["Все"] + [item["name"] for item in mail_sources_config(config)]
+        source_configs = mail_sources_config(config)
+        self.mail_sources = ["Все"] + list(dict.fromkeys(
+            item["name"] for item in source_configs
+        ))
 
         if self.mail_source not in self.mail_sources:
             self.mail_source = "Все"
+        self._set_mail_categories(source_configs)
 
-        self._reload_mail_items()
+        self._reload_mail_items(source_configs)
         self.mail_error_log = load_mail_error_log()
 
         if not self.mail_configured:
@@ -627,7 +654,7 @@ class State(rx.State):
         self.mail_status = "Данные сохранены. Нажмите «Проверить почту»"
 
     @staticmethod
-    def _mail_item_for_view(item: dict) -> dict:
+    def _mail_item_for_view(item: dict, categories=None) -> dict:
         verdict = item.get("verdict") or {}
         kind = item.get("kind", KIND_MESSAGE)
         return {
@@ -652,6 +679,12 @@ class State(rx.State):
             "matches": verdict.get("matches", 0),
             "order_file": item.get("order_file", ""),
             "date_relation": item.get("date_relation", ""),
+            "category": invoice_category(
+                item.get("file", ""),
+                categories,
+                item.get("subject", ""),
+                kind,
+            ),
         }
 
     def _filter_mail_items(self):
@@ -659,6 +692,22 @@ class State(rx.State):
 
         if self.mail_source != "Все":
             items = [item for item in items if item["source"] == self.mail_source]
+
+        if self.mail_category != "Все":
+            if self.mail_category == INVOICE_CATEGORY_UNCATEGORIZED:
+                items = [
+                    item
+                    for item in items
+                    if (
+                        item["is_invoice"] and not item["category"]
+                    ) or item["kind"] == KIND_MESSAGE
+                ]
+            else:
+                items = [
+                    item
+                    for item in items
+                    if item["is_invoice"] and item["category"] == self.mail_category
+                ]
 
         if self.mail_kind_filter == "Только заказы":
             items = [item for item in items if item["is_order"]]
@@ -671,14 +720,28 @@ class State(rx.State):
 
         self.mail_items = items
 
-    def _reload_mail_items(self):
+    def _reload_mail_items(self, source_configs=None):
+        source_configs = source_configs or mail_sources_config(load_mail_config())
+        category_rules = {
+            source["name"]: source.get("categories") or []
+            for source in source_configs
+        }
         self.mail_all_items = [
-            self._mail_item_for_view(item) for item in load_mail_items()
+            self._mail_item_for_view(
+                item,
+                category_rules.get(item.get("source_name"), []),
+            )
+            for item in load_mail_items()
         ]
         self._filter_mail_items()
 
     def set_mail_source(self, source: str):
         self.mail_source = source
+        self._set_mail_categories()
+        self._filter_mail_items()
+
+    def set_mail_category(self, value: str):
+        self.mail_category = value
         self._filter_mail_items()
 
     def set_mail_kind_filter(self, value: str):
@@ -2975,6 +3038,33 @@ def mail_page():
                         gap="8px",
                         wrap="wrap",
                         width="100%",
+                    ),
+                    rx.cond(
+                        State.mail_categories.length() > 1,
+                        rx.vstack(
+                            rx.text(
+                                "Направление накладных",
+                                color=muted(),
+                                font_size="12px",
+                                font_weight="600",
+                            ),
+                            rx.flex(
+                                rx.foreach(
+                                    State.mail_categories,
+                                    lambda category: segment_button(
+                                        category,
+                                        State.mail_category,
+                                        State.set_mail_category(category),
+                                    ),
+                                ),
+                                gap="8px",
+                                wrap="wrap",
+                                width="100%",
+                            ),
+                            spacing="2",
+                            width="100%",
+                        ),
+                        rx.box(),
                     ),
                 ),
                 rx.cond(
