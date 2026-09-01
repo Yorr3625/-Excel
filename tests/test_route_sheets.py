@@ -1,6 +1,17 @@
+import pytest
 from openpyxl import Workbook
 
+from modules import paths, route_drivers
 from modules.route_sheets import create_route_sheets, add_sum_column_to_all_sheets
+
+
+@pytest.fixture(autouse=True)
+def _isolated_route_drivers(tmp_path, monkeypatch):
+    """Уводит файл водителей во временную папку, чтобы тесты не трогали config/."""
+
+    target = tmp_path / "route_drivers.json"
+    monkeypatch.setattr(paths, "ROUTE_DRIVERS_FILE", target)
+    monkeypatch.setattr(route_drivers, "ROUTE_DRIVERS_FILE", target)
 
 
 def _build_order_sheet():
@@ -27,6 +38,25 @@ def test_create_route_sheets_keeps_only_relevant_columns(groups):
 
     # исходный лист не тронут
     assert [c.value for c in ws[1]] == ["Товар", "фм 4", "фм 42"]
+
+
+def test_create_route_sheets_sets_page_header_with_driver_and_area(groups):
+    wb, ws = _build_order_sheet()
+    route_drivers.save_route_drivers({"route_1": "Игорь"})
+
+    create_route_sheets(wb, ws, groups)
+
+    assert wb["Маршрут №1"].oddHeader.center.text == "Маршрут №1 (Игорь) - Текстильщик"
+    assert wb["Маршрут №2"].oddHeader.center.text == "Маршрут №2 (Азер) - Центр"
+
+
+def test_create_route_sheets_skips_header_for_unrecognized_group_name():
+    wb, ws = _build_order_sheet()
+    unnamed_group = [{"name": "Служебный лист", "names": ["фм 4"], "fill": None}]
+
+    create_route_sheets(wb, ws, unnamed_group)
+
+    assert wb["Служебный лист"].oddHeader.center.text is None
 
 
 def test_add_sum_column_inserts_sum_formula_and_totals():

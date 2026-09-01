@@ -26,7 +26,7 @@ from modules.styles import (
     purple_fill,
     conflict_fill,
 )
-from modules.history import record_processing, was_processed
+from modules.history import load_processed_files, record_processing, was_processed
 from modules.excel_io import excel_glob_pattern, is_excel_file
 from modules.file_selector import ORDERS_FOLDER
 from modules.output_writer import PROCESSED_FOLDER
@@ -34,6 +34,13 @@ from modules.logger import LOGS_FOLDER
 from modules.order_preview import PreviewError, build_order_preview
 from modules.pipeline import process_order
 from modules.reporter import format_preview, format_summary
+from modules.weight_log import (
+    add_weight_row,
+    delete_weight_row,
+    last_avg_weight_for,
+    load_weight_rows,
+    update_weight_row,
+)
 
 
 # понятные подписи для известных ключей settings.json
@@ -46,6 +53,13 @@ SETTINGS_LABELS = {
 }
 
 ROUTE_KEYS = ["route_1", "route_2", "route_3", "route_4"]
+
+WEIGHT_NO_BINDING = "— не привязано —"
+WEIGHT_ROUTES = ["Маршрут №1", "Маршрут №2", "Маршрут №3", "Маршрут №4"]
+WEIGHT_ROUTE_OPTIONS = [WEIGHT_NO_BINDING] + WEIGHT_ROUTES
+WEIGHT_FILTER_ALL = "Все"
+WEIGHT_FILTER_UNBOUND = "Без привязки"
+WEIGHT_ROUTE_FILTER_OPTIONS = [WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND] + WEIGHT_ROUTES
 
 
 def open_in_explorer(path):
@@ -74,16 +88,19 @@ class App:
         self.process_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
         self.routes_tab = ttk.Frame(notebook)
+        self.weight_tab = ttk.Frame(notebook)
         self.backups_tab = ttk.Frame(notebook)
 
         notebook.add(self.process_tab, text="Обработка")
         notebook.add(self.settings_tab, text="Настройки")
         notebook.add(self.routes_tab, text="Маршруты")
+        notebook.add(self.weight_tab, text="Вес")
         notebook.add(self.backups_tab, text="Резервные копии")
 
         self._build_process_tab()
         self._build_settings_tab()
         self._build_routes_tab()
+        self._build_weight_tab()
         self._build_backups_tab()
 
         self.refresh_recent_files()
@@ -653,6 +670,293 @@ class App:
             self.backup_status_var.set(f"Состояние восстановлено.{safety}")
         except BackupError as error:
             messagebox.showerror("Резервные копии", str(error))
+
+    # ==========================================================
+    # ВКЛАДКА "ВЕС"
+    # ==========================================================
+
+    def _build_weight_tab(self):
+        container = ttk.Frame(self.weight_tab)
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ttk.Label(
+            container,
+            text=(
+                "Наименование, ящики и средний вес — а для взвешенных позиций впишите "
+                "точный вес. При желании привяжите запись к заказу и маршруту."
+            ),
+            wraplength=1200,
+        ).pack(anchor="w", pady=(0, 10))
+
+        form = ttk.LabelFrame(container, text="Новая запись")
+        form.pack(fill="x", pady=(0, 12))
+
+        row1 = ttk.Frame(form)
+        row1.pack(fill="x", padx=10, pady=(10, 4))
+
+        self.weight_name_var = tk.StringVar()
+        self.weight_box_var = tk.StringVar()
+        self.weight_avg_var = tk.StringVar()
+        self.weight_exact_var = tk.StringVar()
+
+        ttk.Label(row1, text="Наименование:").pack(side="left")
+        name_entry = ttk.Entry(row1, textvariable=self.weight_name_var, width=26)
+        name_entry.pack(side="left", padx=(4, 14))
+        name_entry.bind("<FocusOut>", self._suggest_weight_from_name)
+
+        ttk.Label(row1, text="Кол-во ящиков:").pack(side="left")
+        ttk.Entry(row1, textvariable=self.weight_box_var, width=8).pack(side="left", padx=(4, 14))
+
+        ttk.Label(row1, text="Средний вес, кг:").pack(side="left")
+        ttk.Entry(row1, textvariable=self.weight_avg_var, width=8).pack(side="left", padx=(4, 14))
+
+        ttk.Label(row1, text="Точный вес, кг:").pack(side="left")
+        ttk.Entry(row1, textvariable=self.weight_exact_var, width=8).pack(side="left")
+
+        row2 = ttk.Frame(form)
+        row2.pack(fill="x", padx=10, pady=4)
+
+        self.weight_order_var = tk.StringVar(value=WEIGHT_NO_BINDING)
+        self.weight_route_var = tk.StringVar(value=WEIGHT_NO_BINDING)
+
+        ttk.Label(row2, text="Заказ:").pack(side="left")
+        self.weight_order_combo = ttk.Combobox(
+            row2,
+            textvariable=self.weight_order_var,
+            state="readonly",
+            width=32,
+            values=[WEIGHT_NO_BINDING],
+        )
+        self.weight_order_combo.pack(side="left", padx=(4, 14))
+
+        ttk.Label(row2, text="Маршрут:").pack(side="left")
+        ttk.Combobox(
+            row2,
+            textvariable=self.weight_route_var,
+            state="readonly",
+            width=16,
+            values=WEIGHT_ROUTE_OPTIONS,
+        ).pack(side="left")
+
+        row3 = ttk.Frame(form)
+        row3.pack(fill="x", padx=10, pady=(4, 10))
+
+        self.weight_submit_button = ttk.Button(row3, text="Добавить", command=self.submit_weight_row)
+        self.weight_submit_button.pack(side="left")
+
+        # появляется только во время редактирования строки (см. edit_selected_weight_row)
+        self.weight_cancel_button = ttk.Button(row3, text="Отмена", command=self.cancel_weight_edit)
+
+        self.weight_status_var = tk.StringVar()
+        ttk.Label(row3, textvariable=self.weight_status_var, foreground="#b00020").pack(side="left", padx=12)
+
+        filter_frame = ttk.Frame(container)
+        filter_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(filter_frame, text="Фильтр по заказу:").pack(side="left")
+        self.weight_filter_order_var = tk.StringVar(value=WEIGHT_FILTER_ALL)
+        self.weight_filter_order_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.weight_filter_order_var,
+            state="readonly",
+            width=32,
+            values=[WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND],
+        )
+        self.weight_filter_order_combo.pack(side="left", padx=(4, 14))
+        self.weight_filter_order_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_weight_list())
+
+        ttk.Label(filter_frame, text="Фильтр по маршруту:").pack(side="left")
+        self.weight_filter_route_var = tk.StringVar(value=WEIGHT_FILTER_ALL)
+        filter_route_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.weight_filter_route_var,
+            state="readonly",
+            width=16,
+            values=WEIGHT_ROUTE_FILTER_OPTIONS,
+        )
+        filter_route_combo.pack(side="left", padx=(4, 14))
+        filter_route_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_weight_list())
+
+        ttk.Button(filter_frame, text="Сбросить фильтр", command=self.reset_weight_filter).pack(side="left")
+
+        list_frame = ttk.LabelFrame(container, text="Записи")
+        list_frame.pack(fill="both", expand=True)
+
+        self.weight_list = tk.Listbox(list_frame, height=14)
+        self.weight_list.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        self.weight_list.bind("<Double-Button-1>", lambda _event: self.edit_selected_weight_row())
+
+        list_scroll = ttk.Scrollbar(list_frame, command=self.weight_list.yview)
+        self.weight_list.configure(yscrollcommand=list_scroll.set)
+        list_scroll.pack(side="left", fill="y", pady=4)
+
+        list_buttons = ttk.Frame(container)
+        list_buttons.pack(fill="x", pady=(6, 0))
+
+        ttk.Button(list_buttons, text="Изменить выбранную", command=self.edit_selected_weight_row).pack(side="left")
+        ttk.Button(
+            list_buttons,
+            text="Удалить выбранную",
+            command=self.delete_selected_weight_row,
+        ).pack(side="left", padx=8)
+
+        self.weight_total_var = tk.StringVar()
+        ttk.Label(
+            list_buttons,
+            textvariable=self.weight_total_var,
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(side="right")
+
+        self._weight_editing_id = None
+        self._weight_items = []  # строки, синхронные по порядку с self.weight_list
+
+        self.refresh_weight_list()
+
+    def refresh_weight_list(self):
+        rows = load_weight_rows()
+
+        processed = sorted(load_processed_files().items(), key=lambda item: item[1], reverse=True)
+        order_names = [name for name, _ in processed]
+        self.weight_order_combo.configure(values=[WEIGHT_NO_BINDING] + order_names)
+        self.weight_filter_order_combo.configure(
+            values=[WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND] + order_names
+        )
+
+        order_filter = self.weight_filter_order_var.get()
+        route_filter = self.weight_filter_route_var.get()
+
+        if order_filter == WEIGHT_FILTER_UNBOUND:
+            rows = [row for row in rows if not row["order_file"]]
+        elif order_filter != WEIGHT_FILTER_ALL:
+            rows = [row for row in rows if row["order_file"] == order_filter]
+
+        if route_filter == WEIGHT_FILTER_UNBOUND:
+            rows = [row for row in rows if not row["route"]]
+        elif route_filter != WEIGHT_FILTER_ALL:
+            rows = [row for row in rows if row["route"] == route_filter]
+
+        self.weight_list.delete(0, "end")
+        self._weight_items = rows
+
+        for row in rows:
+            order_part = f" · Заказ: {row['order_file']}" if row["order_file"] else ""
+            route_part = f" · {row['route']}" if row["route"] else ""
+            exact_part = f", точный {row['exact_weight']:g} кг" if row["exact_weight"] is not None else ""
+            line = (
+                f"{row['name']} — {row['box_count']}×{row['avg_weight']:g} кг{exact_part}"
+                f" = {row['total']:g} кг{order_part}{route_part}"
+            )
+            self.weight_list.insert("end", line)
+
+        total = sum(row["total"] for row in rows)
+        self.weight_total_var.set(f"Итого по списку: {total:g} кг")
+
+    def reset_weight_filter(self):
+        self.weight_filter_order_var.set(WEIGHT_FILTER_ALL)
+        self.weight_filter_route_var.set(WEIGHT_FILTER_ALL)
+        self.refresh_weight_list()
+
+    def _suggest_weight_from_name(self, _event=None):
+        """Подставляет средний вес ящика из последней записи с таким же названием."""
+
+        if self.weight_avg_var.get().strip() or self._weight_editing_id:
+            return
+
+        suggestion = last_avg_weight_for(self.weight_name_var.get())
+        if suggestion is not None:
+            self.weight_avg_var.set(f"{suggestion:g}")
+
+    def _reset_weight_form(self):
+        self.weight_name_var.set("")
+        self.weight_box_var.set("")
+        self.weight_avg_var.set("")
+        self.weight_exact_var.set("")
+        self.weight_order_var.set(WEIGHT_NO_BINDING)
+        self.weight_route_var.set(WEIGHT_NO_BINDING)
+        self.weight_status_var.set("")
+        self._weight_editing_id = None
+        self.weight_submit_button.configure(text="Добавить")
+        self.weight_cancel_button.pack_forget()
+
+    def edit_selected_weight_row(self):
+        selection = self.weight_list.curselection()
+        if not selection:
+            messagebox.showinfo("Вес", "Выберите запись в списке.")
+            return
+
+        row = self._weight_items[selection[0]]
+        self.weight_name_var.set(row["name"])
+        self.weight_box_var.set(str(row["box_count"]))
+        self.weight_avg_var.set(f"{row['avg_weight']:g}")
+        self.weight_exact_var.set("" if row["exact_weight"] is None else f"{row['exact_weight']:g}")
+        self.weight_order_var.set(row["order_file"] or WEIGHT_NO_BINDING)
+        self.weight_route_var.set(row["route"] or WEIGHT_NO_BINDING)
+        self.weight_status_var.set("")
+        self._weight_editing_id = row["id"]
+        self.weight_submit_button.configure(text="Сохранить изменения")
+        self.weight_cancel_button.pack(side="left", padx=(8, 0))
+
+    def cancel_weight_edit(self):
+        self._reset_weight_form()
+
+    def submit_weight_row(self):
+        name = self.weight_name_var.get().strip()
+
+        if not name:
+            self.weight_status_var.set("Укажите наименование")
+            return
+
+        try:
+            box_count = int(self.weight_box_var.get())
+            assert box_count > 0
+        except (ValueError, AssertionError):
+            self.weight_status_var.set("Количество ящиков должно быть целым числом больше нуля")
+            return
+
+        try:
+            avg_weight = float(self.weight_avg_var.get().replace(",", "."))
+            assert avg_weight >= 0
+        except (ValueError, AssertionError):
+            self.weight_status_var.set("Средний вес ящика должен быть числом")
+            return
+
+        exact_weight = None
+        exact_text = self.weight_exact_var.get().strip()
+        if exact_text:
+            try:
+                exact_weight = float(exact_text.replace(",", "."))
+                assert exact_weight >= 0
+            except (ValueError, AssertionError):
+                self.weight_status_var.set("Точный вес должен быть числом")
+                return
+
+        order_file = "" if self.weight_order_var.get() == WEIGHT_NO_BINDING else self.weight_order_var.get()
+        route = "" if self.weight_route_var.get() == WEIGHT_NO_BINDING else self.weight_route_var.get()
+
+        if self._weight_editing_id:
+            update_weight_row(
+                self._weight_editing_id, name, box_count, avg_weight, exact_weight, order_file, route
+            )
+        else:
+            add_weight_row(name, box_count, avg_weight, exact_weight, order_file, route)
+
+        self._reset_weight_form()
+        self.refresh_weight_list()
+
+    def delete_selected_weight_row(self):
+        selection = self.weight_list.curselection()
+        if not selection:
+            messagebox.showinfo("Вес", "Выберите запись в списке.")
+            return
+
+        row = self._weight_items[selection[0]]
+        if not messagebox.askyesno("Подтвердите удаление", f"Удалить запись «{row['name']}»?"):
+            return
+
+        delete_weight_row(row["id"])
+        if self._weight_editing_id == row["id"]:
+            self._reset_weight_form()
+        self.refresh_weight_list()
 
 
 def _parse_value(text):

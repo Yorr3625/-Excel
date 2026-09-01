@@ -38,6 +38,9 @@ config/backup.json
 venv/
 .venv/
 
+# Скачивается автоматически share_dashboard.bat (утилита временного туннеля)
+tools/
+
 .pytest_cache/
 
 .vscode/

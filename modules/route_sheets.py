@@ -5,6 +5,8 @@ from openpyxl.styles import Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Border, Side, Font
 
+from modules.route_drivers import load_route_drivers, route_header_for_name
+
 SUM_HEADER = "Сумма"
 DEFAULT_BORDER = Border(
     left=Side(style="thin"),
@@ -19,7 +21,12 @@ def create_route_sheets(wb, ws, groups):
     Для каждой группы (маршрута) создаёт отдельный лист-копию исходного
     листа, оставляя только столбцы, относящиеся к этому маршруту,
     и добавляет колонку "Сумма" с формулой SUM по строке.
+
+    Также выставляет колонтитул страницы вида «Маршрут №N (Водитель) -
+    Район» — виден при печати и в предпросмотре печати.
     """
+
+    drivers = load_route_drivers()
 
     for group in groups:
 
@@ -35,6 +42,10 @@ def create_route_sheets(wb, ws, groups):
         # удаляем справа налево, чтобы номера столбцов не сбились
         for col in sorted(delete_columns, reverse=True):
             new_ws.delete_cols(col)
+
+        header_text = route_header_for_name(route_name, drivers)
+        if header_text:
+            new_ws.oddHeader.center.text = header_text
 
 
 def _find_columns_to_delete(ws, stores):
