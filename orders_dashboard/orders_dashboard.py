@@ -71,6 +71,14 @@ from modules.tracking_sim import (
     init_vehicles,
 )
 from modules.route_drivers import ROUTE_AREAS, load_route_drivers, save_route_drivers
+from modules.ai_settings import (
+    PROVIDER_CLAUDE_CLI,
+    PROVIDER_CLAUDE_KEY,
+    PROVIDER_OPENAI_KEY,
+    load_ai_settings,
+    save_ai_settings,
+)
+from modules.help_chat import HelpChatError, send_chat_message
 
 
 async def gps_ping(request: Request):
@@ -135,6 +143,8 @@ FA_ICON_MAP = {
     "folder": "FaFolderOpen",
     "scale": "FaWeightScale",
     "edit": "FaPenToSquare",
+    "ai": "FaWandMagicSparkles",
+    "send": "FaPaperPlane",
 }
 
 
@@ -173,6 +183,20 @@ WEIGHT_ROUTE_OPTIONS = [WEIGHT_NO_BINDING] + WEIGHT_ROUTES
 WEIGHT_FILTER_ALL = "Все"
 WEIGHT_FILTER_UNBOUND = "Без привязки"
 WEIGHT_ROUTE_FILTER_OPTIONS = [WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND] + WEIGHT_ROUTES
+AI_PROVIDER_LABELS = {
+    PROVIDER_CLAUDE_KEY: "Claude (ключ Anthropic API)",
+    PROVIDER_CLAUDE_CLI: "Claude через Claude Code CLI",
+    PROVIDER_OPENAI_KEY: "ChatGPT (ключ OpenAI API)",
+}
+# Чат-помощник сейчас работает только через Claude — ChatGPT в списке
+# выбора не показываем, хотя modules/ai_settings.py всё ещё умеет его
+# хранить (задел на будущее).
+AI_PROVIDER_OPTIONS = [AI_PROVIDER_LABELS[PROVIDER_CLAUDE_KEY], AI_PROVIDER_LABELS[PROVIDER_CLAUDE_CLI]]
+AI_PROVIDER_BY_LABEL = {label: value for value, label in AI_PROVIDER_LABELS.items()}
+HELP_CHAT_MODEL_SONNET = "claude-sonnet-5"
+HELP_CHAT_MODEL_HAIKU = "claude-haiku-4-5"
+HELP_CHAT_MODEL_BY_LABEL = {"Sonnet": HELP_CHAT_MODEL_SONNET, "Haiku": HELP_CHAT_MODEL_HAIKU}
+HELP_CHAT_MODEL_OPTIONS = list(HELP_CHAT_MODEL_BY_LABEL)
 VERSION_HISTORY = load_changelog()
 
 NAV_ITEMS = [
@@ -474,6 +498,18 @@ class State(rx.State):
     weight_delete_confirm_id: str = ""
     weight_status: str = ""
 
+    ai_provider_label: str = AI_PROVIDER_LABELS[PROVIDER_CLAUDE_KEY]
+    ai_anthropic_key_input: str = ""
+    ai_configured: bool = False
+    ai_settings_status: str = ""
+
+    help_chat_open: bool = False
+    help_chat_model_label: str = "Sonnet"
+    help_chat_messages: list[dict] = []
+    help_chat_input: str = ""
+    help_chat_busy: bool = False
+    help_chat_status: str = ""
+
     @rx.var
     def weight_visible_rows(self) -> list[dict]:
         rows = self.weight_rows
@@ -504,6 +540,7 @@ class State(rx.State):
             self.load_routes()
         elif page == "Настройки":
             self.load_settings_form()
+            self.load_ai_settings_form()
         elif page == "Резервные копии":
             self.load_backups()
         elif page == "Трекинг" and not self.vehicles:
@@ -1390,6 +1427,7 @@ class State(rx.State):
 
         self.refresh_stores_total()
         self.volume_chart_data = build_volume_chart_data()
+        self.load_ai_settings_form()
 
     def load_route_drivers_form(self):
         drivers = load_route_drivers()
@@ -1550,6 +1588,82 @@ class State(rx.State):
 
         if self.weight_editing_id == row_id:
             self._reset_weight_form()
+
+    def load_ai_settings_form(self):
+        settings = load_ai_settings()
+        self.ai_provider_label = AI_PROVIDER_LABELS.get(
+            settings["provider"], AI_PROVIDER_LABELS[PROVIDER_CLAUDE_KEY]
+        )
+        self.ai_anthropic_key_input = ""
+        self.ai_configured = bool(
+            settings["anthropic_api_key"] or settings["provider"] == PROVIDER_CLAUDE_CLI
+        )
+        self.ai_settings_status = ""
+
+    def set_ai_provider_label(self, value: str):
+        self.ai_provider_label = value
+
+    def set_ai_anthropic_key_input(self, value: str):
+        self.ai_anthropic_key_input = value
+
+    def save_ai_settings_form(self):
+        provider = AI_PROVIDER_BY_LABEL.get(self.ai_provider_label, PROVIDER_CLAUDE_KEY)
+
+        settings = save_ai_settings(provider, anthropic_api_key=self.ai_anthropic_key_input)
+
+        self.ai_anthropic_key_input = ""
+        self.ai_configured = bool(settings["anthropic_api_key"] or provider == PROVIDER_CLAUDE_CLI)
+        self.ai_settings_status = "Настройки сохранены" if self.ai_configured else "Настройки сохранены, но ключ не задан"
+
+    def toggle_help_chat(self):
+        self.help_chat_open = not self.help_chat_open
+
+    def set_help_chat_model_label(self, value: str):
+        self.help_chat_model_label = value
+
+    def set_help_chat_input(self, value: str):
+        self.help_chat_input = value
+
+    def clear_help_chat(self):
+        self.help_chat_messages = []
+        self.help_chat_input = ""
+        self.help_chat_status = ""
+
+    @rx.event(background=True)
+    async def send_help_chat_message(self):
+        """Отправляет сообщение в чат-помощник, не блокируя интерфейс."""
+
+        async with self:
+            if self.help_chat_busy:
+                return
+            text = self.help_chat_input.strip()
+            if not text:
+                return
+            self.help_chat_busy = True
+            self.help_chat_status = ""
+            self.help_chat_input = ""
+            history = list(self.help_chat_messages)
+            history.append({"role": "user", "content": text})
+            self.help_chat_messages = history
+            model = HELP_CHAT_MODEL_BY_LABEL.get(self.help_chat_model_label, HELP_CHAT_MODEL_SONNET)
+
+        try:
+            reply = await asyncio.to_thread(send_chat_message, history, model)
+        except HelpChatError as error:
+            async with self:
+                self.help_chat_busy = False
+                self.help_chat_status = str(error)
+            return
+        except Exception as error:
+            async with self:
+                self.help_chat_busy = False
+                self.help_chat_status = f"Непредвиденная ошибка: {error}"
+            return
+
+        async with self:
+            self.help_chat_messages = self.help_chat_messages + [{"role": "assistant", "content": reply}]
+            self.help_chat_busy = False
+            self.help_chat_status = ""
 
     def refresh_stores_total(self):
         total = 0
@@ -4471,6 +4585,51 @@ def settings_page():
             spacing="4",
             align="center",
         ),
+        panel_shell(
+            rx.hstack(
+                panel_title("ai", "Чат-помощник"),
+                rx.spacer(),
+                rx.cond(
+                    State.ai_configured,
+                    rx.badge("Настроено", color_scheme="green", variant="soft"),
+                    rx.badge("Не настроено", color_scheme="gray", variant="soft"),
+                ),
+                width="100%",
+                align="center",
+            ),
+            rx.text(
+                "Плавающая кнопка чата внизу справа доступна любому, кто откроет сайт — "
+                "в том числе по временной ссылке. У чата нет доступа к заказам, весу или "
+                "другим настройкам — только обычный разговор.",
+                color=muted(),
+                font_size="12px",
+            ),
+            weight_select_field("Способ подключения", State.ai_provider_label, State.set_ai_provider_label, AI_PROVIDER_OPTIONS),
+            rx.hstack(
+                weight_field(
+                    "Ключ Anthropic API",
+                    State.ai_anthropic_key_input,
+                    State.set_ai_anthropic_key_input,
+                    "необходим для «Claude (ключ Anthropic API)»",
+                ),
+                spacing="3",
+                width="100%",
+                align="end",
+            ),
+            rx.hstack(
+                secondary_button("Сохранить настройки чата", on_click=State.save_ai_settings_form, width="220px"),
+                rx.text(State.ai_settings_status, color=muted(), font_size="13px"),
+                spacing="4",
+                align="center",
+            ),
+            rx.text(
+                "Ключ хранится локально в config/ai.json и никуда, кроме Anthropic, не "
+                "передаётся. Для «Claude через Claude Code CLI» ключ не нужен — "
+                "используются учётные данные `ant auth login` на этом компьютере.",
+                color=muted(),
+                font_size="11px",
+            ),
+        ),
     )
 
 
@@ -4490,6 +4649,122 @@ def main_content():
     )
 
 
+def help_chat_message_bubble(message):
+    is_user = message["role"] == "user"
+    return rx.box(
+        rx.text(
+            message["content"],
+            color=rx.cond(is_user, "white", text()),
+            font_size="13px",
+            white_space="pre-wrap",
+        ),
+        padding="8px 12px",
+        border_radius="10px",
+        background=rx.cond(is_user, ACCENT, surface_alt()),
+        max_width="85%",
+        margin_left=rx.cond(is_user, "auto", "0"),
+    )
+
+
+def help_chat_widget():
+    return rx.fragment(
+        rx.cond(
+            State.help_chat_open,
+            rx.vstack(
+                rx.hstack(
+                    fa_icon(tag="ai", size=15, color=ACCENT),
+                    rx.text("Чат-помощник", color=text(), font_weight="700", font_size="14px"),
+                    rx.spacer(),
+                    rx.button(
+                        fa_icon(tag="x", size=13),
+                        on_click=State.toggle_help_chat,
+                        size="1",
+                        variant="ghost",
+                        color=muted(),
+                        cursor="pointer",
+                    ),
+                    width="100%",
+                    align="center",
+                ),
+                segmented_control(HELP_CHAT_MODEL_OPTIONS, State.help_chat_model_label, State.set_help_chat_model_label),
+                rx.vstack(
+                    rx.cond(
+                        State.help_chat_messages.length() > 0,
+                        rx.fragment(rx.foreach(State.help_chat_messages, help_chat_message_bubble)),
+                        rx.text(
+                            "Здравствуйте! Чем могу помочь? Это обычный чат — доступа к "
+                            "заказам, весу и настройкам у него нет.",
+                            color=muted(),
+                            font_size="12px",
+                        ),
+                    ),
+                    rx.cond(
+                        State.help_chat_busy,
+                        rx.text("Печатает...", color=muted(), font_size="12px"),
+                        rx.box(),
+                    ),
+                    spacing="2",
+                    width="100%",
+                    align="start",
+                    overflow_y="auto",
+                    flex="1",
+                ),
+                rx.cond(
+                    State.help_chat_status != "",
+                    rx.text(State.help_chat_status, color="#e5484d", font_size="12px"),
+                    rx.box(),
+                ),
+                rx.hstack(
+                    rx.input(
+                        value=State.help_chat_input,
+                        on_change=State.set_help_chat_input,
+                        placeholder="Напишите сообщение...",
+                        width="100%",
+                        height="38px",
+                        disabled=State.help_chat_busy,
+                    ),
+                    rx.button(
+                        fa_icon(tag="send", size=14),
+                        on_click=State.send_help_chat_message,
+                        disabled=State.help_chat_busy,
+                        **button_base(height="38px", background=ACCENT, color="white"),
+                    ),
+                    width="100%",
+                    align="center",
+                ),
+                spacing="3",
+                width="340px",
+                height="460px",
+                padding="14px",
+                border_radius="14px",
+                background=surface(),
+                border=f"1px solid {border()}",
+                box_shadow="0 12px 36px rgba(0, 0, 0, 0.3)",
+                position="fixed",
+                bottom="92px",
+                right="24px",
+                z_index="999",
+            ),
+            rx.box(),
+        ),
+        rx.button(
+            fa_icon(tag="ai", size=22, color="white"),
+            on_click=State.toggle_help_chat,
+            position="fixed",
+            bottom="24px",
+            right="24px",
+            width="56px",
+            height="56px",
+            border_radius="999px",
+            background=ACCENT,
+            box_shadow="0 8px 24px rgba(0, 0, 0, 0.35)",
+            cursor="pointer",
+            z_index="999",
+            _hover={"background": ACCENT_HOVER},
+        ),
+    )
+
+
 def dashboard():
     return rx.fragment(
         rx.hstack(
@@ -4501,6 +4776,7 @@ def dashboard():
             background=page_bg(),
         ),
         order_details_drawer(),
+        help_chat_widget(),
     )
 
 

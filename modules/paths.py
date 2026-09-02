@@ -36,6 +36,7 @@ ROUTE_BACKUPS_FILE = DATA_DIR / "route_backups.json"
 BACKUP_SETTINGS_FILE = CONFIG_DIR / "backup.json"
 WEIGHT_LOG_FILE = DATA_DIR / "weight_log.xlsx"
 ROUTE_DRIVERS_FILE = CONFIG_DIR / "route_drivers.json"
+AI_SETTINGS_FILE = CONFIG_DIR / "ai.json"
 
 
 def stores_file_for(mode: str) -> Path:

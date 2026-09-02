@@ -27,6 +27,9 @@ data/*
 config/mail.json
 config/backup.json
 
+# Ключ Anthropic API для ИИ-разбора во вкладке «Вес» — секрет, не в git.
+config/ai.json
+
 # Ignore Excel files
 *.xlsx
 *.xls
