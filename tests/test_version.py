@@ -49,4 +49,4 @@ def test_load_changelog_reads_utf8_file(tmp_path):
 
 
 def test_current_version_is_stable_release():
-    assert APP_VERSION == "1.0.4"
+    assert APP_VERSION == "1.0.5"

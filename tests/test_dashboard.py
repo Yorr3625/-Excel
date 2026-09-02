@@ -221,3 +221,105 @@ def test_history_order_details_keep_processed_time_label():
     assert state.order_detail_status == ""
     assert state.order_details_open is True
     assert refreshes == [True]
+
+
+def test_load_invoice_ocr_uses_processed_orders_and_journal(monkeypatch):
+    state = SimpleNamespace(
+        invoice_ocr_order="устаревший.xlsx",
+        invoice_ocr_order_options=[],
+        invoice_ocr_entries=[],
+        invoice_ocr_status="",
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "load_processed_files",
+        lambda: {"старый.xlsx": "2026-01-01", "новый.xlsx": "2026-02-01"},
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "load_invoice_entries",
+        lambda: [
+            {
+                "id": "record",
+                "saved_at": "2026-02-01T10:00:00",
+                "order_file": "новый.xlsx",
+                "route": "Маршрут №1",
+                "lines": [{"name": "Банан"}],
+                "total": "3500",
+            }
+        ],
+    )
+
+    dashboard.State.load_invoice_ocr.fn(state)
+
+    assert state.invoice_ocr_order_options == ["новый.xlsx", "старый.xlsx"]
+    assert state.invoice_ocr_order == ""
+    assert state.invoice_ocr_entries[0]["line_count"] == 1
+
+
+def test_invoice_ocr_line_change_recalculates_total():
+    state = SimpleNamespace(
+        invoice_ocr_rows=[
+            {
+                "id": "line",
+                "name": "Банан",
+                "unit": "кг",
+                "quantity": "2",
+                "unit_price": "140",
+                "line_total": "280",
+            }
+        ],
+        invoice_ocr_status="старый статус",
+    )
+
+    dashboard.State.set_invoice_ocr_line_field.fn(state, "line", "quantity", "3")
+
+    assert state.invoice_ocr_rows[0]["quantity"] == "3"
+    assert state.invoice_ocr_rows[0]["line_total"] == "420"
+    assert state.invoice_ocr_status == ""
+
+
+def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):
+    saved = []
+    state = SimpleNamespace(
+        invoice_ocr_busy=False,
+        invoice_ocr_order="заказ.xlsx",
+        invoice_ocr_order_options=["заказ.xlsx"],
+        invoice_ocr_route="Маршрут №1",
+        invoice_ocr_draft_id="a" * 32,
+        invoice_ocr_photo_refs=["invoice_ocr_photos/a/photo-01.jpg"],
+        invoice_ocr_rows=[
+            {
+                "id": "line",
+                "name": "Банан",
+                "unit": "кг",
+                "quantity": "25",
+                "unit_price": "140",
+                "line_total": "3500",
+            }
+        ],
+        invoice_ocr_entries=[],
+        invoice_ocr_photo_names=["photo.jpg"],
+        invoice_ocr_raw_text="Банан кг 25 140",
+        invoice_ocr_status="",
+    )
+    state._reset_invoice_ocr_draft = dashboard.State._reset_invoice_ocr_draft.__get__(state)
+    monkeypatch.setattr(
+        dashboard,
+        "append_invoice_entry",
+        lambda *args: saved.append(args) or {
+            "id": "a" * 32,
+            "saved_at": "2026-02-01T10:00:00",
+            "order_file": "заказ.xlsx",
+            "route": "Маршрут №1",
+            "lines": [{"name": "Банан"}],
+            "total": "3500",
+        },
+    )
+
+    dashboard.State.save_invoice_ocr_draft.fn(state)
+
+    assert len(saved) == 1
+    assert state.invoice_ocr_status == "Накладная сохранена в журнале"
+    assert state.invoice_ocr_draft_id == ""
+    assert state.invoice_ocr_entries[0]["total"] == "3500"

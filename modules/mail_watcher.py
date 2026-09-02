@@ -66,7 +66,7 @@ OLGA_ORDER_SOURCE = {
     "email": "o_solenkova@mail.ru",
     "person": "Ольга Соленкова",
     "kind": KIND_ORDERS,
-    "subject": DEFAULT_ORDER_SUBJECT,
+    "subject": "Заказ.xlsx",
     "categories": [],
 }
 REGION_INVOICE_GROUPS = {

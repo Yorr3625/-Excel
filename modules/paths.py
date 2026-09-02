@@ -37,6 +37,8 @@ BACKUP_SETTINGS_FILE = CONFIG_DIR / "backup.json"
 WEIGHT_LOG_FILE = DATA_DIR / "weight_log.xlsx"
 ROUTE_DRIVERS_FILE = CONFIG_DIR / "route_drivers.json"
 AI_SETTINGS_FILE = CONFIG_DIR / "ai.json"
+INVOICE_OCR_JOURNAL_FILE = DATA_DIR / "invoice_ocr_journal.json"
+INVOICE_OCR_PHOTOS_FOLDER = DATA_DIR / "invoice_ocr_photos"
 
 
 def stores_file_for(mode: str) -> Path:

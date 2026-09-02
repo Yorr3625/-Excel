@@ -77,3 +77,27 @@ def test_save_creates_parent_directory(tmp_path, monkeypatch):
     ai_settings.save_ai_settings(ai_settings.PROVIDER_CLAUDE_KEY, anthropic_api_key="sk-ant-test")
 
     assert target.exists()
+
+
+def test_yandex_vision_needs_key_and_folder_id():
+    ai_settings.save_ai_settings(ai_settings.PROVIDER_CLAUDE_KEY, yandex_vision_api_key="yandex-test")
+    assert ai_settings.is_yandex_vision_configured() is False
+
+    ai_settings.save_ai_settings(
+        ai_settings.PROVIDER_CLAUDE_KEY,
+        yandex_vision_folder_id="b1g-folder",
+    )
+    assert ai_settings.is_yandex_vision_configured() is True
+
+
+def test_empty_yandex_key_keeps_saved_value():
+    ai_settings.save_ai_settings(
+        ai_settings.PROVIDER_CLAUDE_KEY,
+        yandex_vision_api_key="yandex-original",
+        yandex_vision_folder_id="b1g-folder",
+    )
+
+    settings = ai_settings.save_ai_settings(ai_settings.PROVIDER_CLAUDE_KEY, yandex_vision_api_key=" ")
+
+    assert settings["yandex_vision_api_key"] == "yandex-original"
+    assert settings["yandex_vision_folder_id"] == "b1g-folder"

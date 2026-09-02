@@ -12,7 +12,7 @@ class Release(TypedDict):
 
 
 APP_NAME = "Обработка заказов"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 UPDATE_REPOSITORY = "Yorr3625/-Excel"
 UPDATE_BRANCH = "main"
 UPDATE_VERSION_URL = (

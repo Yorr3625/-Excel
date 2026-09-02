@@ -1,9 +1,11 @@
 from pathlib import Path
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 import asyncio
 import json
 import os
 import traceback
+import uuid
 
 import reflex as rx
 from starlette.applications import Starlette
@@ -75,8 +77,23 @@ from modules.ai_settings import (
     PROVIDER_CLAUDE_CLI,
     PROVIDER_CLAUDE_KEY,
     PROVIDER_OPENAI_KEY,
+    is_yandex_vision_configured,
     load_ai_settings,
     save_ai_settings,
+)
+from modules.invoice_journal import (
+    InvoiceJournalError,
+    append_invoice_entry,
+    discard_staged_invoice,
+    load_invoice_entries,
+    stage_invoice_photos,
+)
+from modules.invoice_ocr import (
+    InvoiceOcrError,
+    MAX_PHOTOS,
+    parse_invoice_lines,
+    recognize_images,
+    validate_and_prepare_photo,
 )
 from modules.help_chat import HelpChatError, send_chat_message
 
@@ -172,6 +189,7 @@ ACCENT_HOVER = "#1a7f37"
 MAIL_APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
+INVOICE_OCR_UPLOAD_ID = "invoice_ocr_upload"
 VOLUME_CHART_DAYS = 31
 ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
@@ -205,6 +223,7 @@ NAV_ITEMS = [
     ("Почта", "mail"),
     ("Маршруты", "route"),
     ("Вес", "scale"),
+    ("OCR накладных", "camera"),
     ("Трекинг", "truck"),
     ("История", "history"),
     ("Настройки", "settings"),
@@ -319,6 +338,18 @@ def format_number(value):
     return f"{float(value):,.0f}".replace(",", " ")
 
 
+def format_decimal(value: Decimal) -> str:
+    rendered = format(value.normalize(), "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def _invoice_decimal(value: str) -> Decimal | None:
+    try:
+        return Decimal(value.strip().replace(",", "."))
+    except (InvalidOperation, AttributeError):
+        return None
+
+
 def format_bytes(value):
     size = float(value or 0)
     for unit in ("Б", "КБ", "МБ", "ГБ"):
@@ -354,6 +385,17 @@ def format_weight_row(entry: dict, driver_by_route: dict | None = None) -> dict:
     }
 
 
+def format_invoice_journal_entry(entry: dict) -> dict:
+    return {
+        "id": entry["id"],
+        "saved_at": entry.get("saved_at", "").replace("T", " "),
+        "order_file": entry.get("order_file", ""),
+        "route": entry.get("route", ""),
+        "line_count": len(entry.get("lines", [])),
+        "total": entry.get("total", "0"),
+    }
+
+
 class State(rx.State):
     selected_file: str = "Файл не выбран"
     uploaded_file_path: str = ""
@@ -361,7 +403,7 @@ class State(rx.State):
     mode_auto_note: str = ""
     mode_detection_warning: str = ""
     duplicate_note: str = ""
-    theme: str = "dark"
+    theme: str = "light"
     status: str = "Ожидает загрузки файла"
     is_processing: bool = False
     is_previewing: bool = False
@@ -498,6 +540,23 @@ class State(rx.State):
     weight_delete_confirm_id: str = ""
     weight_status: str = ""
 
+    invoice_ocr_order: str = ""
+    invoice_ocr_order_options: list[str] = []
+    invoice_ocr_route: str = ""
+    invoice_ocr_busy: bool = False
+    invoice_ocr_status: str = ""
+    invoice_ocr_draft_id: str = ""
+    invoice_ocr_photo_refs: list[str] = []
+    invoice_ocr_photo_names: list[str] = []
+    invoice_ocr_raw_text: str = ""
+    invoice_ocr_rows: list[dict] = []
+    invoice_ocr_entries: list[dict] = []
+
+    yandex_vision_api_key_input: str = ""
+    yandex_vision_folder_id_input: str = ""
+    yandex_vision_configured: bool = False
+    yandex_vision_settings_status: str = ""
+
     ai_provider_label: str = AI_PROVIDER_LABELS[PROVIDER_CLAUDE_KEY]
     ai_anthropic_key_input: str = ""
     ai_configured: bool = False
@@ -531,6 +590,16 @@ class State(rx.State):
         total = sum(float(row["total"]) for row in self.weight_visible_rows)
         return f"{total:g}"
 
+    @rx.var
+    def invoice_ocr_total(self) -> str:
+        total = Decimal()
+        for row in self.invoice_ocr_rows:
+            try:
+                total += Decimal(str(row.get("line_total", "")).replace(",", "."))
+            except (InvalidOperation, ValueError):
+                continue
+        return format_decimal(total)
+
     def set_page(self, page: str):
         self.current_page = page
 
@@ -547,6 +616,8 @@ class State(rx.State):
             self.init_tracking()
         elif page == "Вес":
             self.load_weight()
+        elif page == "OCR накладных":
+            self.load_invoice_ocr()
         elif page == "Почта":
             self.refresh_mail_config()
 
@@ -1589,6 +1660,183 @@ class State(rx.State):
         if self.weight_editing_id == row_id:
             self._reset_weight_form()
 
+    def load_invoice_ocr(self):
+        files = sorted(load_processed_files().items(), key=lambda item: item[1], reverse=True)
+        self.invoice_ocr_order_options = [filename for filename, _ in files]
+        if self.invoice_ocr_order not in self.invoice_ocr_order_options:
+            self.invoice_ocr_order = ""
+        try:
+            self.invoice_ocr_entries = [
+                format_invoice_journal_entry(entry) for entry in load_invoice_entries()
+            ]
+        except InvoiceJournalError as error:
+            self.invoice_ocr_entries = []
+            self.invoice_ocr_status = str(error)
+
+    def set_invoice_ocr_order(self, value: str):
+        self.invoice_ocr_order = value
+        self.invoice_ocr_status = ""
+
+    def set_invoice_ocr_route(self, value: str):
+        self.invoice_ocr_route = value
+        self.invoice_ocr_status = ""
+
+    def set_invoice_ocr_line_field(self, row_id: str, field: str, value: str):
+        if field not in {"name", "unit", "quantity", "unit_price", "line_total"}:
+            return
+
+        rows = []
+        for row in self.invoice_ocr_rows:
+            updated = dict(row)
+            if updated["id"] == row_id:
+                updated[field] = value
+                if field in {"quantity", "unit_price"}:
+                    quantity = _invoice_decimal(updated["quantity"])
+                    unit_price = _invoice_decimal(updated["unit_price"])
+                    if quantity is not None and unit_price is not None and quantity >= 0 and unit_price >= 0:
+                        updated["line_total"] = format_decimal(quantity * unit_price)
+            rows.append(updated)
+        self.invoice_ocr_rows = rows
+        self.invoice_ocr_status = ""
+
+    def add_invoice_ocr_line(self):
+        self.invoice_ocr_rows = self.invoice_ocr_rows + [
+            {
+                "id": uuid.uuid4().hex,
+                "name": "",
+                "unit": "",
+                "quantity": "",
+                "unit_price": "",
+                "line_total": "",
+            }
+        ]
+        self.invoice_ocr_status = ""
+
+    def remove_invoice_ocr_line(self, row_id: str):
+        self.invoice_ocr_rows = [row for row in self.invoice_ocr_rows if row["id"] != row_id]
+        self.invoice_ocr_status = ""
+
+    def clear_invoice_ocr_draft(self):
+        if self.invoice_ocr_busy:
+            return
+        if self.invoice_ocr_draft_id:
+            discard_staged_invoice(self.invoice_ocr_draft_id)
+        self._reset_invoice_ocr_draft()
+        self.invoice_ocr_status = "Черновик очищен"
+
+    def _reset_invoice_ocr_draft(self):
+        self.invoice_ocr_draft_id = ""
+        self.invoice_ocr_photo_refs = []
+        self.invoice_ocr_photo_names = []
+        self.invoice_ocr_raw_text = ""
+        self.invoice_ocr_rows = []
+
+    async def recognize_invoice_photos(self, files: list[rx.UploadFile]):
+        if self.invoice_ocr_busy:
+            return
+        if self.invoice_ocr_order not in self.invoice_ocr_order_options:
+            self.invoice_ocr_status = "Сначала выберите обработанный заказ"
+            return
+        if self.invoice_ocr_route not in WEIGHT_ROUTES:
+            self.invoice_ocr_status = "Сначала выберите маршрут"
+            return
+        settings = load_ai_settings()
+        if not is_yandex_vision_configured(settings):
+            self.invoice_ocr_status = "Сначала настройте Yandex Vision OCR на странице «Настройки»"
+            return
+        if not files:
+            self.invoice_ocr_status = "Добавьте хотя бы одну фотографию накладной"
+            return
+        if len(files) > MAX_PHOTOS:
+            self.invoice_ocr_status = f"Можно распознать не более {MAX_PHOTOS} фотографий за раз"
+            return
+        previous_draft_id = self.invoice_ocr_draft_id
+        self.invoice_ocr_busy = True
+        self.invoice_ocr_status = "Подготавливаю фотографии..."
+        self._reset_invoice_ocr_draft()
+        api_key = settings["yandex_vision_api_key"]
+        folder_id = settings["yandex_vision_folder_id"]
+
+        if previous_draft_id:
+            await asyncio.to_thread(discard_staged_invoice, previous_draft_id)
+
+        draft_id = ""
+        try:
+            prepared_photos = []
+            photo_names = []
+            for file in files:
+                filename = getattr(file, "filename", None) or file.name
+                prepared_photos.append(validate_and_prepare_photo(filename, await file.read()))
+                photo_names.append(Path(filename).name)
+
+            draft_id, photo_refs = await asyncio.to_thread(
+                stage_invoice_photos,
+                [(photo.original, photo.extension) for photo in prepared_photos],
+            )
+            self.invoice_ocr_status = "Распознаю текст..."
+
+            raw_text = await asyncio.to_thread(
+                recognize_images,
+                prepared_photos,
+                api_key,
+                folder_id,
+            )
+            rows = parse_invoice_lines(raw_text)
+            self.invoice_ocr_draft_id = draft_id
+            self.invoice_ocr_photo_refs = photo_refs
+            self.invoice_ocr_photo_names = photo_names
+            self.invoice_ocr_raw_text = raw_text
+            self.invoice_ocr_rows = [
+                {"id": uuid.uuid4().hex, **row} for row in rows
+            ]
+            self.invoice_ocr_busy = False
+            self.invoice_ocr_status = (
+                "Проверьте таблицу перед сохранением"
+                if rows
+                else "Текст распознан, но товарные строки не определены. Добавьте их вручную"
+            )
+        except (InvoiceOcrError, InvoiceJournalError) as error:
+            if draft_id:
+                await asyncio.to_thread(discard_staged_invoice, draft_id)
+            self.invoice_ocr_busy = False
+            self._reset_invoice_ocr_draft()
+            self.invoice_ocr_status = str(error)
+        except Exception:
+            if draft_id:
+                await asyncio.to_thread(discard_staged_invoice, draft_id)
+            self.invoice_ocr_busy = False
+            self._reset_invoice_ocr_draft()
+            self.invoice_ocr_status = "Не удалось распознать фотографии накладной"
+
+    def save_invoice_ocr_draft(self):
+        if self.invoice_ocr_busy:
+            return
+        if self.invoice_ocr_order not in self.invoice_ocr_order_options:
+            self.invoice_ocr_status = "Выберите обработанный заказ"
+            return
+        if self.invoice_ocr_route not in WEIGHT_ROUTES:
+            self.invoice_ocr_status = "Выберите маршрут"
+            return
+        if not self.invoice_ocr_draft_id or not self.invoice_ocr_photo_refs:
+            self.invoice_ocr_status = "Сначала загрузите и распознайте фотографии"
+            return
+
+        try:
+            entry = append_invoice_entry(
+                self.invoice_ocr_draft_id,
+                self.invoice_ocr_order,
+                self.invoice_ocr_route,
+                self.invoice_ocr_photo_refs,
+                self.invoice_ocr_rows,
+            )
+        except InvoiceJournalError as error:
+            self.invoice_ocr_status = str(error)
+            return
+
+        self.invoice_ocr_entries = [format_invoice_journal_entry(entry)] + self.invoice_ocr_entries
+        self._reset_invoice_ocr_draft()
+        self.invoice_ocr_status = "Накладная сохранена в журнале"
+
     def load_ai_settings_form(self):
         settings = load_ai_settings()
         self.ai_provider_label = AI_PROVIDER_LABELS.get(
@@ -1599,6 +1847,10 @@ class State(rx.State):
             settings["anthropic_api_key"] or settings["provider"] == PROVIDER_CLAUDE_CLI
         )
         self.ai_settings_status = ""
+        self.yandex_vision_api_key_input = ""
+        self.yandex_vision_folder_id_input = ""
+        self.yandex_vision_configured = is_yandex_vision_configured(settings)
+        self.yandex_vision_settings_status = ""
 
     def set_ai_provider_label(self, value: str):
         self.ai_provider_label = value
@@ -1614,6 +1866,28 @@ class State(rx.State):
         self.ai_anthropic_key_input = ""
         self.ai_configured = bool(settings["anthropic_api_key"] or provider == PROVIDER_CLAUDE_CLI)
         self.ai_settings_status = "Настройки сохранены" if self.ai_configured else "Настройки сохранены, но ключ не задан"
+
+    def set_yandex_vision_api_key_input(self, value: str):
+        self.yandex_vision_api_key_input = value
+
+    def set_yandex_vision_folder_id_input(self, value: str):
+        self.yandex_vision_folder_id_input = value
+
+    def save_yandex_vision_settings_form(self):
+        settings = load_ai_settings()
+        settings = save_ai_settings(
+            settings["provider"],
+            yandex_vision_api_key=self.yandex_vision_api_key_input,
+            yandex_vision_folder_id=self.yandex_vision_folder_id_input,
+        )
+        self.yandex_vision_api_key_input = ""
+        self.yandex_vision_folder_id_input = ""
+        self.yandex_vision_configured = is_yandex_vision_configured(settings)
+        self.yandex_vision_settings_status = (
+            "Настройки сохранены"
+            if self.yandex_vision_configured
+            else "Укажите ключ Yandex Vision и ID каталога"
+        )
 
     def toggle_help_chat(self):
         self.help_chat_open = not self.help_chat_open
@@ -2184,13 +2458,11 @@ def sidebar():
             spacing="3",
             width="100%",
         ),
-        rx.spacer(),
         theme_switch_row(),
         align="start",
         spacing="6",
         width="250px",
         min_width="250px",
-        height="100vh",
         padding="28px 14px 18px",
         background=theme_value("#ffffff", "#090d12"),
         border_right=f"1px solid {border()}",
@@ -2820,13 +3092,21 @@ def history_page():
     )
 
 
-def weight_field(label: str, value, on_change, placeholder: str = "", on_blur=None):
+def weight_field(
+    label: str,
+    value,
+    on_change,
+    placeholder: str = "",
+    on_blur=None,
+    input_type: str = "text",
+):
     return rx.vstack(
         rx.text(label, color=text(), font_size="12px", font_weight="700"),
         rx.input(
             value=value,
             on_change=on_change,
             on_blur=on_blur,
+            type=input_type,
             placeholder=placeholder,
             width="100%",
             height="40px",
@@ -3038,6 +3318,248 @@ def weight_page():
         ),
     )
 
+
+
+def invoice_ocr_line(item):
+    return rx.hstack(
+        rx.input(
+            value=item["name"],
+            on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "name", value),
+            placeholder="Наименование",
+            width="100%",
+            min_width="190px",
+        ),
+        rx.input(
+            value=item["unit"],
+            on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "unit", value),
+            placeholder="Ед.",
+            width="90px",
+        ),
+        rx.input(
+            value=item["quantity"],
+            on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "quantity", value),
+            placeholder="Кол-во",
+            width="110px",
+        ),
+        rx.input(
+            value=item["unit_price"],
+            on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "unit_price", value),
+            placeholder="Цена",
+            width="110px",
+        ),
+        rx.input(
+            value=item["line_total"],
+            on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "line_total", value),
+            placeholder="Сумма",
+            width="120px",
+        ),
+        rx.button(
+            fa_icon(tag="x", size=13),
+            on_click=State.remove_invoice_ocr_line(item["id"]),
+            variant="ghost",
+            color=muted(),
+            cursor="pointer",
+            aria_label="Удалить строку",
+        ),
+        width="100%",
+        spacing="2",
+        align="center",
+        wrap="wrap",
+    )
+
+
+def invoice_ocr_journal_row(item):
+    return rx.hstack(
+        rx.vstack(
+            rx.text(item["order_file"], color=text(), font_weight="700", font_size="13px"),
+            rx.text(item["saved_at"], color=muted(), font_size="11px"),
+            align="start",
+            spacing="1",
+            min_width="200px",
+        ),
+        weight_stat("Маршрут", item["route"]),
+        weight_stat("Позиций", item["line_count"]),
+        weight_stat("Итого", item["total"]),
+        width="100%",
+        padding="10px 12px",
+        border_radius="10px",
+        background=surface_alt(),
+        spacing="4",
+        align="center",
+        wrap="wrap",
+    )
+
+
+def invoice_ocr_page():
+    return page_shell(
+        topbar(
+            "OCR накладных",
+            "Выберите заказ и маршрут, загрузите фотографии и проверьте распознанные позиции перед сохранением.",
+        ),
+        panel_shell(
+            panel_title("route", "1. Привязка"),
+            rx.hstack(
+                weight_select_field(
+                    "Обработанный заказ",
+                    State.invoice_ocr_order,
+                    State.set_invoice_ocr_order,
+                    State.invoice_ocr_order_options,
+                ),
+                weight_select_field(
+                    "Маршрут",
+                    State.invoice_ocr_route,
+                    State.set_invoice_ocr_route,
+                    WEIGHT_ROUTES,
+                ),
+                spacing="3",
+                width="100%",
+                align="end",
+            ),
+            rx.cond(
+                State.invoice_ocr_order_options.length() == 0,
+                rx.text(
+                    "Сначала обработайте хотя бы один заказ — только обработанные заказы можно привязать к накладной.",
+                    color=muted(),
+                    font_size="12px",
+                ),
+                rx.box(),
+            ),
+        ),
+        panel_shell(
+            panel_title("camera", "2. Фотографии накладной"),
+            rx.upload(
+                rx.vstack(
+                    fa_icon(tag="camera", size=24, color=ACCENT),
+                    rx.text("Выберите фотографии JPG, PNG или WEBP", color=text(), font_weight="700"),
+                    rx.text(
+                        f"До {MAX_PHOTOS} фотографий, не более 10 МБ каждая. OCR запускается только после нажатия кнопки.",
+                        color=muted(),
+                        font_size="12px",
+                    ),
+                    rx.vstack(
+                        rx.foreach(
+                            rx.selected_files(INVOICE_OCR_UPLOAD_ID),
+                            lambda file: rx.text(file, color=ACCENT, font_size="12px"),
+                        ),
+                        align="start",
+                        spacing="1",
+                        width="100%",
+                    ),
+                    align="center",
+                    spacing="2",
+                    width="100%",
+                ),
+                id=INVOICE_OCR_UPLOAD_ID,
+                accept={
+                    "image/jpeg": [".jpg", ".jpeg"],
+                    "image/png": [".png"],
+                    "image/webp": [".webp"],
+                },
+                max_files=MAX_PHOTOS,
+                border=f"1px dashed {border()}",
+                border_radius="10px",
+                background=surface_alt(),
+                padding="20px",
+                width="100%",
+                cursor="pointer",
+            ),
+            rx.hstack(
+                primary_button(
+                    rx.cond(State.invoice_ocr_busy, "Распознаю...", "Распознать фотографии"),
+                    on_click=State.recognize_invoice_photos(
+                        rx.upload_files(upload_id=INVOICE_OCR_UPLOAD_ID)
+                    ),
+                    disabled=State.invoice_ocr_busy,
+                    width="230px",
+                ),
+                rx.text(State.invoice_ocr_status, color=muted(), font_size="13px"),
+                spacing="4",
+                align="center",
+                wrap="wrap",
+            ),
+        ),
+        rx.cond(
+            State.invoice_ocr_draft_id != "",
+            panel_shell(
+                rx.hstack(
+                    panel_title("list", "3. Проверка перед сохранением"),
+                    rx.spacer(),
+                    rx.text("Итого: ", State.invoice_ocr_total, color=text(), font_weight="800"),
+                    width="100%",
+                    align="center",
+                ),
+                rx.text(
+                    "OCR может ошибаться. Проверьте все наименования, единицы, количество, цены и суммы.",
+                    color="#b45309",
+                    font_size="12px",
+                    font_weight="700",
+                ),
+                rx.text("Исходный текст OCR", color=text(), font_size="13px", font_weight="700"),
+                rx.box(
+                    rx.text(
+                        State.invoice_ocr_raw_text,
+                        color=text(),
+                        white_space="pre-wrap",
+                        font_size="12px",
+                    ),
+                    width="100%",
+                    max_height="180px",
+                    overflow_y="auto",
+                    padding="12px",
+                    border_radius="10px",
+                    background=surface_alt(),
+                ),
+                rx.hstack(
+                    rx.text("Наименование", color=muted(), font_size="11px", min_width="190px", width="100%"),
+                    rx.text("Ед.", color=muted(), font_size="11px", width="90px"),
+                    rx.text("Кол-во", color=muted(), font_size="11px", width="110px"),
+                    rx.text("Цена", color=muted(), font_size="11px", width="110px"),
+                    rx.text("Сумма", color=muted(), font_size="11px", width="120px"),
+                    rx.box(width="32px"),
+                    width="100%",
+                    spacing="2",
+                    wrap="wrap",
+                ),
+                rx.vstack(
+                    rx.foreach(State.invoice_ocr_rows, invoice_ocr_line),
+                    spacing="2",
+                    width="100%",
+                ),
+                secondary_button("Добавить строку", on_click=State.add_invoice_ocr_line, width="170px"),
+                rx.hstack(
+                    primary_button(
+                        "Сохранить накладную",
+                        on_click=State.save_invoice_ocr_draft,
+                        disabled=State.invoice_ocr_busy,
+                        width="210px",
+                    ),
+                    secondary_button(
+                        "Очистить черновик",
+                        on_click=State.clear_invoice_ocr_draft,
+                        disabled=State.invoice_ocr_busy,
+                        width="180px",
+                    ),
+                    spacing="3",
+                    wrap="wrap",
+                ),
+            ),
+            rx.box(),
+        ),
+        panel_shell(
+            panel_title("history", "Сохранённые накладные"),
+            rx.cond(
+                State.invoice_ocr_entries.length() > 0,
+                rx.vstack(
+                    rx.foreach(State.invoice_ocr_entries, invoice_ocr_journal_row),
+                    spacing="2",
+                    width="100%",
+                    max_height="360px",
+                    overflow_y="auto",
+                ),
+                rx.text("Сохранённых накладных пока нет", color=muted(), font_size="13px"),
+            ),
+        ),
+    )
 
 
 
@@ -4630,6 +5152,59 @@ def settings_page():
                 font_size="11px",
             ),
         ),
+        panel_shell(
+            rx.hstack(
+                panel_title("camera", "Yandex Vision OCR"),
+                rx.spacer(),
+                rx.cond(
+                    State.yandex_vision_configured,
+                    rx.badge("Настроено", color_scheme="green", variant="soft"),
+                    rx.badge("Не настроено", color_scheme="gray", variant="soft"),
+                ),
+                width="100%",
+                align="center",
+            ),
+            rx.text(
+                "Распознаёт фотографии накладных на вкладке «OCR накладных». "
+                "Укажите ключ сервисного аккаунта с доступом Vision OCR и ID каталога.",
+                color=muted(),
+                font_size="12px",
+            ),
+            rx.hstack(
+                weight_field(
+                    "Ключ Yandex Vision API",
+                    State.yandex_vision_api_key_input,
+                    State.set_yandex_vision_api_key_input,
+                    "пустое поле оставит сохранённый ключ",
+                    input_type="password",
+                ),
+                weight_field(
+                    "ID каталога Yandex Cloud",
+                    State.yandex_vision_folder_id_input,
+                    State.set_yandex_vision_folder_id_input,
+                    "b1g...",
+                ),
+                spacing="3",
+                width="100%",
+                align="end",
+            ),
+            rx.hstack(
+                secondary_button(
+                    "Сохранить настройки OCR",
+                    on_click=State.save_yandex_vision_settings_form,
+                    width="220px",
+                ),
+                rx.text(State.yandex_vision_settings_status, color=muted(), font_size="13px"),
+                spacing="4",
+                align="center",
+            ),
+            rx.text(
+                "Ключ хранится только локально в config/ai.json, который исключён из Git. "
+                "Пустой ключ при сохранении не удаляет ранее сохранённый ключ.",
+                color=muted(),
+                font_size="11px",
+            ),
+        ),
     )
 
 
@@ -4640,6 +5215,7 @@ def main_content():
         ("Почта", mail_page()),
         ("Маршруты", routes_page()),
         ("Вес", weight_page()),
+        ("OCR накладных", invoice_ocr_page()),
         ("Трекинг", tracking_page()),
         ("История", history_page()),
         ("Настройки", settings_page()),

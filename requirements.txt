@@ -5,6 +5,8 @@ colorama==0.4.6
 reflex==0.9.8
 starlette==1.6.0
 
-# Только для необязательного чата-помощника (плавающая кнопка в углу
-# сайта) — остальной дашборд от этого пакета не зависит.
+# Only for optional invoice OCR: validates images and converts WEBP before Yandex Vision.
+Pillow==12.1.1
+
+# Only for optional chat assistant (floating corner button) — the rest of the dashboard does not depend on it.
 anthropic==1.3.0
