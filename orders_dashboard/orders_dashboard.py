@@ -186,6 +186,14 @@ fa_icon = FaIcon.create
 
 ACCENT = "#1f883d"
 ACCENT_HOVER = "#1a7f37"
+# Сайдбар всегда тёмный (не зависит от переключателя светлой/тёмной темы) —
+# так задано в присланном макете.
+SIDEBAR_BG = "#0f172a"
+SIDEBAR_BORDER = "rgba(255, 255, 255, 0.06)"
+SIDEBAR_TEXT = "#e5e7eb"
+SIDEBAR_MUTED = "#8b95a5"
+SIDEBAR_HOVER = "#1a2436"
+SIDEBAR_SURFACE_ALT = "#141d2b"
 MAIL_APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
@@ -2253,8 +2261,8 @@ def muted():
 
 def button_base(**props):
     return {
-        "height": "44px",
-        "border_radius": "9px",
+        "height": "38px",
+        "border_radius": "8px",
         "font_weight": "700",
         "transition": "160ms ease",
         "cursor": "pointer",
@@ -2317,10 +2325,10 @@ def nav_button(label: str, icon: str):
         width="100%",
         justify_content="flex-start",
         gap="10px",
-        color=rx.cond(active, "white", muted()),
+        color=rx.cond(active, "white", SIDEBAR_MUTED),
         background=rx.cond(active, ACCENT, "transparent"),
-        _hover={"background": rx.cond(active, ACCENT_HOVER, theme_value("#edf2f7", "#16212b"))},
-        **button_base(height="42px", font_weight=rx.cond(active, "700", "500"))
+        _hover={"background": rx.cond(active, ACCENT_HOVER, SIDEBAR_HOVER)},
+        **button_base(height="36px", font_weight=rx.cond(active, "700", "500"))
     )
 
 
@@ -2368,26 +2376,26 @@ def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
 
     return rx.hstack(
         rx.box(
-            fa_icon(tag=icon, size=20, color=color),
+            fa_icon(tag=icon, size=17, color=color),
             display="flex",
             align_items="center",
             justify_content="center",
-            width="44px",
-            height="44px",
-            min_width="44px",
-            border_radius="12px",
+            width="38px",
+            height="38px",
+            min_width="38px",
+            border_radius="11px",
             background=tint_bg,
         ),
         rx.vstack(
-            rx.text(value, color=text(), font_size="26px", font_weight="800", line_height="1.1"),
-            rx.text(title, color=muted(), font_size="13px", font_weight="600"),
+            rx.text(value, color=text(), font_size="22px", font_weight="800", line_height="1.1"),
+            rx.text(title, color=muted(), font_size="12px", font_weight="600"),
             hint_node,
             align="start",
             spacing="1",
         ),
-        spacing="4",
+        spacing="3",
         align="center",
-        padding="18px",
+        padding="14px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -2399,18 +2407,18 @@ def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
 def sidebar_logo():
     return rx.hstack(
         rx.box(
-            fa_icon(tag="boxes", size=18, color="white"),
+            fa_icon(tag="boxes", size=16, color="white"),
             display="flex",
             align_items="center",
             justify_content="center",
-            width="34px",
-            height="34px",
-            border_radius="9px",
+            width="30px",
+            height="30px",
+            border_radius="8px",
             background=ACCENT,
         ),
         rx.vstack(
-            rx.heading("Orders", color=text(), size="5", line_height="1.1"),
-            rx.text("Обработка заказов v2.0", color=muted(), font_size="11px"),
+            rx.heading("Orders", color=SIDEBAR_TEXT, size="4", line_height="1.1"),
+            rx.text("Обработка заказов v2.0", color=SIDEBAR_MUTED, font_size="10px"),
             align="start",
             spacing="0",
         ),
@@ -2424,10 +2432,10 @@ def theme_switch_row():
     return rx.hstack(
         rx.cond(
             State.theme == "light",
-            fa_icon(tag="sun", size=16, color=muted()),
-            fa_icon(tag="moon", size=16, color=muted()),
+            fa_icon(tag="sun", size=16, color=SIDEBAR_MUTED),
+            fa_icon(tag="moon", size=16, color=SIDEBAR_MUTED),
         ),
-        rx.text("Тёмная тема", color=text(), font_size="13px", font_weight="600"),
+        rx.text("Тёмная тема", color=SIDEBAR_TEXT, font_size="13px", font_weight="600"),
         rx.spacer(),
         rx.switch(
             checked=State.theme == "dark",
@@ -2438,9 +2446,9 @@ def theme_switch_row():
         align="center",
         spacing="2",
         padding="12px 14px",
-        border=f"1px solid {border()}",
+        border=f"1px solid {SIDEBAR_BORDER}",
         border_radius="12px",
-        background=surface_alt(),
+        background=SIDEBAR_SURFACE_ALT,
     )
 
 
@@ -2448,7 +2456,7 @@ def sidebar():
     return rx.vstack(
         sidebar_logo(),
         rx.vstack(
-            muted_text("ГЛАВНОЕ МЕНЮ", size="11px"),
+            rx.text("ГЛАВНОЕ МЕНЮ", color=SIDEBAR_MUTED, font_size="11px"),
             rx.vstack(
                 *[nav_button(label, icon) for label, icon in NAV_ITEMS],
                 spacing="2",
@@ -2460,12 +2468,12 @@ def sidebar():
         ),
         theme_switch_row(),
         align="start",
-        spacing="6",
-        width="250px",
-        min_width="250px",
-        padding="28px 14px 18px",
-        background=theme_value("#ffffff", "#090d12"),
-        border_right=f"1px solid {border()}",
+        spacing="5",
+        width="216px",
+        min_width="216px",
+        padding="20px 12px 14px",
+        background=SIDEBAR_BG,
+        border_right=f"1px solid {SIDEBAR_BORDER}",
     )
 
 
@@ -2616,7 +2624,7 @@ def order_panel():
             rx.box(),
         ),
         spacing="5",
-        padding="24px",
+        padding="18px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -2839,7 +2847,7 @@ def history_panel():
         ),
         align="start",
         spacing="4",
-        padding="24px",
+        padding="18px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -2885,10 +2893,10 @@ def page_shell(*children):
     return rx.vstack(
         *children,
         align="start",
-        spacing="5",
+        spacing="4",
         width="100%",
         min_height="100vh",
-        padding="28px",
+        padding="20px",
         background=page_bg(),
     )
 
@@ -2896,8 +2904,8 @@ def page_shell(*children):
 def topbar(title: str, subtitle: str, actions=None):
     return rx.hstack(
         rx.vstack(
-            rx.heading(title, color=text(), size="7"),
-            rx.text(subtitle, color=muted(), font_size="13px"),
+            rx.heading(title, color=text(), size="6"),
+            rx.text(subtitle, color=muted(), font_size="12px"),
             align="start",
             spacing="1",
         ),
@@ -2913,7 +2921,7 @@ def panel_shell(*children):
         *children,
         align="start",
         spacing="4",
-        padding="24px",
+        padding="18px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -3755,7 +3763,7 @@ def order_details_drawer():
                 width=["100%", "560px"],
                 height="100vh",
                 overflow_y="auto",
-                padding="24px",
+                padding="18px",
                 background=surface(),
                 border_left=f"1px solid {border()}",
                 box_shadow="-16px 0 40px rgba(0, 0, 0, 0.22)",
@@ -4394,7 +4402,7 @@ def tracking_map_panel():
         tracking_legend(),
         align="start",
         spacing="4",
-        padding="24px",
+        padding="18px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -4492,7 +4500,7 @@ def rating_panel():
         ),
         align="start",
         spacing="4",
-        padding="24px",
+        padding="18px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -4525,7 +4533,7 @@ def event_log_panel():
         ),
         align="start",
         spacing="4",
-        padding="24px",
+        padding="18px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -5477,7 +5485,7 @@ def driver_select_screen():
         spacing="5",
         width="100%",
         max_width="420px",
-        padding="24px",
+        padding="18px",
     )
 
 
