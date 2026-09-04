@@ -682,8 +682,9 @@ class App:
         ttk.Label(
             container,
             text=(
-                "Наименование, ящики и средний вес — а для взвешенных позиций впишите "
-                "точный вес. При желании привяжите запись к заказу и маршруту."
+                "Наименование, ящики и средний вес ящика — а если взвесили с ящиками, "
+                "впишите грязный вес: чистый вес = грязный вес − кол-во ящиков × средний "
+                "вес ящика. При желании привяжите запись к заказу и маршруту."
             ),
             wraplength=1200,
         ).pack(anchor="w", pady=(0, 10))
@@ -710,7 +711,7 @@ class App:
         ttk.Label(row1, text="Средний вес, кг:").pack(side="left")
         ttk.Entry(row1, textvariable=self.weight_avg_var, width=8).pack(side="left", padx=(4, 14))
 
-        ttk.Label(row1, text="Точный вес, кг:").pack(side="left")
+        ttk.Label(row1, text="Грязный вес, кг:").pack(side="left")
         ttk.Entry(row1, textvariable=self.weight_exact_var, width=8).pack(side="left")
 
         row2 = ttk.Frame(form)
@@ -841,15 +842,15 @@ class App:
         for row in rows:
             order_part = f" · Заказ: {row['order_file']}" if row["order_file"] else ""
             route_part = f" · {row['route']}" if row["route"] else ""
-            exact_part = f", точный {row['exact_weight']:g} кг" if row["exact_weight"] is not None else ""
+            exact_part = f", грязный {row['exact_weight']:g} кг" if row["exact_weight"] is not None else ""
             line = (
                 f"{row['name']} — {row['box_count']}×{row['avg_weight']:g} кг{exact_part}"
-                f" = {row['total']:g} кг{order_part}{route_part}"
+                f" = {row['total']:g} кг чистого{order_part}{route_part}"
             )
             self.weight_list.insert("end", line)
 
         total = sum(row["total"] for row in rows)
-        self.weight_total_var.set(f"Итого по списку: {total:g} кг")
+        self.weight_total_var.set(f"Чистый вес по списку: {total:g} кг")
 
     def reset_weight_filter(self):
         self.weight_filter_order_var.set(WEIGHT_FILTER_ALL)
@@ -927,7 +928,7 @@ class App:
                 exact_weight = float(exact_text.replace(",", "."))
                 assert exact_weight >= 0
             except (ValueError, AssertionError):
-                self.weight_status_var.set("Точный вес должен быть числом")
+                self.weight_status_var.set("Грязный вес должен быть числом")
                 return
 
         order_file = "" if self.weight_order_var.get() == WEIGHT_NO_BINDING else self.weight_order_var.get()

@@ -30,9 +30,14 @@ from modules.history import (
     record_processing,
     was_processed,
 )
+from modules.order_positions import order_position_names
 from modules.weight_log import (
+    STAGE_LOADING,
+    STAGE_STORE_SHIPMENT,
+    STAGES,
     add_weight_row,
     delete_weight_row,
+    known_names_for_order,
     last_avg_weight_for,
     load_weight_rows,
     update_weight_row,
@@ -209,6 +214,9 @@ WEIGHT_ROUTE_OPTIONS = [WEIGHT_NO_BINDING] + WEIGHT_ROUTES
 WEIGHT_FILTER_ALL = "Все"
 WEIGHT_FILTER_UNBOUND = "Без привязки"
 WEIGHT_ROUTE_FILTER_OPTIONS = [WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND] + WEIGHT_ROUTES
+WEIGHT_STAGE_OPTIONS = list(STAGES)
+WEIGHT_STAGE_FILTER_OPTIONS = [WEIGHT_FILTER_ALL] + list(STAGES)
+WEIGHT_STORE_PLACEHOLDER = "— выберите магазин —"
 AI_PROVIDER_LABELS = {
     PROVIDER_CLAUDE_KEY: "Claude (ключ Anthropic API)",
     PROVIDER_CLAUDE_CLI: "Claude через Claude Code CLI",
@@ -390,6 +398,26 @@ def format_weight_row(entry: dict, driver_by_route: dict | None = None) -> dict:
         "order_file": entry["order_file"],
         "route": entry["route"],
         "driver": driver_by_route.get(entry["route"], ""),
+        "stage": entry.get("stage", ""),
+        "store": entry.get("store", ""),
+    }
+
+
+def _empty_weight_draft_row() -> dict:
+    """Пустая строка черновика массового ввода веса.
+
+    saved_id пуст для ещё не сохранённой строки; если строку загрузили для
+    правки уже сохранённой записи, там будет её id из weight_log.
+    """
+
+    return {
+        "id": uuid.uuid4().hex,
+        "saved_id": "",
+        "name": "",
+        "box_count": "",
+        "avg_weight": "",
+        "exact_weight": "",
+        "store": WEIGHT_STORE_PLACEHOLDER,
     }
 
 
@@ -534,19 +562,21 @@ class State(rx.State):
     route_drivers_status: str = ""
 
     weight_rows: list[dict] = []
-    weight_name: str = ""
-    weight_box_count: str = ""
-    weight_avg_weight: str = ""
-    weight_exact_weight: str = ""
     weight_order: str = WEIGHT_NO_BINDING
     weight_route: str = WEIGHT_NO_BINDING
     weight_order_options: list[str] = [WEIGHT_NO_BINDING]
     weight_order_filter_options: list[str] = [WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND]
     weight_filter_order: str = WEIGHT_FILTER_ALL
     weight_filter_route: str = WEIGHT_FILTER_ALL
-    weight_editing_id: str = ""
+    weight_filter_stage: str = WEIGHT_FILTER_ALL
     weight_delete_confirm_id: str = ""
     weight_status: str = ""
+    weight_stage: str = STAGE_LOADING
+    weight_draft_rows: list[dict] = []
+    weight_name_suggestions: list[str] = []
+    weight_suggestions_expanded: bool = False
+    weight_autocomplete_row: str = ""
+    weight_autocomplete_matches: list[str] = []
 
     invoice_ocr_order: str = ""
     invoice_ocr_order_options: list[str] = []
@@ -591,7 +621,21 @@ class State(rx.State):
         elif self.weight_filter_route != WEIGHT_FILTER_ALL:
             rows = [row for row in rows if row["route"] == self.weight_filter_route]
 
+        if self.weight_filter_stage != WEIGHT_FILTER_ALL:
+            rows = [row for row in rows if row["stage"] == self.weight_filter_stage]
+
         return rows
+
+    @rx.var
+    def weight_draft_store_options(self) -> list[str]:
+        """Магазины выбранного маршрута — варианты для поля «Магазин» на этапе отгрузки."""
+
+        stores = (
+            self.route_stores[WEIGHT_ROUTES.index(self.weight_route)]
+            if self.weight_route in WEIGHT_ROUTES
+            else []
+        )
+        return [WEIGHT_STORE_PLACEHOLDER] + stores
 
     @rx.var
     def weight_total(self) -> str:
@@ -1527,9 +1571,12 @@ class State(rx.State):
 
     def load_weight(self):
         self.weight_status = ""
-        self.weight_editing_id = ""
-        self.load_route_drivers_form()
         self.weight_delete_confirm_id = ""
+        self.weight_suggestions_expanded = False
+        self.weight_autocomplete_row = ""
+        self.weight_autocomplete_matches = []
+        self.load_route_drivers_form()
+        self.load_routes()
         driver_lookup = self._route_driver_lookup()
         self.weight_rows = [format_weight_row(row, driver_lookup) for row in load_weight_rows()]
 
@@ -1538,23 +1585,39 @@ class State(rx.State):
         self.weight_order_options = [WEIGHT_NO_BINDING] + filenames
         self.weight_order_filter_options = [WEIGHT_FILTER_ALL, WEIGHT_FILTER_UNBOUND] + filenames
 
-    def set_weight_name(self, value: str):
-        self.weight_name = value
+        if not self.weight_draft_rows:
+            self.weight_draft_rows = [_empty_weight_draft_row()]
+        self._refresh_weight_name_suggestions()
 
-    def set_weight_box_count(self, value: str):
-        self.weight_box_count = value
+    def _refresh_weight_name_suggestions(self):
+        order_file = "" if self.weight_order == WEIGHT_NO_BINDING else self.weight_order
 
-    def set_weight_avg_weight(self, value: str):
-        self.weight_avg_weight = value
+        if order_file:
+            names = list(order_position_names(order_file))
+            seen = {name.casefold() for name in names}
+            for name in known_names_for_order(order_file):
+                if name.casefold() not in seen:
+                    seen.add(name.casefold())
+                    names.append(name)
+            self.weight_name_suggestions = names
+        else:
+            self.weight_name_suggestions = []
 
-    def set_weight_exact_weight(self, value: str):
-        self.weight_exact_weight = value
+        self.weight_autocomplete_row = ""
+        self.weight_autocomplete_matches = []
+
+    def toggle_weight_suggestions(self):
+        self.weight_suggestions_expanded = not self.weight_suggestions_expanded
 
     def set_weight_order(self, value: str):
         self.weight_order = value
+        self._refresh_weight_name_suggestions()
 
     def set_weight_route(self, value: str):
         self.weight_route = value
+
+    def set_weight_stage(self, value: str):
+        self.weight_stage = value
 
     def set_weight_filter_order(self, value: str):
         self.weight_filter_order = value
@@ -1562,96 +1625,211 @@ class State(rx.State):
     def set_weight_filter_route(self, value: str):
         self.weight_filter_route = value
 
-    def suggest_weight_from_name(self):
-        """Подставляет средний вес ящика из последней записи с таким же названием.
+    def set_weight_filter_stage(self, value: str):
+        self.weight_filter_stage = value
 
-        Срабатывает по уходу фокуса с поля «Наименование» и не трогает поле,
-        если пользователь уже что-то в него вписал.
-        """
-
-        if self.weight_avg_weight.strip() or self.weight_editing_id:
+    def set_weight_draft_field(self, row_id: str, field: str, value: str):
+        if field not in {"name", "box_count", "avg_weight", "exact_weight", "store"}:
             return
 
-        suggestion = last_avg_weight_for(self.weight_name)
-        if suggestion is not None:
-            self.weight_avg_weight = f"{suggestion:g}"
+        rows = []
+        for row in self.weight_draft_rows:
+            if row["id"] == row_id:
+                row = dict(row)
+                row[field] = value
+            rows.append(row)
+        self.weight_draft_rows = rows
 
-    def _reset_weight_form(self):
-        self.weight_name = ""
-        self.weight_box_count = ""
-        self.weight_avg_weight = ""
-        self.weight_exact_weight = ""
-        self.weight_order = WEIGHT_NO_BINDING
-        self.weight_route = WEIGHT_NO_BINDING
-        self.weight_editing_id = ""
+        if field == "name":
+            self._refresh_weight_name_autocomplete(row_id, value)
+
+    def _refresh_weight_name_autocomplete(self, row_id: str, typed: str):
+        typed = typed.strip().lower()
+        if not typed:
+            self.weight_autocomplete_row = ""
+            self.weight_autocomplete_matches = []
+            return
+
+        self.weight_autocomplete_row = row_id
+        self.weight_autocomplete_matches = [
+            name for name in self.weight_name_suggestions if name.lower().startswith(typed)
+        ][:6]
+
+    def handle_weight_name_key(self, row_id: str, key: str):
+        if key == "Escape":
+            self.weight_autocomplete_row = ""
+            self.weight_autocomplete_matches = []
+            return
+
+        if key != "Tab":
+            return
+
+        if self.weight_autocomplete_row != row_id or not self.weight_autocomplete_matches:
+            return
+
+        self.accept_weight_name_suggestion(row_id, self.weight_autocomplete_matches[0])
+
+    def accept_weight_name_suggestion(self, row_id: str, name: str):
+        self.set_weight_draft_field(row_id, "name", name)
+        self.weight_autocomplete_row = ""
+        self.weight_autocomplete_matches = []
+        self.suggest_weight_draft_avg(row_id)
+
+    def suggest_weight_draft_avg(self, row_id: str):
+        """Подставляет средний вес ящика из последней записи с таким же названием.
+
+        Срабатывает по уходу фокуса с поля «Наименование» строки черновика и
+        не трогает поле, если оно уже заполнено.
+        """
+
+        rows = []
+        changed = False
+        for row in self.weight_draft_rows:
+            if row["id"] == row_id and not row["avg_weight"].strip():
+                suggestion = last_avg_weight_for(row["name"])
+                if suggestion is not None:
+                    row = dict(row)
+                    row["avg_weight"] = f"{suggestion:g}"
+                    changed = True
+            rows.append(row)
+
+        if changed:
+            self.weight_draft_rows = rows
+
+    def add_weight_draft_row(self):
+        self.weight_draft_rows = self.weight_draft_rows + [_empty_weight_draft_row()]
         self.weight_status = ""
 
+    def add_weight_draft_row_with_name(self, name: str):
+        """Клик по подсказке наименования — быстро завести строку с этим именем.
+
+        Занимает последнюю пустую строку черновика, если она есть, иначе
+        добавляет новую — так по подсказкам можно быстро набрать список
+        позиций, а потом просто проставить количества."""
+
+        suggestion = last_avg_weight_for(name)
+        avg_weight = f"{suggestion:g}" if suggestion is not None else ""
+
+        rows = list(self.weight_draft_rows)
+        if rows and not rows[-1]["name"].strip() and not rows[-1]["saved_id"]:
+            rows[-1] = {**rows[-1], "name": name, "avg_weight": avg_weight}
+        else:
+            rows.append({**_empty_weight_draft_row(), "name": name, "avg_weight": avg_weight})
+        self.weight_draft_rows = rows
+        self.weight_status = ""
+
+    def remove_weight_draft_row(self, row_id: str):
+        remaining = [row for row in self.weight_draft_rows if row["id"] != row_id]
+        self.weight_draft_rows = remaining or [_empty_weight_draft_row()]
+        self.weight_status = ""
+        if self.weight_autocomplete_row == row_id:
+            self.weight_autocomplete_row = ""
+            self.weight_autocomplete_matches = []
+
     def start_edit_weight_row(self, row_id: str):
+        """Подгружает уже сохранённую запись в черновик массового ввода для правки."""
+
         row = next((row for row in self.weight_rows if row["id"] == row_id), None)
         if row is None:
             return
 
-        self.weight_name = row["name"]
-        self.weight_box_count = str(row["box_count"])
-        self.weight_avg_weight = row["avg_weight"]
-        self.weight_exact_weight = row["exact_weight"]
+        if any(draft["saved_id"] == row_id for draft in self.weight_draft_rows):
+            return
+
+        loaded = {
+            "id": uuid.uuid4().hex,
+            "saved_id": row_id,
+            "name": row["name"],
+            "box_count": str(row["box_count"]),
+            "avg_weight": row["avg_weight"],
+            "exact_weight": row["exact_weight"],
+            "store": row["store"] or WEIGHT_STORE_PLACEHOLDER,
+        }
+
+        only_row = self.weight_draft_rows[0] if len(self.weight_draft_rows) == 1 else None
+        is_blank = only_row is not None and not only_row["name"].strip() and not only_row["saved_id"]
+
         self.weight_order = row["order_file"] or WEIGHT_NO_BINDING
         self.weight_route = row["route"] or WEIGHT_NO_BINDING
-        self.weight_editing_id = row_id
+        if row["stage"]:
+            self.weight_stage = row["stage"]
+        self._refresh_weight_name_suggestions()
         self.weight_delete_confirm_id = ""
         self.weight_status = ""
 
-    def cancel_weight_edit(self):
-        self._reset_weight_form()
+        self.weight_draft_rows = [loaded] if is_blank else self.weight_draft_rows + [loaded]
 
-    def submit_weight_row(self):
-        name = self.weight_name.strip()
-
-        if not name:
-            self.weight_status = "Укажите наименование"
-            return
-
-        try:
-            box_count = int(self.weight_box_count)
-            assert box_count > 0
-        except (ValueError, AssertionError):
-            self.weight_status = "Количество ящиков должно быть целым числом больше нуля"
-            return
-
-        try:
-            avg_weight = float(self.weight_avg_weight.replace(",", "."))
-            assert avg_weight >= 0
-        except (ValueError, AssertionError):
-            self.weight_status = "Средний вес ящика должен быть числом"
-            return
-
-        exact_weight = None
-        if self.weight_exact_weight.strip():
-            try:
-                exact_weight = float(self.weight_exact_weight.replace(",", "."))
-                assert exact_weight >= 0
-            except (ValueError, AssertionError):
-                self.weight_status = "Точный вес должен быть числом"
-                return
-
+    def submit_weight_draft_rows(self):
         order_file = "" if self.weight_order == WEIGHT_NO_BINDING else self.weight_order
         route = "" if self.weight_route == WEIGHT_NO_BINDING else self.weight_route
+        stage = self.weight_stage
+
+        parsed = []
+        for index, row in enumerate(self.weight_draft_rows, start=1):
+            name = row["name"].strip()
+            if not name and not row["box_count"].strip() and not row["avg_weight"].strip():
+                continue
+
+            if not name:
+                self.weight_status = f"Строка {index}: укажите наименование"
+                return
+
+            try:
+                box_count = int(row["box_count"])
+                assert box_count > 0
+            except (ValueError, AssertionError):
+                self.weight_status = f"Строка {index}: количество ящиков должно быть целым числом больше нуля"
+                return
+
+            try:
+                avg_weight = float(row["avg_weight"].replace(",", "."))
+                assert avg_weight >= 0
+            except (ValueError, AssertionError):
+                self.weight_status = f"Строка {index}: средний вес ящика должен быть числом"
+                return
+
+            exact_weight = None
+            if row["exact_weight"].strip():
+                try:
+                    exact_weight = float(row["exact_weight"].replace(",", "."))
+                    assert exact_weight >= 0
+                except (ValueError, AssertionError):
+                    self.weight_status = f"Строка {index}: точный вес должен быть числом"
+                    return
+
+            store = row["store"].strip() if stage == STAGE_STORE_SHIPMENT else ""
+            if store == WEIGHT_STORE_PLACEHOLDER:
+                store = ""
+            if stage == STAGE_STORE_SHIPMENT and not store:
+                self.weight_status = f"Строка {index}: укажите магазин"
+                return
+
+            parsed.append((row["saved_id"], name, box_count, avg_weight, exact_weight, store))
+
+        if not parsed:
+            self.weight_status = "Добавьте хотя бы одну позицию"
+            return
 
         driver_lookup = self._route_driver_lookup()
 
-        if self.weight_editing_id:
-            entry = update_weight_row(
-                self.weight_editing_id, name, box_count, avg_weight, exact_weight, order_file, route
-            )
-            formatted = format_weight_row(entry, driver_lookup)
-            self.weight_rows = [
-                formatted if row["id"] == entry["id"] else row for row in self.weight_rows
-            ]
-        else:
-            entry = add_weight_row(name, box_count, avg_weight, exact_weight, order_file, route)
-            self.weight_rows = self.weight_rows + [format_weight_row(entry, driver_lookup)]
+        for saved_id, name, box_count, avg_weight, exact_weight, store in parsed:
+            if saved_id:
+                entry = update_weight_row(
+                    saved_id, name, box_count, avg_weight, exact_weight, order_file, route, stage, store
+                )
+                if entry is None:
+                    continue
+                formatted = format_weight_row(entry, driver_lookup)
+                self.weight_rows = [
+                    formatted if r["id"] == entry["id"] else r for r in self.weight_rows
+                ]
+            else:
+                entry = add_weight_row(name, box_count, avg_weight, exact_weight, order_file, route, stage, store)
+                self.weight_rows = self.weight_rows + [format_weight_row(entry, driver_lookup)]
 
-        self._reset_weight_form()
+        self.weight_draft_rows = [_empty_weight_draft_row()]
+        self.weight_status = f"Сохранено позиций: {len(parsed)}"
+        self._refresh_weight_name_suggestions()
 
     def ask_delete_weight_row(self, row_id: str):
         self.weight_delete_confirm_id = row_id
@@ -1663,10 +1841,9 @@ class State(rx.State):
         row_id = self.weight_delete_confirm_id
         delete_weight_row(row_id)
         self.weight_rows = [row for row in self.weight_rows if row["id"] != row_id]
+        remaining = [row for row in self.weight_draft_rows if row["saved_id"] != row_id]
+        self.weight_draft_rows = remaining or [_empty_weight_draft_row()]
         self.weight_delete_confirm_id = ""
-
-        if self.weight_editing_id == row_id:
-            self._reset_weight_form()
 
     def load_invoice_ocr(self):
         files = sorted(load_processed_files().items(), key=lambda item: item[1], reverse=True)
@@ -3160,14 +3337,19 @@ def weight_row(item):
             spacing="1",
             min_width="180px",
         ),
+        rx.cond(
+            item["stage"] != "",
+            weight_stat("Этап", item["stage"]),
+            weight_stat("Этап", "—"),
+        ),
         weight_stat("Ящиков", item["box_count"]),
-        weight_stat("Средний вес, кг", item["avg_weight"]),
+        weight_stat("Средний вес ящика, кг", item["avg_weight"]),
         rx.cond(
             item["exact_weight"] != "",
-            weight_stat("Точный вес, кг", item["exact_weight"]),
-            weight_stat("Точный вес, кг", "—"),
+            weight_stat("Грязный вес, кг", item["exact_weight"]),
+            weight_stat("Грязный вес, кг", "—"),
         ),
-        weight_stat("Итого, кг", item["total"]),
+        weight_stat("Чистый вес, кг", item["total"]),
         rx.cond(
             item["order_file"] != "",
             weight_stat("Заказ", item["order_file"]),
@@ -3177,6 +3359,11 @@ def weight_row(item):
             item["route"] != "",
             weight_stat("Маршрут / водитель", item["route"], " (", item["driver"], ")"),
             weight_stat("Маршрут / водитель", "—"),
+        ),
+        rx.cond(
+            item["store"] != "",
+            weight_stat("Магазин", item["store"]),
+            rx.box(),
         ),
         rx.spacer(),
         rx.cond(
@@ -3227,12 +3414,111 @@ def weight_row(item):
         padding="10px 12px",
         border_radius="10px",
         background=surface_alt(),
-        border=rx.cond(
-            State.weight_editing_id == item["id"],
-            f"1px solid {ACCENT}",
-            "1px solid transparent",
-        ),
         wrap="wrap",
+    )
+
+
+def weight_name_autocomplete_option(item_id, name):
+    return rx.box(
+        rx.text(name, font_size="13px", color=text()),
+        on_mouse_down=State.accept_weight_name_suggestion(item_id, name),
+        padding="6px 10px",
+        cursor="pointer",
+        width="100%",
+        border_radius="6px",
+        _hover={"background": surface_alt()},
+    )
+
+
+def weight_draft_row(item):
+    return rx.hstack(
+        rx.box(
+            rx.input(
+                value=item["name"],
+                on_change=lambda value: State.set_weight_draft_field(item["id"], "name", value),
+                on_blur=State.suggest_weight_draft_avg(item["id"]),
+                on_key_down=lambda key, info: State.handle_weight_name_key(item["id"], key),
+                placeholder="Наименование",
+                width="100%",
+            ),
+            rx.cond(
+                (State.weight_autocomplete_row == item["id"]) & (State.weight_autocomplete_matches.length() > 0),
+                rx.vstack(
+                    rx.foreach(
+                        State.weight_autocomplete_matches,
+                        lambda name: weight_name_autocomplete_option(item["id"], name),
+                    ),
+                    position="absolute",
+                    top="100%",
+                    left="0",
+                    margin_top="4px",
+                    width="240px",
+                    background=surface(),
+                    border=f"1px solid {border()}",
+                    border_radius="8px",
+                    box_shadow="0 8px 20px rgba(16, 24, 32, 0.18)",
+                    padding="4px",
+                    spacing="0",
+                    z_index="20",
+                ),
+                rx.box(),
+            ),
+            position="relative",
+            width="100%",
+            min_width="190px",
+        ),
+        rx.input(
+            value=item["box_count"],
+            on_change=lambda value: State.set_weight_draft_field(item["id"], "box_count", value),
+            placeholder="Ящиков",
+            width="100px",
+        ),
+        rx.input(
+            value=item["avg_weight"],
+            on_change=lambda value: State.set_weight_draft_field(item["id"], "avg_weight", value),
+            placeholder="Ср. вес ящика, кг",
+            width="130px",
+        ),
+        rx.input(
+            value=item["exact_weight"],
+            on_change=lambda value: State.set_weight_draft_field(item["id"], "exact_weight", value),
+            placeholder="Грязный вес",
+            width="120px",
+        ),
+        rx.cond(
+            State.weight_stage == STAGE_STORE_SHIPMENT,
+            rx.select(
+                State.weight_draft_store_options,
+                value=item["store"],
+                on_change=lambda value: State.set_weight_draft_field(item["id"], "store", value),
+                width="180px",
+            ),
+            rx.box(),
+        ),
+        rx.button(
+            fa_icon(tag="x", size=13),
+            on_click=State.remove_weight_draft_row(item["id"]),
+            variant="ghost",
+            color=muted(),
+            cursor="pointer",
+            aria_label="Удалить строку",
+        ),
+        width="100%",
+        spacing="2",
+        align="center",
+        wrap="wrap",
+    )
+
+
+def weight_name_suggestion_chip(name):
+    return rx.button(
+        name,
+        on_click=State.add_weight_draft_row_with_name(name),
+        size="1",
+        variant="soft",
+        color_scheme="gray",
+        cursor="pointer",
+        border_radius="999px",
     )
 
 
@@ -3240,36 +3526,16 @@ def weight_page():
     return page_shell(
         topbar(
             "Вес",
-            "Наименование, ящики и средний вес — а для взвешенных позиций впишите точный вес. "
-            "При желании привяжите запись к заказу и маршруту.",
+            "Три этапа за день: загрузка утром, выгрузка остатка вечером и отгрузка по магазинам. "
+            "Если взвесили с ящиками — впишите грязный вес: чистый вес = грязный вес − "
+            "кол-во ящиков × средний вес ящика.",
         ),
         panel_shell(
-            panel_title("scale", rx.cond(State.weight_editing_id != "", "Изменение записи", "Новая запись")),
-            rx.hstack(
-                weight_field(
-                    "Наименование",
-                    State.weight_name,
-                    State.set_weight_name,
-                    "Например, «Хлеб»",
-                    on_blur=State.suggest_weight_from_name,
-                ),
-                weight_field("Кол-во ящиков", State.weight_box_count, State.set_weight_box_count, "10"),
-                weight_field(
-                    "Средний вес ящика, кг",
-                    State.weight_avg_weight,
-                    State.set_weight_avg_weight,
-                    "2.5",
-                ),
-                weight_field(
-                    "Точный вес, кг (если взвесили)",
-                    State.weight_exact_weight,
-                    State.set_weight_exact_weight,
-                    "необязательно",
-                ),
-                spacing="3",
-                width="100%",
-                align="end",
-            ),
+            panel_title("scale", "Этап"),
+            segmented_control(WEIGHT_STAGE_OPTIONS, State.weight_stage, State.set_weight_stage),
+        ),
+        panel_shell(
+            panel_title("route", "Привязка"),
             rx.hstack(
                 weight_select_field("Заказ", State.weight_order, State.set_weight_order, State.weight_order_options),
                 weight_select_field("Маршрут", State.weight_route, State.set_weight_route, WEIGHT_ROUTE_OPTIONS),
@@ -3277,17 +3543,48 @@ def weight_page():
                 width="100%",
                 align="end",
             ),
+        ),
+        panel_shell(
+            panel_title("list", "Позиции"),
+            rx.cond(
+                State.weight_name_suggestions.length() > 0,
+                rx.vstack(
+                    rx.hstack(
+                        muted_text("Позиции из заказа (", State.weight_name_suggestions.length(), ")"),
+                        rx.text(
+                            rx.cond(State.weight_suggestions_expanded, "Скрыть", "Показать"),
+                            on_click=State.toggle_weight_suggestions,
+                            color=ACCENT,
+                            font_size="12px",
+                            font_weight="700",
+                            cursor="pointer",
+                        ),
+                        spacing="3",
+                        align="center",
+                    ),
+                    rx.cond(
+                        State.weight_suggestions_expanded,
+                        rx.hstack(
+                            rx.foreach(State.weight_name_suggestions, weight_name_suggestion_chip),
+                            spacing="2",
+                            wrap="wrap",
+                        ),
+                        rx.box(),
+                    ),
+                    align="start",
+                    spacing="2",
+                    width="100%",
+                ),
+                rx.box(),
+            ),
+            rx.vstack(
+                rx.foreach(State.weight_draft_rows, weight_draft_row),
+                spacing="2",
+                width="100%",
+            ),
             rx.hstack(
-                primary_button(
-                    rx.cond(State.weight_editing_id != "", "Сохранить изменения", "Добавить"),
-                    on_click=State.submit_weight_row,
-                    width="180px",
-                ),
-                rx.cond(
-                    State.weight_editing_id != "",
-                    secondary_button("Отмена", on_click=State.cancel_weight_edit, width="120px"),
-                    rx.box(),
-                ),
+                secondary_button("+ Добавить строку", on_click=State.add_weight_draft_row, width="180px"),
+                primary_button("Сохранить всё", on_click=State.submit_weight_draft_rows, width="160px"),
                 rx.text(State.weight_status, color="#e5484d", font_size="13px"),
                 spacing="4",
                 align="center",
@@ -3297,11 +3594,15 @@ def weight_page():
             rx.hstack(
                 panel_title("list", "Записи"),
                 rx.spacer(),
-                rx.text("Итого по списку: ", State.weight_total, " кг", color=text(), font_size="13px", font_weight="700"),
+                rx.text("Чистый вес по списку: ", State.weight_total, " кг", color=text(), font_size="13px", font_weight="700"),
                 width="100%",
                 align="center",
             ),
             rx.hstack(
+                weight_select_field(
+                    "Фильтр по этапу", State.weight_filter_stage, State.set_weight_filter_stage,
+                    WEIGHT_STAGE_FILTER_OPTIONS,
+                ),
                 weight_select_field(
                     "Фильтр по заказу", State.weight_filter_order, State.set_weight_filter_order,
                     State.weight_order_filter_options,

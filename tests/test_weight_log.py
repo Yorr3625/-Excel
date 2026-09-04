@@ -23,13 +23,14 @@ def test_add_without_exact_weight_computes_total_from_average():
     assert weight_log.load_weight_rows()[0]["total"] == 25.0
 
 
-def test_exact_weight_overrides_computed_total():
-    """Если позицию взвесили — итог берётся из точного веса, а не из среднего."""
+def test_exact_weight_is_gross_and_total_is_net_after_subtracting_boxes():
+    """Если позицию взвесили с ящиками — итог = грязный вес минус вес ящиков (кол-во × средний)."""
 
-    entry = weight_log.add_weight_row("Товар Б", box_count=10, avg_weight=2.5, exact_weight=23.4)
+    entry = weight_log.add_weight_row("Товар Б", box_count=10, avg_weight=0.5, exact_weight=30.0)
 
-    assert entry["total"] == 23.4
-    assert weight_log.load_weight_rows()[0]["exact_weight"] == 23.4
+    assert entry["total"] == 25.0
+    assert weight_log.load_weight_rows()[0]["exact_weight"] == 30.0
+    assert weight_log.load_weight_rows()[0]["total"] == 25.0
 
 
 def test_rows_keep_insertion_order():
@@ -191,3 +192,98 @@ def test_update_weight_row_on_legacy_book_adds_missing_columns(tmp_path, monkeyp
     row = weight_log.load_weight_rows()[0]
     assert row["name"] == "Обновлено"
     assert row["order_file"] == "заказ.xlsx"
+
+
+def test_stage_and_store_are_saved_and_default_to_empty():
+    with_stage = weight_log.add_weight_row(
+        "Огурец",
+        box_count=5,
+        avg_weight=2,
+        exact_weight=None,
+        order_file="заказ.xlsx",
+        route="Маршрут №1",
+        stage=weight_log.STAGE_STORE_SHIPMENT,
+        store="фм 10",
+    )
+    without_stage = weight_log.add_weight_row("Помидор", box_count=3, avg_weight=1.5, exact_weight=None)
+
+    assert with_stage["stage"] == weight_log.STAGE_STORE_SHIPMENT
+    assert with_stage["store"] == "фм 10"
+    assert without_stage["stage"] == ""
+    assert without_stage["store"] == ""
+
+    rows = weight_log.load_weight_rows()
+    assert rows[0]["stage"] == weight_log.STAGE_STORE_SHIPMENT
+    assert rows[0]["store"] == "фм 10"
+    assert rows[1]["stage"] == ""
+    assert rows[1]["store"] == ""
+
+
+def test_update_weight_row_changes_stage_and_store():
+    entry = weight_log.add_weight_row("Товар", box_count=1, avg_weight=1, exact_weight=None)
+
+    updated = weight_log.update_weight_row(
+        entry["id"],
+        "Товар",
+        box_count=1,
+        avg_weight=1,
+        exact_weight=None,
+        order_file="",
+        route="",
+        stage=weight_log.STAGE_UNLOADING,
+        store="",
+    )
+
+    assert updated["stage"] == weight_log.STAGE_UNLOADING
+    assert weight_log.load_weight_rows()[0]["stage"] == weight_log.STAGE_UNLOADING
+
+
+def test_reads_legacy_rows_without_stage_and_store_columns(tmp_path, monkeypatch):
+    """Книга без колонок Этап/Магазин (до этого редизайна) не должна ломать чтение."""
+
+    from openpyxl import Workbook
+
+    target = tmp_path / "legacy_weight_log.xlsx"
+    monkeypatch.setattr(weight_log, "WEIGHT_LOG_FILE", target)
+
+    workbook = Workbook()
+    workbook.active.append(
+        (
+            "ID", "Дата", "Наименование", "Кол-во ящиков", "Средний вес ящика, кг",
+            "Точный вес, кг", "Итого, кг", "Заказ", "Маршрут",
+        )
+    )
+    workbook.active.append(
+        ("legacy-id", "2026-01-01", "Старая запись", 5, 2, None, 10, "заказ.xlsx", "Маршрут №1")
+    )
+    workbook.save(target)
+
+    row = weight_log.load_weight_rows()[0]
+    assert row["order_file"] == "заказ.xlsx"
+    assert row["stage"] == ""
+    assert row["store"] == ""
+
+    updated = weight_log.update_weight_row(
+        "legacy-id", "Обновлено", box_count=5, avg_weight=2, exact_weight=None,
+        order_file="заказ.xlsx", route="Маршрут №1", stage=weight_log.STAGE_LOADING, store="",
+    )
+    assert updated["stage"] == weight_log.STAGE_LOADING
+
+
+def test_known_names_for_order_returns_recent_first_without_duplicates():
+    weight_log.add_weight_row("Огурец", box_count=1, avg_weight=1, exact_weight=None, order_file="заказ.xlsx")
+    weight_log.add_weight_row("Помидор", box_count=1, avg_weight=1, exact_weight=None, order_file="заказ.xlsx")
+    weight_log.add_weight_row("Другой заказ", box_count=1, avg_weight=1, exact_weight=None, order_file="другой.xlsx")
+    weight_log.add_weight_row("огурец", box_count=1, avg_weight=1, exact_weight=None, order_file="заказ.xlsx")
+
+    names = weight_log.known_names_for_order("заказ.xlsx")
+
+    assert names == ["огурец", "Помидор"]
+
+
+def test_known_names_for_order_empty_for_unknown_or_blank_order():
+    weight_log.add_weight_row("Огурец", box_count=1, avg_weight=1, exact_weight=None, order_file="заказ.xlsx")
+
+    assert weight_log.known_names_for_order("нет-такого-заказа.xlsx") == []
+    assert weight_log.known_names_for_order("") == []
+    assert weight_log.known_names_for_order("   ") == []
