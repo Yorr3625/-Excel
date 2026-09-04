@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import orders_dashboard.orders_dashboard as dashboard
+from modules.config import MAX_ROUTES
 
 
 def test_refresh_mail_config_is_registered_and_loads_state(monkeypatch):
@@ -277,6 +278,60 @@ def test_invoice_ocr_line_change_recalculates_total():
     assert state.invoice_ocr_rows[0]["quantity"] == "3"
     assert state.invoice_ocr_rows[0]["line_total"] == "420"
     assert state.invoice_ocr_status == ""
+
+
+def test_add_route_increments_count_and_selects_new_route(monkeypatch):
+    saved_counts = []
+    monkeypatch.setattr(dashboard, "save_route_count", lambda count: saved_counts.append(count))
+    state = SimpleNamespace(active_route_count=4, selected_route_index=0, routes_status="")
+
+    dashboard.State.add_route.fn(state)
+
+    assert state.active_route_count == 5
+    assert state.selected_route_index == 4
+    assert saved_counts == [5]
+    assert "Маршрут №5" in state.routes_status
+
+
+def test_add_route_stops_at_max_routes(monkeypatch):
+    monkeypatch.setattr(dashboard, "save_route_count", lambda count: (_ for _ in ()).throw(
+        AssertionError("не должно сохраняться при достижении предела")
+    ))
+    state = SimpleNamespace(active_route_count=MAX_ROUTES, selected_route_index=2, routes_status="")
+
+    dashboard.State.add_route.fn(state)
+
+    assert state.active_route_count == MAX_ROUTES
+    assert state.selected_route_index == 2
+    assert str(MAX_ROUTES) in state.routes_status
+
+
+def test_select_route_parses_name_and_ignores_out_of_range():
+    state = SimpleNamespace(active_route_count=5, selected_route_index=0)
+
+    dashboard.State.select_route.fn(state, "Маршрут №3")
+    assert state.selected_route_index == 2
+
+    dashboard.State.select_route.fn(state, "Маршрут №8")
+    assert state.selected_route_index == 2
+
+    dashboard.State.select_route.fn(state, "не маршрут")
+    assert state.selected_route_index == 2
+
+
+def test_add_store_and_remove_store_operate_on_selected_route():
+    state = SimpleNamespace(
+        selected_route_index=1,
+        route_stores=[["фм 1"], ["фм 2"]],
+        new_store_input="  Новый магазин  ",
+    )
+
+    dashboard.State.add_store.fn(state)
+    assert state.route_stores == [["фм 1"], ["фм 2", "Новый магазин"]]
+    assert state.new_store_input == ""
+
+    dashboard.State.remove_store.fn(state, "фм 2")
+    assert state.route_stores == [["фм 1"], ["Новый магазин"]]
 
 
 def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):

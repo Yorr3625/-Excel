@@ -22,7 +22,17 @@ from modules.backup import (
     restore_backup,
     save_backup_directory,
 )
-from modules.config import build_groups, load_settings, load_stores, save_settings, save_stores
+from modules.config import (
+    DEFAULT_ROUTE_COUNT,
+    MAX_ROUTES,
+    build_groups,
+    load_route_count,
+    load_settings,
+    load_stores,
+    save_route_count,
+    save_settings,
+    save_stores,
+)
 from modules.excel_io import EXCEL_MIME_TYPES, is_excel_file
 from modules.history import (
     load_processed_files,
@@ -66,7 +76,7 @@ from modules.mail_watcher import (
 )
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.order_preview import PreviewError, build_order_preview
-from modules.styles import blue_fill, conflict_fill, green_fill, purple_fill, yellow_fill
+from modules.styles import conflict_fill, fills_for
 from modules.version import APP_NAME, APP_VERSION, Release, load_changelog
 from modules.updater import check_for_update as check_remote_update, update_project
 from modules.tracking_sim import (
@@ -77,7 +87,12 @@ from modules.tracking_sim import (
     build_map_svg,
     init_vehicles,
 )
-from modules.route_drivers import ROUTE_AREAS, load_route_drivers, save_route_drivers
+from modules.route_drivers import (
+    ROUTE_AREAS,
+    load_route_drivers,
+    route_index_from_name,
+    save_route_drivers,
+)
 from modules.ai_settings import (
     PROVIDER_CLAUDE_CLI,
     PROVIDER_CLAUDE_KEY,
@@ -206,7 +221,8 @@ INVOICE_OCR_UPLOAD_ID = "invoice_ocr_upload"
 VOLUME_CHART_DAYS = 31
 ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
-VOLUME_ROUTE_LABELS = ["Маршрут 1", "Маршрут 2", "Маршрут 3", "Маршрут 4"]
+VOLUME_ROUTE_KEYS = [f"route_{i}" for i in range(1, MAX_ROUTES + 1)]
+VOLUME_ROUTE_LABELS = [f"Маршрут {i}" for i in range(1, MAX_ROUTES + 1)]
 SUPPORTED_EXCEL_LABEL = ".xlsx, .xlsm, .xlsb, .xls, .xltx, .xltm"
 WEIGHT_NO_BINDING = "— не привязано —"
 WEIGHT_ROUTES = ["Маршрут №1", "Маршрут №2", "Маршрут №3", "Маршрут №4"]
@@ -330,8 +346,8 @@ def build_volume_chart_data():
         if not date:
             continue
 
-        bucket = daily.setdefault(date, [0.0, 0.0, 0.0, 0.0])
-        for index, key in enumerate(("route_1", "route_2", "route_3", "route_4")):
+        bucket = daily.setdefault(date, [0.0] * len(VOLUME_ROUTE_KEYS))
+        for index, key in enumerate(VOLUME_ROUTE_KEYS):
             bucket[index] += float(record.get(key) or 0)
 
     today = datetime.now().date()
@@ -461,7 +477,7 @@ class State(rx.State):
     output_file: str = ""
     log_file: str = ""
     grand_total: str = "0"
-    route_totals: list[str] = ["0", "0", "0", "0"]
+    route_totals: list[str] = ["0"] * MAX_ROUTES
     conflict_count: int = 0
     unknown_count: int = 0
     error_text: str = ""
@@ -488,9 +504,12 @@ class State(rx.State):
     current_page: str = "Dashboard"
 
     routes_source: str = "Область"
-    # Списки по маршрутам (индексы 0..3 соответствуют ROUTE_KEYS).
-    route_stores: list[list[str]] = [[], [], [], []]
-    new_store_inputs: list[str] = ["", "", "", ""]
+    # Списки по маршрутам (индексы 0..MAX_ROUTES-1 соответствуют ROUTE_KEYS);
+    # сколько из них реально показываются — active_route_count.
+    route_stores: list[list[str]] = [[] for _ in range(MAX_ROUTES)]
+    active_route_count: int = DEFAULT_ROUTE_COUNT
+    selected_route_index: int = 0
+    new_store_input: str = ""
     routes_status: str = ""
     route_backup_labels: list[str] = []
     selected_route_backup: str = ""
@@ -558,7 +577,7 @@ class State(rx.State):
     }
     settings_status: str = ""
 
-    route_driver_names: list[str] = ["----", "Азер", "Фарид", "Раван"]
+    route_driver_names: list[str] = ["----", "Азер", "Фарид", "Раван", "----", "----", "----", "----"]
     route_drivers_status: str = ""
 
     weight_rows: list[dict] = []
@@ -1310,8 +1329,36 @@ class State(rx.State):
     def load_routes(self):
         data = load_stores(self.stores_file)
         self.route_stores = [list(data.get(key, [])) for key in ROUTE_KEYS]
+        self.active_route_count = load_route_count()
+        if self.selected_route_index >= self.active_route_count:
+            self.selected_route_index = 0
         self.routes_status = ""
         self.refresh_route_backups()
+
+    @rx.var
+    def route_name_options(self) -> list[str]:
+        return [f"Маршрут №{index + 1}" for index in range(self.active_route_count)]
+
+    @rx.var
+    def selected_route_label(self) -> str:
+        return f"Маршрут №{self.selected_route_index + 1}"
+
+    def select_route(self, value: str):
+        index = route_index_from_name(value)
+        if index is not None and index < self.active_route_count:
+            self.selected_route_index = index
+
+    def add_route(self):
+        if self.active_route_count >= MAX_ROUTES:
+            self.routes_status = f"Достигнут предел — не больше {MAX_ROUTES} маршрутов"
+            return
+
+        self.active_route_count += 1
+        save_route_count(self.active_route_count)
+        self.selected_route_index = self.active_route_count - 1
+        self.routes_status = (
+            f"Добавлен «Маршрут №{self.active_route_count}» — впишите магазины и сохраните"
+        )
 
     def refresh_route_backups(self):
         data = load_route_backups()
@@ -1362,25 +1409,23 @@ class State(rx.State):
         self.routes_source = value
         self.load_routes()
 
-    def set_new_store(self, index: int, value: str):
-        inputs = list(self.new_store_inputs)
-        inputs[index] = value
-        self.new_store_inputs = inputs
+    def set_new_store(self, value: str):
+        self.new_store_input = value
 
-    def add_store(self, index: int):
-        value = self.new_store_inputs[index].strip()
+    def add_store(self):
+        index = self.selected_route_index
+        value = self.new_store_input.strip()
 
         if value and value not in self.route_stores[index]:
             routes = [list(names) for names in self.route_stores]
             routes[index].append(value)
             self.route_stores = routes
 
-        inputs = list(self.new_store_inputs)
-        inputs[index] = ""
-        self.new_store_inputs = inputs
+        self.new_store_input = ""
 
-    def remove_store(self, index: int, name: str):
+    def remove_store(self, name: str):
         routes = [list(names) for names in self.route_stores]
+        index = self.selected_route_index
         routes[index] = [item for item in routes[index] if item != name]
         self.route_stores = routes
 
@@ -1416,7 +1461,7 @@ class State(rx.State):
 
     def init_tracking(self):
         stores_file = paths.stores_file_for(self.tracking_source)
-        self.vehicles = init_vehicles(stores_file)
+        self.vehicles = init_vehicles(stores_file, self.active_route_count)
         self.tracking_event_log = []
 
     def set_tracking_source(self, value: str):
@@ -1492,7 +1537,7 @@ class State(rx.State):
     def refresh_real_data(self):
         items = []
 
-        for index, key in enumerate(ROUTE_KEYS):
+        for index, key in enumerate(ROUTE_KEYS[: self.active_route_count]):
             data = driver_data.load_today(key)
             stops = data["stops"] if data else []
             last = data.get("last_position") if data else None
@@ -1548,6 +1593,7 @@ class State(rx.State):
         today = datetime.now().strftime("%Y-%m-%d")
         self.orders_today_count = sum(1 for ts in data.values() if ts.startswith(today))
 
+        self.active_route_count = load_route_count()
         self.refresh_stores_total()
         self.volume_chart_data = build_volume_chart_data()
         self.load_ai_settings_form()
@@ -2200,9 +2246,9 @@ class State(rx.State):
         self.mode_detection_warning = ""
 
         try:
-            fills = [green_fill, yellow_fill, blue_fill, purple_fill]
+            fills = fills_for(self.active_route_count)
             mode_groups = {
-                mode: build_groups(load_stores(paths.stores_file_for(mode)), fills)
+                mode: build_groups(load_stores(paths.stores_file_for(mode)), fills, self.active_route_count)
                 for mode in ("Город", "Область")
             }
 
@@ -2260,8 +2306,8 @@ class State(rx.State):
         try:
             stores_file = paths.stores_file_for(self.mode)
             stores = load_stores(stores_file)
-            fills = [green_fill, yellow_fill, blue_fill, purple_fill]
-            groups = build_groups(stores, fills)
+            fills = fills_for(self.active_route_count)
+            groups = build_groups(stores, fills, self.active_route_count)
             preview = build_order_preview(
                 self.uploaded_file_path,
                 groups,
@@ -2369,8 +2415,8 @@ class State(rx.State):
             settings = load_settings()
 
             stores = load_stores(stores_file)
-            fills = [green_fill, yellow_fill, blue_fill, purple_fill]
-            groups = build_groups(stores, fills)
+            fills = fills_for(self.active_route_count)
+            groups = build_groups(stores, fills, self.active_route_count)
 
             output_file, log_file, stats = run_pipeline(
                 self.uploaded_file_path,
@@ -2380,7 +2426,7 @@ class State(rx.State):
             )
 
             route_totals = list(stats.get("route_totals", {}).values())
-            while len(route_totals) < 4:
+            while len(route_totals) < MAX_ROUTES:
                 route_totals.append(0)
 
             self.route_totals = [format_number(total) for total in route_totals]
@@ -2648,9 +2694,13 @@ def sidebar():
         spacing="5",
         width="216px",
         min_width="216px",
+        height="100vh",
         padding="20px 12px 14px",
         background=SIDEBAR_BG,
         border_right=f"1px solid {SIDEBAR_BORDER}",
+        position="sticky",
+        top="0",
+        overflow_y="auto",
     )
 
 
@@ -2987,8 +3037,12 @@ def processing_summary():
         ),
         rx.vstack(
             *[
-                route_result(f"Маршрут №{index + 1}", State.route_totals[index])
-                for index in range(len(ROUTE_KEYS))
+                rx.cond(
+                    index < State.active_route_count,
+                    route_result(f"Маршрут №{index + 1}", State.route_totals[index]),
+                    rx.box(),
+                )
+                for index in range(MAX_ROUTES)
             ],
             spacing="2",
             width="100%",
@@ -3127,10 +3181,10 @@ def volume_chart_panel():
                 rx.recharts.y_axis(stroke=muted()),
                 rx.recharts.tooltip(),
                 rx.recharts.legend(),
-                rx.recharts.bar(data_key="Маршрут 1", stack_id="a", fill=ROUTE_COLORS[0]),
-                rx.recharts.bar(data_key="Маршрут 2", stack_id="a", fill=ROUTE_COLORS[1]),
-                rx.recharts.bar(data_key="Маршрут 3", stack_id="a", fill=ROUTE_COLORS[2]),
-                rx.recharts.bar(data_key="Маршрут 4", stack_id="a", fill=ROUTE_COLORS[3]),
+                *[
+                    rx.recharts.bar(data_key=label, stack_id="a", fill=ROUTE_COLORS[index])
+                    for index, label in enumerate(VOLUME_ROUTE_LABELS)
+                ],
                 data=State.volume_chart_data,
                 margin={"left": 0, "right": 8, "top": 4, "bottom": 0},
             ),
@@ -3232,7 +3286,10 @@ def route_drivers_panel():
             font_size="12px",
         ),
         rx.vstack(
-            *[route_driver_row(index, area) for index, area in enumerate(ROUTE_AREAS)],
+            *[
+                rx.cond(index < State.active_route_count, route_driver_row(index, area), rx.box())
+                for index, area in enumerate(ROUTE_AREAS)
+            ],
             spacing="2",
             width="100%",
         ),
@@ -4556,35 +4613,35 @@ def store_row(name, on_remove):
     )
 
 
-def route_edit_card(index: int):
+def route_edit_card():
     return rx.vstack(
         rx.hstack(
             fa_icon(tag="route", size=15, color=text()),
-            rx.text(f"Маршрут №{index + 1}", color=text(), font_size="15px", font_weight="800"),
+            rx.text(State.selected_route_label, color=text(), font_size="15px", font_weight="800"),
             spacing="2",
             align="center",
         ),
         rx.vstack(
             rx.foreach(
-                State.route_stores[index],
-                lambda name: store_row(name, lambda value: State.remove_store(index, value)),
+                State.route_stores[State.selected_route_index],
+                lambda name: store_row(name, State.remove_store),
             ),
             spacing="1",
             width="100%",
-            max_height="220px",
+            max_height="320px",
             overflow_y="auto",
         ),
         rx.hstack(
             rx.input(
                 placeholder="Название магазина",
-                value=State.new_store_inputs[index],
-                on_change=lambda value: State.set_new_store(index, value),
+                value=State.new_store_input,
+                on_change=State.set_new_store,
                 width="100%",
             ),
             rx.button(
                 fa_icon(tag="plus", size=15),
                 "Добавить",
-                on_click=State.add_store(index),
+                on_click=State.add_store,
                 height="36px",
             ),
             width="100%",
@@ -4629,12 +4686,18 @@ def routes_page():
             "Списки магазинов по маршрутам для режимов Город/Область.",
             actions=[segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source)],
         ),
-        rx.grid(
-            *[route_edit_card(index) for index in range(len(ROUTE_KEYS))],
-            columns="2",
-            spacing="4",
-            width="100%",
+        panel_shell(
+            rx.hstack(
+                weight_select_field(
+                    "Маршрут", State.selected_route_label, State.select_route, State.route_name_options
+                ),
+                secondary_button("+ Новый маршрут", on_click=State.add_route, width="180px"),
+                spacing="3",
+                align="end",
+                width="100%",
+            ),
         ),
+        route_edit_card(),
         routes_backup_bar(),
         rx.cond(
             State.routes_status != "",
@@ -4675,7 +4738,10 @@ def tracking_legend_dot(color, label):
 
 def tracking_legend():
     return rx.hstack(
-        *[tracking_legend_dot(color, label) for label, color in zip(ROUTE_LABELS, ROUTE_COLORS)],
+        *[
+            rx.cond(index < State.active_route_count, tracking_legend_dot(color, label), rx.box())
+            for index, (label, color) in enumerate(zip(ROUTE_LABELS, ROUTE_COLORS))
+        ],
         tracking_legend_dot("#f5a623", "Резкий разгон"),
         tracking_legend_dot("#e5484d", "Резкое торможение"),
         spacing="5",
@@ -5705,9 +5771,13 @@ class DriverState(rx.State):
     stops: list[dict] = []
     active_stop: str = ""
     upload_status: str = ""
+    active_route_count: int = DEFAULT_ROUTE_COUNT
 
     def _stores_file(self) -> Path:
         return paths.stores_file_for(self.source)
+
+    def load_active_routes(self):
+        self.active_route_count = load_route_count()
 
     def select_vehicle(self, key: str, label: str):
         self.vehicle_key = key
@@ -5779,7 +5849,14 @@ def driver_select_screen():
         rx.heading("Выберите машину", color=text(), size="6"),
         segmented_control(["Город", "Область"], DriverState.source, DriverState.set_source),
         rx.vstack(
-            *[driver_vehicle_button(key, label, color) for key, label, color in DRIVER_VEHICLES],
+            *[
+                rx.cond(
+                    index < DriverState.active_route_count,
+                    driver_vehicle_button(key, label, color),
+                    rx.box(),
+                )
+                for index, (key, label, color) in enumerate(DRIVER_VEHICLES)
+            ],
             spacing="3",
             width="100%",
         ),
@@ -5952,6 +6029,13 @@ app = rx.App(
     api_transformer=custom_api,
     stylesheets=[
         "https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700;800&display=swap",
+        # Единый вид скроллбаров (светлая/тёмная тема, включая прокрутку
+        # всей страницы) — обычный статический файл в assets/, а не
+        # App.style: App.style компилируется в theme.js вне React-дерева,
+        # где привязка к State.theme ломает страницу ("State is not
+        # defined"), а вложенный ("&::-webkit-scrollbar") селектор всё
+        # равно не достаёт html/body — они предок обёртки, а не потомок.
+        "/scrollbar.css",
     ],
     style={
         "font_family": "'Roboto', sans-serif",
@@ -5959,4 +6043,4 @@ app = rx.App(
     },
 )
 app.add_page(dashboard, route="/", title="Обработка заказов", on_load=State.load_history)
-app.add_page(driver_page, route="/driver", title="Водитель")
+app.add_page(driver_page, route="/driver", title="Водитель", on_load=DriverState.load_active_routes)

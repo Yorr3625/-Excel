@@ -12,13 +12,20 @@ import re
 
 from modules.paths import ROUTE_DRIVERS_FILE
 
-ROUTE_KEYS = ("route_1", "route_2", "route_3", "route_4")
-ROUTE_AREAS = ("Текстильщик", "Центр", "Заперевальная", "Металдоны")
+ROUTE_KEYS = tuple(f"route_{i}" for i in range(1, 9))
+# Район фиксирован только для исходных 4 маршрутов; у добавленных сверх
+# них (route_index_from_name это уже поддерживает) района пока нет — в
+# колонтитуле он просто не показывается, см. route_header_text.
+ROUTE_AREAS = ("Текстильщик", "Центр", "Заперевальная", "Металдоны", "", "", "", "")
 DEFAULT_DRIVERS = {
     "route_1": "----",
     "route_2": "Азер",
     "route_3": "Фарид",
     "route_4": "Раван",
+    "route_5": "----",
+    "route_6": "----",
+    "route_7": "----",
+    "route_8": "----",
 }
 
 _NAME_PATTERN = re.compile(r"№\s*(\d+)")
@@ -65,9 +72,16 @@ def route_index_from_name(route_name: str) -> int | None:
 
 
 def route_header_text(index: int, driver: str) -> str:
-    """Текст колонтитула: «Маршрут №N (Водитель) - Район»."""
+    """Текст колонтитула: «Маршрут №N (Водитель) - Район».
 
-    return f"Маршрут №{index + 1} ({driver}) - {ROUTE_AREAS[index]}"
+    Часть «- Район» опускается, если у маршрута района нет (добавленные
+    сверх исходных 4 маршруты, см. ROUTE_AREAS).
+    """
+
+    base = f"Маршрут №{index + 1} ({driver})"
+    area = ROUTE_AREAS[index] if index < len(ROUTE_AREAS) else ""
+
+    return f"{base} - {area}" if area else base
 
 
 def route_header_for_name(route_name: str, drivers: dict | None = None) -> str | None:

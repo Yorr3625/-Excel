@@ -20,6 +20,7 @@ SETTINGS_FILE = CONFIG_DIR / "settings.json"
 STORES_FILE = CONFIG_DIR / "stores.json"
 STORES_CITY_FILE = CONFIG_DIR / "stores_city.json"
 STORES_REGION_FILE = CONFIG_DIR / "stores_region.json"
+ROUTES_FILE = CONFIG_DIR / "routes.json"
 
 # --- data/: рабочие папки ---
 ORDERS_FOLDER = DATA_DIR / "orders"

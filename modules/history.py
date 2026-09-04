@@ -12,7 +12,7 @@ from datetime import datetime
 from modules.paths import PROCESSED_FILES_FILE, VOLUME_HISTORY_FILE
 
 
-ROUTE_KEYS = ("route_1", "route_2", "route_3", "route_4")
+ROUTE_KEYS = tuple(f"route_{i}" for i in range(1, 9))
 
 
 def _read_json(path, default):

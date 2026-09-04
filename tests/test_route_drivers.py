@@ -81,3 +81,12 @@ def test_route_header_for_name_falls_back_to_saved_drivers():
 
 def test_route_header_for_name_unrecognized_returns_none():
     assert route_drivers.route_header_for_name("Служебный лист") is None
+
+
+def test_route_header_text_omits_district_for_added_routes():
+    assert route_drivers.route_header_text(4, "----") == "Маршрут №5 (----)"
+
+
+def test_route_index_from_name_recognizes_added_routes():
+    assert route_drivers.route_index_from_name("Маршрут №5") == 4
+    assert route_drivers.route_index_from_name("Маршрут №8") == 7

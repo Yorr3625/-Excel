@@ -12,7 +12,10 @@ TRAIL_LIMIT = 100
 # (/api/gps-ping), а дальше подставляется в имя файла — без проверки
 # значение вида "../../config/stores_city" уводило запись за пределы
 # папки с данными.
-ALLOWED_VEHICLE_KEYS = ("route_1", "route_2", "route_3", "route_4")
+ALLOWED_VEHICLE_KEYS = (
+    "route_1", "route_2", "route_3", "route_4",
+    "route_5", "route_6", "route_7", "route_8",
+)
 
 
 def is_valid_vehicle(vehicle_key: str) -> bool:

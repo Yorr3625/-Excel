@@ -1,0 +1,30 @@
+/* Единый вид скроллбаров (светлая и тёмная тема одинаково хорошо
+   читаются на полупрозрачном сером). App.style в orders_dashboard.py
+   стилизует скроллбары внутри React-дерева через вложенный селектор
+   (".css-XXXX ::-webkit-scrollbar"), но так не достать сам document/body —
+   он его предок, а не потомок. Отдельный статический файл в stylesheets
+   не завязан на эту обёртку и покрывает вообще все скроллбары, включая
+   прокрутку всей страницы. */
+
+html {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(120, 134, 148, 0.45) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 134, 148, 0.45);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 134, 148, 0.7);
+}

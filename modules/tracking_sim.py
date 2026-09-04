@@ -4,9 +4,12 @@ from datetime import datetime
 from modules.config import load_stores
 
 
-ROUTE_KEYS = ["route_1", "route_2", "route_3", "route_4"]
-ROUTE_LABELS = ["Машина №1", "Машина №2", "Машина №3", "Машина №4"]
-ROUTE_COLORS = ["#1f883d", "#2f6fed", "#7c5cff", "#e8590c"]
+ROUTE_KEYS = [f"route_{i}" for i in range(1, 9)]
+ROUTE_LABELS = [f"Машина №{i}" for i in range(1, 9)]
+ROUTE_COLORS = [
+    "#1f883d", "#2f6fed", "#7c5cff", "#e8590c",
+    "#d6409f", "#12b886", "#795548", "#607d8b",
+]
 
 TICK_SECONDS = 1.0
 BASE_SPEED_KMH = 42.0
@@ -30,7 +33,7 @@ def lerp_x(stop_index: int, progress: float, total: int) -> float:
     return round(x0 + (x1 - x0) * progress, 2)
 
 
-def init_vehicles(stores_file: str) -> list[dict]:
+def init_vehicles(stores_file: str, route_count: int = len(ROUTE_KEYS)) -> list[dict]:
     try:
         data = load_stores(stores_file)
     except (OSError, ValueError):
@@ -38,7 +41,7 @@ def init_vehicles(stores_file: str) -> list[dict]:
 
     vehicles = []
 
-    for index, key in enumerate(ROUTE_KEYS):
+    for index, key in enumerate(ROUTE_KEYS[:route_count]):
         stops = list(data.get(key, []))
         waypoints = ["База"] + stops
         n = len(waypoints)
