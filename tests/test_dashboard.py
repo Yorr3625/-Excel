@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import orders_dashboard.orders_dashboard as dashboard
 from modules.config import MAX_ROUTES
+from modules.weight_log import STAGE_LOADING, STAGE_STORE_SHIPMENT, STAGE_UNLOADING
 
 
 def test_refresh_mail_config_is_registered_and_loads_state(monkeypatch):
@@ -378,3 +379,69 @@ def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):
     assert state.invoice_ocr_status == "Накладная сохранена в журнале"
     assert state.invoice_ocr_draft_id == ""
     assert state.invoice_ocr_entries[0]["total"] == "3500"
+
+
+def _weight_row(stage, total, order_file="заказ.xlsx", route="Маршрут №1"):
+    return {
+        "order_file": order_file,
+        "route": route,
+        "stage": stage,
+        "total": total,
+    }
+
+
+def test_weight_reconciliation_rows_filters_by_order_and_route():
+    rows = [
+        _weight_row(STAGE_LOADING, 500, order_file="заказ.xlsx", route="Маршрут №1"),
+        _weight_row(STAGE_LOADING, 300, order_file="другой.xlsx", route="Маршрут №2"),
+        _weight_row(STAGE_LOADING, 100, order_file="", route=""),
+    ]
+    state = SimpleNamespace(
+        weight_rows=rows,
+        weight_filter_order=dashboard.WEIGHT_FILTER_ALL,
+        weight_filter_route=dashboard.WEIGHT_FILTER_ALL,
+    )
+    reconciliation_rows = dashboard.State.__dict__["weight_reconciliation_rows"].fget
+    assert reconciliation_rows(state) == rows
+
+    state.weight_filter_order = "заказ.xlsx"
+    assert reconciliation_rows(state) == [rows[0]]
+
+    state.weight_filter_order = dashboard.WEIGHT_FILTER_ALL
+    state.weight_filter_route = dashboard.WEIGHT_FILTER_UNBOUND
+    assert reconciliation_rows(state) == [rows[2]]
+
+
+def test_weight_reconciliation_flags_mismatch_between_stages():
+    state = SimpleNamespace(
+        weight_reconciliation_rows=[
+            _weight_row(STAGE_LOADING, 500),
+            _weight_row(STAGE_UNLOADING, 10),
+            _weight_row(STAGE_STORE_SHIPMENT, 480),
+        ]
+    )
+
+    result = dashboard.State.__dict__["weight_reconciliation"].fget(state)
+
+    assert result == {
+        "loaded": "500",
+        "shipped": "480",
+        "unloaded": "10",
+        "difference": "10",
+        "has_difference": "1",
+    }
+
+
+def test_weight_reconciliation_matches_when_stages_balance():
+    state = SimpleNamespace(
+        weight_reconciliation_rows=[
+            _weight_row(STAGE_LOADING, 500),
+            _weight_row(STAGE_UNLOADING, 10),
+            _weight_row(STAGE_STORE_SHIPMENT, 490),
+        ]
+    )
+
+    result = dashboard.State.__dict__["weight_reconciliation"].fget(state)
+
+    assert result["difference"] == "0"
+    assert result["has_difference"] == ""

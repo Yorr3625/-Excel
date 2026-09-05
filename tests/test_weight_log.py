@@ -281,6 +281,70 @@ def test_known_names_for_order_returns_recent_first_without_duplicates():
     assert names == ["огурец", "Помидор"]
 
 
+def test_net_weight_entered_directly_becomes_total_without_tare_subtraction():
+    """Если чистый вес уже известен — он идёт в итог как есть, тара не вычитается."""
+
+    entry = weight_log.add_weight_row(
+        "Товар", box_count=10, avg_weight=0.5, exact_weight=None, net_weight=25.0
+    )
+
+    assert entry["total"] == 25.0
+    assert entry["net_weight"] == 25.0
+    assert entry["exact_weight"] is None
+
+    row = weight_log.load_weight_rows()[0]
+    assert row["total"] == 25.0
+    assert row["net_weight"] == 25.0
+
+
+def test_net_weight_takes_priority_over_gross_weight():
+    entry = weight_log.add_weight_row(
+        "Товар", box_count=10, avg_weight=0.5, exact_weight=30.0, net_weight=27.0
+    )
+
+    assert entry["total"] == 27.0
+
+
+def test_update_weight_row_saves_net_weight():
+    entry = weight_log.add_weight_row("Товар", box_count=1, avg_weight=1, exact_weight=None)
+
+    updated = weight_log.update_weight_row(
+        entry["id"], "Товар", box_count=10, avg_weight=0.5, exact_weight=None, net_weight=18.0
+    )
+
+    assert updated["total"] == 18.0
+    assert updated["net_weight"] == 18.0
+
+    row = weight_log.load_weight_rows()[0]
+    assert row["total"] == 18.0
+    assert row["net_weight"] == 18.0
+
+
+def test_reads_legacy_rows_without_net_weight_column(tmp_path, monkeypatch):
+    """Книга без колонки «Чистый вес введён» (до этой правки) не должна ломать чтение."""
+
+    from openpyxl import Workbook
+
+    target = tmp_path / "legacy_weight_log.xlsx"
+    monkeypatch.setattr(weight_log, "WEIGHT_LOG_FILE", target)
+
+    workbook = Workbook()
+    workbook.active.append(
+        (
+            "ID", "Дата", "Наименование", "Кол-во ящиков", "Средний вес ящика, кг",
+            "Грязный вес, кг", "Чистый вес, кг", "Заказ", "Маршрут", "Этап", "Магазин",
+        )
+    )
+    workbook.active.append(
+        ("legacy-id", "2026-01-01", "Старая запись", 5, 2, None, 10, "", "", "", "")
+    )
+    workbook.save(target)
+
+    row = weight_log.load_weight_rows()[0]
+    assert row["net_weight"] is None
+    assert row["total"] == 10
+
+
 def test_known_names_for_order_empty_for_unknown_or_blank_order():
     weight_log.add_weight_row("Огурец", box_count=1, avg_weight=1, exact_weight=None, order_file="заказ.xlsx")
 

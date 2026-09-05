@@ -26,6 +26,7 @@ COLUMNS = (
     "Маршрут",
     "Этап",
     "Магазин",
+    "Чистый вес введён, кг",
 )
 
 STAGE_LOADING = "Загрузка"
@@ -61,6 +62,7 @@ def load_weight_rows() -> list[dict]:
     for row in sheet.iter_rows(min_row=2, values_only=True):
         row_id, date, name, box_count, avg_weight, exact_weight, total = row[:7]
         order_file, route, stage, store = (row[7:11] + (None, None, None, None))[:4]
+        (net_weight,) = (row[11:12] + (None,))[:1]
 
         if row_id is None:
             continue
@@ -73,6 +75,7 @@ def load_weight_rows() -> list[dict]:
                 "box_count": box_count or 0,
                 "avg_weight": avg_weight or 0,
                 "exact_weight": exact_weight,
+                "net_weight": net_weight,
                 "total": total or 0,
                 "order_file": order_file or "",
                 "route": route or "",
@@ -93,19 +96,30 @@ def add_weight_row(
     route: str = "",
     stage: str = "",
     store: str = "",
+    net_weight: float | None = None,
 ) -> dict:
     """Добавляет строку и возвращает её.
 
-    Итог (чистый вес) — если позицию взвесили вместе с ящиками (exact_weight
-    — грязный вес), из него вычитается вес самих ящиков (кол-во ящиков ×
-    средний вес ящика); иначе итог — это оценка, кол-во ящиков, умноженное
-    на средний вес ящика. order_file и route — необязательная привязка к
-    обработанному заказу и маршруту, для группировки записей. stage — один
-    из STAGES (загрузка/выгрузка/отгрузка с магазинов), store — магазин,
-    актуален только для этапа отгрузки с магазинов.
+    Итог (чистый вес) — по приоритету: net_weight, если чистый вес уже
+    известен и введён напрямую (весы сами показывают нетто, или его уже
+    посчитали) — тогда он идёт в итог как есть, без вычитания тары; иначе,
+    если позицию взвесили вместе с ящиками (exact_weight — грязный вес), из
+    него вычитается вес самих ящиков (кол-во ящиков × средний вес ящика);
+    иначе итог — это оценка, кол-во ящиков, умноженное на средний вес
+    ящика. order_file и route — необязательная привязка к обработанному
+    заказу и маршруту, для группировки записей. stage — один из STAGES
+    (загрузка/выгрузка/отгрузка с магазинов), store — магазин, актуален
+    только для этапа отгрузки с магазинов.
     """
 
     tare = box_count * avg_weight
+    if net_weight is not None:
+        total = net_weight
+    elif exact_weight is not None:
+        total = exact_weight - tare
+    else:
+        total = tare
+
     entry = {
         "id": uuid.uuid4().hex,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -113,7 +127,8 @@ def add_weight_row(
         "box_count": box_count,
         "avg_weight": avg_weight,
         "exact_weight": exact_weight,
-        "total": (exact_weight - tare) if exact_weight is not None else tare,
+        "net_weight": net_weight,
+        "total": total,
         "order_file": order_file,
         "route": route,
         "stage": stage,
@@ -134,6 +149,7 @@ def add_weight_row(
             entry["route"],
             entry["stage"],
             entry["store"],
+            entry["net_weight"],
         ]
     )
     _save_workbook(workbook)
@@ -167,13 +183,16 @@ def update_weight_row(
     route: str = "",
     stage: str = "",
     store: str = "",
+    net_weight: float | None = None,
 ) -> dict | None:
     """Обновляет существующую строку по id и возвращает её новую версию.
 
     Дата и id исходной записи сохраняются. Возвращает None, если строка не
     найдена. Пишет через sheet.cell(...) вместо ячеек из iter_rows — так
     правка не падает на книге, сохранённой до появления колонок Заказ,
-    Маршрут, Этап и Магазин (в ней короче строк, чем ожидает текущая схема).
+    Маршрут, Этап, Магазин и Чистый вес введён (в ней короче строк, чем
+    ожидает текущая схема). Приоритет для итога — как в add_weight_row:
+    net_weight, иначе exact_weight минус тара, иначе тара.
     """
 
     if not WEIGHT_LOG_FILE.exists():
@@ -188,7 +207,12 @@ def update_weight_row(
 
         row_number = row[0].row
         tare = box_count * avg_weight
-        total = (exact_weight - tare) if exact_weight is not None else tare
+        if net_weight is not None:
+            total = net_weight
+        elif exact_weight is not None:
+            total = exact_weight - tare
+        else:
+            total = tare
         date = sheet.cell(row=row_number, column=2).value
 
         sheet.cell(row=row_number, column=3, value=name)
@@ -200,6 +224,7 @@ def update_weight_row(
         sheet.cell(row=row_number, column=9, value=route)
         sheet.cell(row=row_number, column=10, value=stage)
         sheet.cell(row=row_number, column=11, value=store)
+        sheet.cell(row=row_number, column=12, value=net_weight)
         _save_workbook(workbook)
 
         return {
@@ -209,6 +234,7 @@ def update_weight_row(
             "box_count": box_count,
             "avg_weight": avg_weight,
             "exact_weight": exact_weight,
+            "net_weight": net_weight,
             "total": total,
             "order_file": order_file,
             "route": route,

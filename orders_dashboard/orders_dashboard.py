@@ -44,6 +44,7 @@ from modules.order_positions import order_position_names
 from modules.weight_log import (
     STAGE_LOADING,
     STAGE_STORE_SHIPMENT,
+    STAGE_UNLOADING,
     STAGES,
     add_weight_row,
     delete_weight_row,
@@ -267,6 +268,8 @@ ICON_TINTS = {
     "green": (ACCENT, "rgba(31, 136, 61, 0.16)"),
     "blue": ("#2f6fed", "rgba(47, 111, 237, 0.16)"),
     "violet": ("#7c5cff", "rgba(124, 92, 255, 0.16)"),
+    "amber": ("#f5a623", "rgba(245, 166, 35, 0.16)"),
+    "red": ("#e5484d", "rgba(229, 72, 77, 0.16)"),
 }
 
 SETTINGS_LABELS = {
@@ -401,6 +404,7 @@ def format_weight_row(entry: dict, driver_by_route: dict | None = None) -> dict:
     кто отвозил заказ, прямо в строке веса."""
 
     exact_weight = entry["exact_weight"]
+    net_weight = entry.get("net_weight")
     driver_by_route = driver_by_route or {}
 
     return {
@@ -410,6 +414,7 @@ def format_weight_row(entry: dict, driver_by_route: dict | None = None) -> dict:
         "box_count": entry["box_count"],
         "avg_weight": f"{float(entry['avg_weight']):g}",
         "exact_weight": f"{float(exact_weight):g}" if exact_weight is not None else "",
+        "net_weight": f"{float(net_weight):g}" if net_weight is not None else "",
         "total": f"{float(entry['total']):g}",
         "order_file": entry["order_file"],
         "route": entry["route"],
@@ -433,6 +438,7 @@ def _empty_weight_draft_row() -> dict:
         "box_count": "",
         "avg_weight": "",
         "exact_weight": "",
+        "net_weight": "",
         "store": WEIGHT_STORE_PLACEHOLDER,
     }
 
@@ -660,6 +666,53 @@ class State(rx.State):
     def weight_total(self) -> str:
         total = sum(float(row["total"]) for row in self.weight_visible_rows)
         return f"{total:g}"
+
+    @rx.var
+    def weight_reconciliation_rows(self) -> list[dict]:
+        """Строки для сверки склада — с учётом фильтров по заказу и маршруту, но без фильтра по этапу.
+
+        Нужны сразу все три этапа одновременно, иначе сверку не построить.
+        """
+
+        rows = self.weight_rows
+
+        if self.weight_filter_order == WEIGHT_FILTER_UNBOUND:
+            rows = [row for row in rows if not row["order_file"]]
+        elif self.weight_filter_order != WEIGHT_FILTER_ALL:
+            rows = [row for row in rows if row["order_file"] == self.weight_filter_order]
+
+        if self.weight_filter_route == WEIGHT_FILTER_UNBOUND:
+            rows = [row for row in rows if not row["route"]]
+        elif self.weight_filter_route != WEIGHT_FILTER_ALL:
+            rows = [row for row in rows if row["route"] == self.weight_filter_route]
+
+        return rows
+
+    @rx.var
+    def weight_reconciliation(self) -> dict[str, str]:
+        """Сверка склада за выбранные заказ/маршрут: загрузка = отгрузка по магазинам + выгрузка + разница.
+
+        Разница — то, что не сошлось (пересорт, недовес, потери), в идеале должна быть 0.
+        """
+
+        totals = {stage: 0.0 for stage in STAGES}
+        for row in self.weight_reconciliation_rows:
+            stage = row["stage"]
+            if stage in totals:
+                totals[stage] += float(row["total"])
+
+        loaded = totals[STAGE_LOADING]
+        shipped = totals[STAGE_STORE_SHIPMENT]
+        unloaded = totals[STAGE_UNLOADING]
+        difference = loaded - shipped - unloaded
+
+        return {
+            "loaded": f"{loaded:g}",
+            "shipped": f"{shipped:g}",
+            "unloaded": f"{unloaded:g}",
+            "difference": f"{difference:g}",
+            "has_difference": "1" if round(difference, 3) != 0 else "",
+        }
 
     @rx.var
     def invoice_ocr_total(self) -> str:
@@ -1137,20 +1190,39 @@ class State(rx.State):
         if enabled:
             return State.watch_mail
 
+    def _client_connected(self) -> bool:
+        """Жив ли ещё веб-сокет этой вкладки.
+
+        Фоновые циклы (эта проверка, симуляция трекинга, слежение за
+        реальными данными) иначе тикают вечно после закрытия вкладки —
+        флаг вроде tracking_running/real_watching/mail_auto остаётся
+        True навсегда, потому что сбросить его после закрытия некому, а
+        каждый тик Reflex всё равно пытается отправить дельту уже
+        отключённому клиенту и пишет в лог предупреждение
+        "Attempting to send delta to disconnected client". Останавливает
+        цикл на первом же тике после отключения.
+        """
+
+        namespace = app.event_namespace
+        if namespace is None:
+            return True
+
+        return self.router.session.client_token in namespace.token_to_sid
+
     @rx.event(background=True)
     async def watch_mail(self):
         """Периодическая проверка, пока дашборд открыт и переключатель включён."""
 
         while True:
             async with self:
-                if not self.mail_auto:
+                if not self.mail_auto or not self._client_connected():
                     return
                 interval = self.mail_interval
 
             await asyncio.sleep(max(interval, 1) * 60)
 
             async with self:
-                if not self.mail_auto:
+                if not self.mail_auto or not self._client_connected():
                     return
 
             await self._run_mail_check(with_retry=True)
@@ -1487,7 +1559,7 @@ class State(rx.State):
             await asyncio.sleep(1.0)
 
             async with self:
-                if not self.tracking_running:
+                if not self.tracking_running or not self._client_connected():
                     return
 
                 updated, events = advance_tick(self.vehicles)
@@ -1568,7 +1640,11 @@ class State(rx.State):
             await asyncio.sleep(5.0)
 
             async with self:
-                if not self.real_watching or self.tracking_view != "Реальные данные":
+                if (
+                    not self.real_watching
+                    or self.tracking_view != "Реальные данные"
+                    or not self._client_connected()
+                ):
                     self.real_watching = False
                     return
 
@@ -1675,7 +1751,7 @@ class State(rx.State):
         self.weight_filter_stage = value
 
     def set_weight_draft_field(self, row_id: str, field: str, value: str):
-        if field not in {"name", "box_count", "avg_weight", "exact_weight", "store"}:
+        if field not in {"name", "box_count", "avg_weight", "exact_weight", "net_weight", "store"}:
             return
 
         rows = []
@@ -1789,6 +1865,7 @@ class State(rx.State):
             "box_count": str(row["box_count"]),
             "avg_weight": row["avg_weight"],
             "exact_weight": row["exact_weight"],
+            "net_weight": row["net_weight"],
             "store": row["store"] or WEIGHT_STORE_PLACEHOLDER,
         }
 
@@ -1840,7 +1917,16 @@ class State(rx.State):
                     exact_weight = float(row["exact_weight"].replace(",", "."))
                     assert exact_weight >= 0
                 except (ValueError, AssertionError):
-                    self.weight_status = f"Строка {index}: точный вес должен быть числом"
+                    self.weight_status = f"Строка {index}: грязный вес должен быть числом"
+                    return
+
+            net_weight = None
+            if row["net_weight"].strip():
+                try:
+                    net_weight = float(row["net_weight"].replace(",", "."))
+                    assert net_weight >= 0
+                except (ValueError, AssertionError):
+                    self.weight_status = f"Строка {index}: чистый вес должен быть числом"
                     return
 
             store = row["store"].strip() if stage == STAGE_STORE_SHIPMENT else ""
@@ -1850,7 +1936,7 @@ class State(rx.State):
                 self.weight_status = f"Строка {index}: укажите магазин"
                 return
 
-            parsed.append((row["saved_id"], name, box_count, avg_weight, exact_weight, store))
+            parsed.append((row["saved_id"], name, box_count, avg_weight, exact_weight, store, net_weight))
 
         if not parsed:
             self.weight_status = "Добавьте хотя бы одну позицию"
@@ -1858,10 +1944,11 @@ class State(rx.State):
 
         driver_lookup = self._route_driver_lookup()
 
-        for saved_id, name, box_count, avg_weight, exact_weight, store in parsed:
+        for saved_id, name, box_count, avg_weight, exact_weight, store, net_weight in parsed:
             if saved_id:
                 entry = update_weight_row(
-                    saved_id, name, box_count, avg_weight, exact_weight, order_file, route, stage, store
+                    saved_id, name, box_count, avg_weight, exact_weight, order_file, route, stage, store,
+                    net_weight=net_weight,
                 )
                 if entry is None:
                     continue
@@ -1870,7 +1957,10 @@ class State(rx.State):
                     formatted if r["id"] == entry["id"] else r for r in self.weight_rows
                 ]
             else:
-                entry = add_weight_row(name, box_count, avg_weight, exact_weight, order_file, route, stage, store)
+                entry = add_weight_row(
+                    name, box_count, avg_weight, exact_weight, order_file, route, stage, store,
+                    net_weight=net_weight,
+                )
                 self.weight_rows = self.weight_rows + [format_weight_row(entry, driver_lookup)]
 
         self.weight_draft_rows = [_empty_weight_draft_row()]
@@ -3542,6 +3632,12 @@ def weight_draft_row(item):
             placeholder="Грязный вес",
             width="120px",
         ),
+        rx.input(
+            value=item["net_weight"],
+            on_change=lambda value: State.set_weight_draft_field(item["id"], "net_weight", value),
+            placeholder="Чистый вес (уже посчитан)",
+            width="170px",
+        ),
         rx.cond(
             State.weight_stage == STAGE_STORE_SHIPMENT,
             rx.select(
@@ -3585,7 +3681,8 @@ def weight_page():
             "Вес",
             "Три этапа за день: загрузка утром, выгрузка остатка вечером и отгрузка по магазинам. "
             "Если взвесили с ящиками — впишите грязный вес: чистый вес = грязный вес − "
-            "кол-во ящиков × средний вес ящика.",
+            "кол-во ящиков × средний вес ящика. Если чистый вес уже известен — впишите его "
+            "напрямую в поле «Чистый вес», тара вычитаться не будет.",
         ),
         panel_shell(
             panel_title("scale", "Этап"),
@@ -3671,6 +3768,36 @@ def weight_page():
                 spacing="3",
                 width="100%",
                 align="end",
+            ),
+            rx.hstack(
+                stat_card(
+                    "truck", "blue", "Загрузка",
+                    State.weight_reconciliation["loaded"] + " кг", rx.box(),
+                ),
+                stat_card(
+                    "route", "green", "Отгрузка по магазинам",
+                    State.weight_reconciliation["shipped"] + " кг", rx.box(),
+                ),
+                stat_card(
+                    "boxes", "violet", "Выгрузка (остаток)",
+                    State.weight_reconciliation["unloaded"] + " кг", rx.box(),
+                ),
+                rx.cond(
+                    State.weight_reconciliation["has_difference"] != "",
+                    stat_card(
+                        "triangle_alert", "red", "Разница",
+                        State.weight_reconciliation["difference"] + " кг",
+                        rx.text("Не сошлось — проверьте позиции", color="#e5484d", font_size="11px", font_weight="700"),
+                    ),
+                    stat_card(
+                        "circle_check", "green", "Разница",
+                        "0 кг",
+                        rx.text("Сошлось", color=muted(), font_size="11px"),
+                    ),
+                ),
+                spacing="3",
+                width="100%",
+                wrap="wrap",
             ),
             rx.cond(
                 State.weight_visible_rows.length() > 0,
