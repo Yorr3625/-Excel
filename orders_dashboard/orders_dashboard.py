@@ -117,6 +117,7 @@ from modules.invoice_ocr import (
     validate_and_prepare_photo,
 )
 from modules.help_chat import HelpChatError, send_chat_message
+from orders_dashboard import theme as ui
 
 
 async def gps_ping(request: Request):
@@ -145,76 +146,76 @@ async def gps_ping(request: Request):
 custom_api = Starlette(routes=[Route("/api/gps-ping", gps_ping, methods=["POST"])])
 
 
-FA_ICON_MAP = {
-    "layout_dashboard": "FaGauge",
-    "package": "FaBox",
-    "route": "FaRoute",
-    "truck": "FaTruck",
-    "history": "FaClockRotateLeft",
-    "settings": "FaGear",
-    "boxes": "FaBoxesStacked",
-    "sun": "FaSun",
-    "moon": "FaMoon",
-    "upload": "FaUpload",
-    "file_spreadsheet": "FaFileExcel",
-    "file_pdf": "FaFilePdf",
-    "chart_no_axes_column": "FaChartColumn",
-    "map": "FaMap",
-    "award": "FaAward",
-    "list": "FaList",
-    "map_pin": "FaLocationDot",
-    "mail": "FaEnvelope",
-    "inbox": "FaInbox",
-    "refresh": "FaRotate",
-    "circle_x": "FaCircleXmark",
-    "x": "FaXmark",
-    "plus": "FaPlus",
-    "camera": "FaCamera",
-    "circle_check": "FaCircleCheck",
-    "circle": "FaCircle",
-    "store": "FaStore",
-    "fuel": "FaGasPump",
-    "triangle_alert": "FaTriangleExclamation",
-    "key": "FaKey",
-    "info": "FaCircleInfo",
-    "save": "FaFloppyDisk",
-    "folder": "FaFolderOpen",
-    "scale": "FaWeightScale",
-    "edit": "FaPenToSquare",
-    "ai": "FaWandMagicSparkles",
-    "send": "FaPaperPlane",
+TABLER_ICON_MAP = {
+    "layout_dashboard": "IconLayoutDashboard",
+    "package": "IconPackage",
+    "route": "IconRoute",
+    "truck": "IconTruck",
+    "history": "IconHistory",
+    "settings": "IconSettings",
+    "boxes": "IconPackages",
+    "sun": "IconSun",
+    "moon": "IconMoon",
+    "upload": "IconUpload",
+    "file_spreadsheet": "IconFileSpreadsheet",
+    "file_pdf": "IconFileTypePdf",
+    "chart_no_axes_column": "IconChartBar",
+    "map": "IconMap",
+    "award": "IconAward",
+    "list": "IconList",
+    "map_pin": "IconMapPin",
+    "mail": "IconMail",
+    "inbox": "IconInbox",
+    "refresh": "IconRefresh",
+    "circle_x": "IconCircleX",
+    "x": "IconX",
+    "plus": "IconPlus",
+    "camera": "IconCamera",
+    "circle_check": "IconCircleCheck",
+    "circle": "IconCircle",
+    "store": "IconBuildingStore",
+    "fuel": "IconGasStation",
+    "triangle_alert": "IconAlertTriangle",
+    "key": "IconKey",
+    "info": "IconInfoCircle",
+    "save": "IconDeviceFloppy",
+    "folder": "IconFolderOpen",
+    "scale": "IconScale",
+    "edit": "IconEdit",
+    "ai": "IconSparkles",
+    "send": "IconSend",
 }
 
 
-class FaIcon(rx.Component):
-    """Font Awesome 6 icon, loaded from the react-icons/fa6 package."""
+class TablerIcon(rx.Component):
+    """Outline icon from the single Tabler Icons set used by the web UI."""
 
-    library = "react-icons/fa6"
-    tag = "FaCircleQuestion"
+    library = "@tabler/icons-react"
+    tag = "IconHelpCircle"
 
     size: rx.Var[int]
     color: rx.Var[str]
+    stroke_width: rx.Var[float]
 
     @classmethod
     def create(cls, **props):
         name = props.pop("tag", "")
-        props["tag"] = FA_ICON_MAP.get(name, "FaCircleQuestion")
+        props["tag"] = TABLER_ICON_MAP.get(name, "IconHelpCircle")
+        props.setdefault("stroke_width", 1.8)
         return super().create(**props)
 
 
-fa_icon = FaIcon.create
+fa_icon = TablerIcon.create
 
 
-ACCENT = "#1f883d"
-ACCENT_HOVER = "#1a7f37"
-# Сайдбар всегда тёмный (не зависит от переключателя светлой/тёмной темы) —
-# так задано в присланном макете.
-SIDEBAR_BG = "#0f172a"
-SIDEBAR_BORDER = "rgba(255, 255, 255, 0.06)"
-SIDEBAR_TEXT = "#e5e7eb"
-SIDEBAR_MUTED = "#8b95a5"
-SIDEBAR_HOVER = "#1a2436"
-SIDEBAR_SURFACE_ALT = "#141d2b"
+ACCENT = ui.PURPLE
+ACCENT_HOVER = ui.PURPLE_DARK
+SIDEBAR_BG = ui.PANEL
+SIDEBAR_BORDER = ui.LINE
+SIDEBAR_TEXT = ui.INK
+SIDEBAR_MUTED = ui.INK_2
+SIDEBAR_HOVER = ui.STATUS_GRAY_BG
+SIDEBAR_SURFACE_ALT = ui.PAGE
 MAIL_APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
 UPLOAD_ID = "order_upload"
 INVOICE_UPLOAD_ID = "invoice_upload"
@@ -265,11 +266,11 @@ NAV_ITEMS = [
 ]
 
 ICON_TINTS = {
-    "green": (ACCENT, "rgba(31, 136, 61, 0.16)"),
-    "blue": ("#2f6fed", "rgba(47, 111, 237, 0.16)"),
-    "violet": ("#7c5cff", "rgba(124, 92, 255, 0.16)"),
-    "amber": ("#f5a623", "rgba(245, 166, 35, 0.16)"),
-    "red": ("#e5484d", "rgba(229, 72, 77, 0.16)"),
+    "green": (ui.INK_2, ui.STATUS_GRAY_BG),
+    "blue": (ui.INK_2, ui.STATUS_GRAY_BG),
+    "violet": (ui.INK_2, ui.STATUS_GRAY_BG),
+    "amber": (ui.STATUS_AMBER_TEXT, ui.STATUS_AMBER_BG),
+    "red": (ui.STATUS_RED_TEXT, ui.STATUS_RED_BG),
 }
 
 SETTINGS_LABELS = {
@@ -2544,41 +2545,37 @@ class State(rx.State):
             self.is_processing = False
 
 
-def theme_value(light: str, dark: str):
-    return rx.cond(State.theme == "light", light, dark)
-
-
 def page_bg():
-    return theme_value("#f6f8fa", "#0b0f14")
+    return ui.PAGE
 
 
 def surface():
-    return theme_value("#ffffff", "#111820")
+    return ui.PANEL
 
 
 def surface_alt():
-    return theme_value("#f1f4f7", "#16212b")
+    return ui.STATUS_GRAY_BG
 
 
 def border():
-    return theme_value("#d9e1e8", "#24313d")
+    return ui.LINE
 
 
 def text():
-    return theme_value("#101820", "#f3f6f8")
+    return ui.INK
 
 
 def muted():
-    return theme_value("#66717d", "#8b98a5")
+    return ui.INK_2
 
 
 def button_base(**props):
     return {
-        "height": "38px",
-        "border_radius": "8px",
-        "font_weight": "700",
-        "transition": "160ms ease",
+        "height": "32px",
+        "border_radius": ui.RADIUS_CONTROL,
+        "font_weight": ui.FONT_WEIGHT_MEDIUM,
         "cursor": "pointer",
+        "class_name": "prototype-interactive",
         **props,
     }
 
@@ -2589,10 +2586,11 @@ def primary_button(label: str, on_click=None, width: str = "230px", disabled=Fal
         on_click=on_click,
         width=width,
         disabled=disabled,
-        color="white",
-        background=ACCENT,
-        _hover={"background": ACCENT_HOVER},
-        **button_base()
+        color=ui.WHITE,
+        background=ui.PURPLE,
+        border=f"1px solid {ui.PURPLE}",
+        _hover={"background": ui.PURPLE_DARK, "border_color": ui.PURPLE_DARK},
+        **button_base(),
     )
 
 
@@ -2602,11 +2600,28 @@ def secondary_button(label: str, on_click=None, width: str = "156px", disabled=F
         on_click=on_click,
         width=width,
         disabled=disabled,
-        color=text(),
-        background=surface_alt(),
-        border=f"1px solid {border()}",
-        _hover={"background": theme_value("#e4ebf1", "#223140")},
-        **button_base()
+        color=ui.INK,
+        background=ui.PANEL,
+        border=f"1px solid {ui.LINE}",
+        _hover={"background": ui.STATUS_GRAY_BG},
+        **button_base(),
+    )
+
+
+def icon_button(icon: str, on_click=None, label: str = "", disabled=False):
+    return rx.button(
+        fa_icon(tag=icon, size=16),
+        on_click=on_click,
+        disabled=disabled,
+        aria_label=label,
+        width="32px",
+        min_width="32px",
+        padding="0",
+        color=ui.INK_2,
+        background=ui.PANEL,
+        border=f"1px solid {ui.LINE}",
+        _hover={"background": ui.STATUS_GRAY_BG, "color": ui.INK},
+        **button_base(),
     )
 
 
@@ -2614,19 +2629,22 @@ def nav_button(label: str, icon: str):
     active = State.current_page == label
 
     children = [
-        fa_icon(tag=icon, size=17),
-        rx.text(label, font_size="14px"),
+        fa_icon(tag=icon, size=19),
+        rx.text(label, font_size=ui.FONT_SIZE_BODY),
     ]
     if label == "Почта":
         children.extend([
             rx.spacer(),
             rx.cond(
                 State.mail_new_orders_count > 0,
-                rx.badge(
+                rx.box(
                     State.mail_new_orders_count,
-                    color_scheme="red",
-                    variant="solid",
-                    border_radius="999px",
+                    color=ui.STATUS_RED_TEXT,
+                    background=ui.STATUS_RED_BG,
+                    border_radius=ui.RADIUS_PILL,
+                    padding="1px 7px",
+                    font_size=ui.FONT_SIZE_CAPTION,
+                    font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                 ),
                 rx.box(),
             ),
@@ -2637,11 +2655,12 @@ def nav_button(label: str, icon: str):
         on_click=State.set_page(label),
         width="100%",
         justify_content="flex-start",
-        gap="10px",
-        color=rx.cond(active, "white", SIDEBAR_MUTED),
-        background=rx.cond(active, ACCENT, "transparent"),
-        _hover={"background": rx.cond(active, ACCENT_HOVER, SIDEBAR_HOVER)},
-        **button_base(height="36px", font_weight=rx.cond(active, "700", "500"))
+        gap="8px",
+        color=rx.cond(active, ui.PURPLE, ui.INK_2),
+        background=rx.cond(active, ui.PURPLE_BG, ui.TRANSPARENT),
+        border="1px solid transparent",
+        _hover={"background": rx.cond(active, ui.PURPLE_BG, ui.STATUS_GRAY_BG)},
+        **button_base(font_weight=rx.cond(active, ui.FONT_WEIGHT_MEDIUM, ui.FONT_WEIGHT_REGULAR)),
     )
 
 
@@ -2651,76 +2670,139 @@ def segment_button(label: str, current, on_click):
     return rx.button(
         label,
         on_click=on_click,
-        height="36px",
-        min_width="96px",
-        border_radius="7px",
-        color=rx.cond(active, "white", muted()),
-        background=rx.cond(active, ACCENT, "transparent"),
-        border=rx.cond(active, f"1px solid {ACCENT}", "1px solid transparent"),
-        box_shadow=rx.cond(active, "0 0 0 3px rgba(31, 136, 61, 0.18)", "none"),
-        _hover={
-            "background": rx.cond(active, ACCENT_HOVER, theme_value("#e4ebf1", "#223140"))
-        },
-        font_weight=rx.cond(active, "700", "600"),
+        height="32px",
+        min_width="88px",
+        border_radius=ui.RADIUS_CONTROL,
+        color=rx.cond(active, ui.INK, ui.INK_2),
+        background=rx.cond(active, ui.PANEL, ui.TRANSPARENT),
+        border=rx.cond(active, f"1px solid {ui.LINE}", "1px solid transparent"),
+        _hover={"background": rx.cond(active, ui.PANEL, ui.STATUS_GRAY_BG)},
+        font_weight=rx.cond(active, ui.FONT_WEIGHT_MEDIUM, ui.FONT_WEIGHT_REGULAR),
+        class_name="prototype-interactive",
     )
 
 
 def segmented_control(values: list[str], current, setter):
     return rx.hstack(
-        *[
-            segment_button(value, current, setter(value))
-            for value in values
-        ],
+        *[segment_button(value, current, setter(value)) for value in values],
         spacing="1",
-        padding="4px",
-        border=f"1px solid {border()}",
-        border_radius="10px",
-        background=surface_alt(),
+        padding="3px",
+        border=f"1px solid {ui.LINE}",
+        border_radius=ui.RADIUS_CONTROL,
+        background=ui.STATUS_GRAY_BG,
         width="fit-content",
     )
 
 
-def muted_text(*parts, size="12px"):
-    return rx.text(*parts, color=muted(), font_size=size)
+def muted_text(*parts, size=ui.FONT_SIZE_LABEL):
+    return rx.text(*parts, color=ui.INK_2, font_size=size)
+
+
+def metric_card(label: str, value, supporting=None, value_color=ui.INK):
+    return rx.vstack(
+        rx.text(label, color=ui.INK_2, font_size=ui.FONT_SIZE_LABEL),
+        rx.text(
+            value,
+            color=value_color,
+            font_size=ui.FONT_SIZE_METRIC,
+            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
+            line_height="1.15",
+        ),
+        supporting or rx.box(),
+        align="start",
+        spacing="1",
+        padding="14px 16px",
+        border=f"1px solid {ui.LINE}",
+        border_radius=ui.RADIUS_CARD,
+        background=ui.PANEL,
+        width="100%",
+    )
 
 
 def stat_card(icon: str, tint_key: str, title: str, value, hint_node):
-    color, tint_bg = ICON_TINTS[tint_key]
+    """Backward-compatible wrapper while remaining screens migrate to metric_card."""
 
-    return rx.hstack(
+    del icon, tint_key
+    return metric_card(title, value, hint_node)
+
+
+def _pill(label, background, color):
+    return rx.text(
+        label,
+        color=color,
+        background=background,
+        font_size=ui.FONT_SIZE_LABEL,
+        font_weight=ui.FONT_WEIGHT_MEDIUM,
+        padding="3px 10px",
+        border_radius=ui.RADIUS_PILL,
+        white_space="nowrap",
+    )
+
+
+def status_pill(status):
+    """One status component for all screens, using the defined color pairs."""
+
+    return rx.match(
+        status,
+        ("В работе", _pill(status, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
+        ("В пути", _pill(status, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
+        ("Требует внимания", _pill(status, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
+        ("Отгружен", _pill(status, ui.STATUS_GREEN_BG, ui.STATUS_GREEN_TEXT)),
+        ("Подтверждено", _pill(status, ui.STATUS_GREEN_BG, ui.STATUS_GREEN_TEXT)),
+        ("Просрочен", _pill(status, ui.STATUS_RED_BG, ui.STATUS_RED_TEXT)),
+        ("Ошибка", _pill(status, ui.STATUS_RED_BG, ui.STATUS_RED_TEXT)),
+        _pill(status, ui.STATUS_GRAY_BG, ui.STATUS_GRAY_TEXT),
+    )
+
+
+def driver_avatar(initials, assigned=True):
+    return rx.cond(
+        assigned,
         rx.box(
-            fa_icon(tag=icon, size=17, color=color),
-            display="flex",
+            initials,
+            display="inline-flex",
             align_items="center",
             justify_content="center",
-            width="38px",
-            height="38px",
-            min_width="38px",
-            border_radius="11px",
-            background=tint_bg,
+            width="24px",
+            height="24px",
+            min_width="24px",
+            border_radius="50%",
+            color=ui.PURPLE_DARK,
+            background=ui.PURPLE_BG,
+            font_size="10px",
+            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
         ),
-        rx.vstack(
-            rx.text(value, color=text(), font_size="22px", font_weight="800", line_height="1.1"),
-            rx.text(title, color=muted(), font_size="12px", font_weight="600"),
-            hint_node,
-            align="start",
-            spacing="1",
+        rx.box(
+            "+",
+            display="inline-flex",
+            align_items="center",
+            justify_content="center",
+            width="24px",
+            height="24px",
+            min_width="24px",
+            border=f"1px dashed {ui.LINE_STRONG}",
+            border_radius="50%",
+            color=ui.INK_3,
+            font_size=ui.FONT_SIZE_BODY,
         ),
-        spacing="3",
-        align="center",
-        padding="14px",
-        border=f"1px solid {border()}",
-        border_radius="14px",
-        background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
+    )
+
+
+def table_container(*children):
+    return rx.box(
+        *children,
         width="100%",
+        overflow="hidden",
+        background=ui.PANEL,
+        border=f"1px solid {ui.LINE}",
+        border_radius=ui.RADIUS_CARD,
     )
 
 
 def sidebar_logo():
     return rx.hstack(
         rx.box(
-            fa_icon(tag="boxes", size=16, color="white"),
+            fa_icon(tag="boxes", size=16, color=ui.WHITE),
             display="flex",
             align_items="center",
             justify_content="center",
@@ -2809,12 +2891,12 @@ def upload_area():
                 background=ICON_TINTS["green"][1],
             ),
             rx.vstack(
-                rx.text("1. Выберите Excel-файл", color=text(), font_size="15px", font_weight="800"),
+                rx.text("1. Выберите Excel-файл", color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.text(f"Поддерживаются форматы: {SUPPORTED_EXCEL_LABEL}", color=muted(), font_size="12px"),
                 rx.vstack(
                     rx.foreach(
                         rx.selected_files(UPLOAD_ID),
-                        lambda file: rx.text(file, color=ACCENT, font_size="13px", font_weight="700"),
+                        lambda file: rx.text(file, color=ACCENT, font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                     ),
                     align="start",
                     spacing="1",
@@ -2857,7 +2939,7 @@ def order_panel():
         upload_area(),
         rx.hstack(
             rx.vstack(
-                rx.text("2. Загрузите выбранный файл", color=text(), font_size="14px", font_weight="800"),
+                rx.text("2. Загрузите выбранный файл", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.text("После загрузки файл будет доступен для обработки.", color=muted(), font_size="12px"),
                 align="start",
                 spacing="1",
@@ -2878,21 +2960,21 @@ def order_panel():
         rx.cond(
             State.duplicate_note != "",
             rx.hstack(
-                fa_icon(tag="triangle_alert", size=15, color="#f5a623"),
+                fa_icon(tag="triangle_alert", size=15, color=ui.STATUS_AMBER_TEXT),
                 rx.text(State.duplicate_note, color=text(), font_size="12px"),
                 spacing="2",
                 align="center",
                 width="100%",
                 padding="10px 14px",
-                border="1px solid rgba(245, 166, 35, 0.35)",
+                border=f"1px solid {ui.LINE}",
                 border_radius="10px",
-                background="rgba(245, 166, 35, 0.10)",
+                background=ui.STATUS_AMBER_BG,
             ),
             rx.box(),
         ),
         rx.hstack(
             rx.vstack(
-                rx.text("3. Режим обработки", color=text(), font_size="14px", font_weight="800"),
+                rx.text("3. Режим обработки", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 segmented_control(["Город", "Область"], State.mode, State.set_mode),
                 rx.cond(
                     State.mode_auto_note != "",
@@ -2945,7 +3027,6 @@ def order_panel():
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -2953,7 +3034,7 @@ def order_panel():
 def result_metric(label: str, value):
     return rx.vstack(
         rx.text(label, color=muted(), font_size="12px"),
-        rx.text(value, color=text(), font_size="22px", font_weight="800"),
+        rx.text(value, color=text(), font_size="22px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         align="start",
         spacing="1",
         padding="14px",
@@ -2966,9 +3047,9 @@ def result_metric(label: str, value):
 
 def route_result(label: str, value):
     return rx.hstack(
-        rx.text(label, color=text(), font_size="14px", font_weight="700"),
+        rx.text(label, color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.spacer(),
-        rx.text(value, color=text(), font_size="14px", font_weight="800"),
+        rx.text(value, color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         width="100%",
         padding="11px 12px",
         border_radius="9px",
@@ -2979,7 +3060,7 @@ def route_result(label: str, value):
 def preview_metric(label: str, value):
     return rx.vstack(
         rx.text(label, color=muted(), font_size="12px"),
-        rx.text(value, color=text(), font_size="20px", font_weight="800"),
+        rx.text(value, color=text(), font_size="20px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         align="start",
         spacing="1",
         padding="12px",
@@ -3009,14 +3090,14 @@ def order_preview_panel():
             width="100%",
             align="center",
         ),
-        rx.text(State.preview_file_info, color=text(), font_size="13px", font_weight="700"),
+        rx.text(State.preview_file_info, color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.text(State.preview_sheet_info, color=muted(), font_size="12px"),
         rx.text(
             "Режим: ",
             State.preview_mode,
             color=text(),
             font_size="13px",
-            font_weight="700",
+            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
         ),
         rx.text(
             rx.cond(
@@ -3036,7 +3117,7 @@ def order_preview_panel():
             width="100%",
         ),
         rx.vstack(
-            rx.text("По маршрутам", color=text(), font_size="13px", font_weight="800"),
+            rx.text("По маршрутам", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.foreach(
                 State.preview_route_rows,
                 lambda route: rx.text(route, color=text(), font_size="13px"),
@@ -3048,7 +3129,7 @@ def order_preview_panel():
         rx.cond(
             State.preview_found_stores.length() > 0,
             rx.vstack(
-                rx.text("Найденные магазины", color=text(), font_size="13px", font_weight="800"),
+                rx.text("Найденные магазины", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.foreach(
                     State.preview_found_stores,
                     lambda store: rx.text(store, color=muted(), font_size="12px"),
@@ -3062,7 +3143,7 @@ def order_preview_panel():
         rx.cond(
             State.preview_warnings.length() > 0,
             rx.vstack(
-                rx.text("Предупреждения", color="#f5a623", font_size="13px", font_weight="800"),
+                rx.text("Предупреждения", color=ui.STATUS_AMBER_TEXT, font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.foreach(
                     State.preview_warnings,
                     lambda warning: rx.text(f"⚠ {warning}", color=text(), font_size="12px"),
@@ -3071,16 +3152,16 @@ def order_preview_panel():
                 spacing="1",
                 width="100%",
                 padding="10px 12px",
-                border="1px solid rgba(245, 166, 35, 0.35)",
+                border=f"1px solid {ui.LINE}",
                 border_radius="10px",
-                background="rgba(245, 166, 35, 0.10)",
+                background=ui.STATUS_AMBER_BG,
             ),
             rx.box(),
         ),
         rx.cond(
             State.preview_unknown_stores.length() > 0,
             rx.vstack(
-                rx.text("Неизвестные магазины", color=text(), font_size="13px", font_weight="800"),
+                rx.text("Неизвестные магазины", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.foreach(
                     State.preview_unknown_stores,
                     lambda store: rx.text(store, color=muted(), font_size="12px"),
@@ -3094,7 +3175,7 @@ def order_preview_panel():
         rx.cond(
             State.preview_conflicts.length() > 0,
             rx.vstack(
-                rx.text("Конфликты", color=text(), font_size="13px", font_weight="800"),
+                rx.text("Конфликты", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.foreach(
                     State.preview_conflicts,
                     lambda item: rx.text(item, color=muted(), font_size="12px"),
@@ -3172,7 +3253,6 @@ def history_panel():
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -3191,7 +3271,7 @@ def history_row(filename, time):
             background=surface(),
         ),
         rx.vstack(
-            rx.text(filename, color=text(), font_weight="700", font_size="14px"),
+            rx.text(filename, color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, font_size="14px"),
             rx.text("Обработка заказа", color=muted(), font_size="12px"),
             align="start",
             spacing="1",
@@ -3206,7 +3286,7 @@ def history_row(filename, time):
         background=surface_alt(),
         cursor="pointer",
         on_click=State.open_order_details(filename, time),
-        _hover={"background": theme_value("#e8edf2", "#1c2a36")},
+        _hover={"background": ui.STATUS_GRAY_BG},
     )
 
 
@@ -3246,7 +3326,6 @@ def panel_shell(*children):
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -3352,7 +3431,7 @@ def overview_page():
 
 def route_driver_row(index: int, area: str):
     return rx.hstack(
-        rx.text(f"Маршрут №{index + 1}", color=text(), font_size="13px", font_weight="700", min_width="110px"),
+        rx.text(f"Маршрут №{index + 1}", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD, min_width="110px"),
         rx.text(area, color=muted(), font_size="12px", min_width="150px"),
         rx.input(
             value=State.route_driver_names[index],
@@ -3433,7 +3512,7 @@ def weight_field(
     input_type: str = "text",
 ):
     return rx.vstack(
-        rx.text(label, color=text(), font_size="12px", font_weight="700"),
+        rx.text(label, color=text(), font_size="12px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.input(
             value=value,
             on_change=on_change,
@@ -3451,7 +3530,7 @@ def weight_field(
 
 def weight_select_field(label: str, value, on_change, items):
     return rx.vstack(
-        rx.text(label, color=text(), font_size="12px", font_weight="700"),
+        rx.text(label, color=text(), font_size="12px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.select(
             items,
             value=value,
@@ -3467,7 +3546,7 @@ def weight_select_field(label: str, value, on_change, items):
 
 def weight_stat(label: str, *value_parts):
     return rx.vstack(
-        rx.text(*value_parts, color=text(), font_size="14px", font_weight="800"),
+        rx.text(*value_parts, color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.text(label, color=muted(), font_size="11px"),
         align="start",
         spacing="0",
@@ -3478,7 +3557,7 @@ def weight_stat(label: str, *value_parts):
 def weight_row(item):
     return rx.hstack(
         rx.vstack(
-            rx.text(item["name"], color=text(), font_weight="700", font_size="14px"),
+            rx.text(item["name"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, font_size="14px"),
             rx.text(item["date"], color=muted(), font_size="11px"),
             align="start",
             spacing="1",
@@ -3518,7 +3597,7 @@ def weight_row(item):
             rx.hstack(
                 rx.text("Удалить?", color=muted(), font_size="12px"),
                 rx.button(
-                    fa_icon(tag="circle_check", size=15, color="#e5484d"),
+                    fa_icon(tag="circle_check", size=15, color=ui.STATUS_RED_TEXT),
                     on_click=State.confirm_delete_weight_row,
                     size="1",
                     variant="ghost",
@@ -3603,7 +3682,6 @@ def weight_draft_row(item):
                     background=surface(),
                     border=f"1px solid {border()}",
                     border_radius="8px",
-                    box_shadow="0 8px 20px rgba(16, 24, 32, 0.18)",
                     padding="4px",
                     spacing="0",
                     z_index="20",
@@ -3710,7 +3788,7 @@ def weight_page():
                             on_click=State.toggle_weight_suggestions,
                             color=ACCENT,
                             font_size="12px",
-                            font_weight="700",
+                            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                             cursor="pointer",
                         ),
                         spacing="3",
@@ -3739,7 +3817,7 @@ def weight_page():
             rx.hstack(
                 secondary_button("+ Добавить строку", on_click=State.add_weight_draft_row, width="180px"),
                 primary_button("Сохранить всё", on_click=State.submit_weight_draft_rows, width="160px"),
-                rx.text(State.weight_status, color="#e5484d", font_size="13px"),
+                rx.text(State.weight_status, color=ui.STATUS_RED_TEXT, font_size="13px"),
                 spacing="4",
                 align="center",
             ),
@@ -3748,7 +3826,7 @@ def weight_page():
             rx.hstack(
                 panel_title("list", "Записи"),
                 rx.spacer(),
-                rx.text("Чистый вес по списку: ", State.weight_total, " кг", color=text(), font_size="13px", font_weight="700"),
+                rx.text("Чистый вес по списку: ", State.weight_total, " кг", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 width="100%",
                 align="center",
             ),
@@ -3787,7 +3865,7 @@ def weight_page():
                     stat_card(
                         "triangle_alert", "red", "Разница",
                         State.weight_reconciliation["difference"] + " кг",
-                        rx.text("Не сошлось — проверьте позиции", color="#e5484d", font_size="11px", font_weight="700"),
+                        rx.text("Не сошлось — проверьте позиции", color=ui.STATUS_RED_TEXT, font_size="11px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                     ),
                     stat_card(
                         "circle_check", "green", "Разница",
@@ -3864,7 +3942,7 @@ def invoice_ocr_line(item):
 def invoice_ocr_journal_row(item):
     return rx.hstack(
         rx.vstack(
-            rx.text(item["order_file"], color=text(), font_weight="700", font_size="13px"),
+            rx.text(item["order_file"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, font_size="13px"),
             rx.text(item["saved_at"], color=muted(), font_size="11px"),
             align="start",
             spacing="1",
@@ -3923,7 +4001,7 @@ def invoice_ocr_page():
             rx.upload(
                 rx.vstack(
                     fa_icon(tag="camera", size=24, color=ACCENT),
-                    rx.text("Выберите фотографии JPG, PNG или WEBP", color=text(), font_weight="700"),
+                    rx.text("Выберите фотографии JPG, PNG или WEBP", color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                     rx.text(
                         f"До {MAX_PHOTOS} фотографий, не более 10 МБ каждая. OCR запускается только после нажатия кнопки.",
                         color=muted(),
@@ -3977,17 +4055,17 @@ def invoice_ocr_page():
                 rx.hstack(
                     panel_title("list", "3. Проверка перед сохранением"),
                     rx.spacer(),
-                    rx.text("Итого: ", State.invoice_ocr_total, color=text(), font_weight="800"),
+                    rx.text("Итого: ", State.invoice_ocr_total, color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                     width="100%",
                     align="center",
                 ),
                 rx.text(
                     "OCR может ошибаться. Проверьте все наименования, единицы, количество, цены и суммы.",
-                    color="#b45309",
+                    color=ui.STATUS_AMBER_TEXT,
                     font_size="12px",
-                    font_weight="700",
+                    font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                 ),
-                rx.text("Исходный текст OCR", color=text(), font_size="13px", font_weight="700"),
+                rx.text("Исходный текст OCR", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.box(
                     rx.text(
                         State.invoice_ocr_raw_text,
@@ -4059,8 +4137,8 @@ def invoice_ocr_page():
 def order_invoice_row(item, linked: bool):
     return rx.vstack(
         rx.hstack(
-            fa_icon(tag="file_pdf", size=16, color="#3b82f6"),
-            rx.text(item["file"], color=text(), font_size="13px", font_weight="700"),
+            fa_icon(tag="file_pdf", size=16, color=ui.STATUS_BLUE_TEXT),
+            rx.text(item["file"], color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.spacer(),
             rx.text(item["received"], color=muted(), font_size="11px"),
             width="100%",
@@ -4119,14 +4197,14 @@ def order_details_drawer():
             rx.box(
                 position="fixed",
                 inset="0",
-                background="rgba(0, 0, 0, 0.48)",
+                background=ui.OVERLAY,
                 z_index="90",
                 on_click=State.close_order_details,
             ),
             rx.vstack(
                 rx.hstack(
                     rx.vstack(
-                        rx.text("ЗАКАЗ", color=muted(), font_size="11px", font_weight="700"),
+                        rx.text("ЗАКАЗ", color=muted(), font_size="11px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                         rx.heading(State.selected_order, color=text(), size="5"),
                         rx.text(
                             State.selected_order_time_label,
@@ -4251,7 +4329,6 @@ def order_details_drawer():
                 padding="18px",
                 background=surface(),
                 border_left=f"1px solid {border()}",
-                box_shadow="-16px 0 40px rgba(0, 0, 0, 0.22)",
                 z_index="100",
             ),
         ),
@@ -4272,7 +4349,7 @@ def mail_setup_hint():
                 "Электронная почта",
                 color=text(),
                 font_size="13px",
-                font_weight="700",
+                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
             ),
             rx.input(
                 value=State.mail_email,
@@ -4291,7 +4368,7 @@ def mail_setup_hint():
                 "Ключ приложения (пароль приложения)",
                 color=text(),
                 font_size="13px",
-                font_weight="700",
+                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
             ),
             rx.input(
                 value=State.mail_app_password,
@@ -4335,7 +4412,7 @@ def mail_setup_hint():
                 target="_blank",
                 color=ACCENT,
                 font_size="13px",
-                font_weight="700",
+                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                 text_decoration="none",
             ),
             gap="16px",
@@ -4350,7 +4427,7 @@ def mail_setup_hint():
                 color=rx.cond(
                     State.mail_credentials_status == "Данные почты сохранены",
                     ACCENT,
-                    "#e5484d",
+                    ui.STATUS_RED_TEXT,
                 ),
                 font_size="12px",
             ),
@@ -4369,13 +4446,13 @@ def mail_verdict_badge(is_order):
         is_order,
         rx.hstack(
             fa_icon(tag="circle_check", size=13, color=ACCENT),
-            rx.text("Похоже на заказ", color=ACCENT, font_size="12px", font_weight="700"),
+            rx.text("Похоже на заказ", color=ACCENT, font_size="12px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             spacing="2",
             align="center",
         ),
         rx.hstack(
-            fa_icon(tag="circle_x", size=13, color="#e5484d"),
-            rx.text("Не заказ", color="#e5484d", font_size="12px", font_weight="700"),
+            fa_icon(tag="circle_x", size=13, color=ui.STATUS_RED_TEXT),
+            rx.text("Не заказ", color=ui.STATUS_RED_TEXT, font_size="12px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             spacing="2",
             align="center",
         ),
@@ -4394,7 +4471,7 @@ def mail_item_row(item):
                     fa_icon(tag="mail", size=15, color=muted()),
                 ),
             ),
-            rx.text(item["file"], color=text(), font_size="14px", font_weight="700"),
+            rx.text(item["file"], color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.spacer(),
             rx.cond(
                 item["is_invoice"],
@@ -4461,7 +4538,7 @@ def mail_item_row(item):
                 ),
                 rx.cond(
                     item["reason"] != "",
-                    rx.text(item["reason"], color="#e5484d", font_size="12px"),
+                    rx.text(item["reason"], color=ui.STATUS_RED_TEXT, font_size="12px"),
                     rx.box(),
                 ),
             ),
@@ -4549,7 +4626,7 @@ def mail_page():
                     ),
                     rx.cond(
                         State.mail_error != "",
-                        rx.text(State.mail_error, color="#e5484d", font_size="12px"),
+                        rx.text(State.mail_error, color=ui.STATUS_RED_TEXT, font_size="12px"),
                         rx.box(),
                     ),
                 ),
@@ -4576,7 +4653,7 @@ def mail_page():
                             State.mail_notification,
                             color=ACCENT,
                             font_size="13px",
-                            font_weight="700",
+                            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                         ),
                     ),
                     rx.box(),
@@ -4605,7 +4682,7 @@ def mail_page():
                                             entry["operation"],
                                             color=text(),
                                             font_size="13px",
-                                            font_weight="700",
+                                            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                                         ),
                                         rx.spacer(),
                                         rx.text(
@@ -4617,7 +4694,7 @@ def mail_page():
                                     ),
                                     rx.text(
                                         entry["error"],
-                                        color="#e5484d",
+                                        color=ui.STATUS_RED_TEXT,
                                         font_size="12px",
                                     ),
                                     align="start",
@@ -4744,7 +4821,7 @@ def route_edit_card():
     return rx.vstack(
         rx.hstack(
             fa_icon(tag="route", size=15, color=text()),
-            rx.text(State.selected_route_label, color=text(), font_size="15px", font_weight="800"),
+            rx.text(State.selected_route_label, color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             spacing="2",
             align="center",
         ),
@@ -4780,7 +4857,6 @@ def route_edit_card():
         border=f"1px solid {border()}",
         border_radius="12px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -4869,8 +4945,8 @@ def tracking_legend():
             rx.cond(index < State.active_route_count, tracking_legend_dot(color, label), rx.box())
             for index, (label, color) in enumerate(zip(ROUTE_LABELS, ROUTE_COLORS))
         ],
-        tracking_legend_dot("#f5a623", "Резкий разгон"),
-        tracking_legend_dot("#e5484d", "Резкое торможение"),
+        tracking_legend_dot(ui.STATUS_AMBER_TEXT, "Резкий разгон"),
+        tracking_legend_dot(ui.STATUS_RED_TEXT, "Резкое торможение"),
         spacing="5",
         wrap="wrap",
         width="100%",
@@ -4900,7 +4976,6 @@ def tracking_map_panel():
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -4908,10 +4983,10 @@ def tracking_map_panel():
 def event_badge(flag):
     return rx.cond(
         flag == "harsh_brake",
-        rx.text("Резкое торможение", color="#e5484d", font_size="11px", font_weight="700"),
+        rx.text("Резкое торможение", color=ui.STATUS_RED_TEXT, font_size="11px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.cond(
             flag == "harsh_accel",
-            rx.text("Резкий разгон", color="#f5a623", font_size="11px", font_weight="700"),
+            rx.text("Резкий разгон", color=ui.STATUS_AMBER_TEXT, font_size="11px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.text("Плавно", color=muted(), font_size="11px"),
         ),
     )
@@ -4924,7 +4999,6 @@ def tracking_progress_bar(percent, color):
             height="100%",
             border_radius="6px",
             background=color,
-            transition="width 400ms ease",
         ),
         width="100%",
         height="8px",
@@ -4938,7 +5012,7 @@ def vehicle_card(v):
     return rx.vstack(
         rx.hstack(
             rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=v["color"]),
-            rx.text(v["label"], color=text(), font_size="14px", font_weight="800"),
+            rx.text(v["label"], color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.spacer(),
             event_badge(v["event_flag"]),
             width="100%",
@@ -4957,7 +5031,6 @@ def vehicle_card(v):
         border=f"1px solid {border()}",
         border_radius="12px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -4965,11 +5038,11 @@ def vehicle_card(v):
 def rating_row(v):
     return rx.hstack(
         rx.box(width="8px", height="8px", min_width="8px", border_radius="50%", background=v["color"]),
-        rx.text(v["label"], color=text(), font_size="13px", font_weight="700"),
+        rx.text(v["label"], color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         rx.spacer(),
         rx.text(v["harsh_count"], color=muted(), font_size="12px"),
         rx.text(" рывков", color=muted(), font_size="12px"),
-        rx.text(v["score"], color=text(), font_size="14px", font_weight="800"),
+        rx.text(v["score"], color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
         spacing="2",
         align="center",
         width="100%",
@@ -4998,7 +5071,6 @@ def rating_panel():
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -5031,7 +5103,6 @@ def event_log_panel():
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -5151,9 +5222,9 @@ def real_vehicle_card(v):
     return rx.vstack(
         rx.hstack(
             rx.box(width="10px", height="10px", min_width="10px", border_radius="50%", background=v["color"]),
-            rx.text(v["label"], color=text(), font_size="15px", font_weight="800"),
+            rx.text(v["label"], color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.spacer(),
-            rx.text(v["done_count"], color=text(), font_size="13px", font_weight="700"),
+            rx.text(v["done_count"], color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.text(" / ", color=muted(), font_size="13px"),
             rx.text(v["total_count"], color=muted(), font_size="13px"),
             width="100%",
@@ -5178,7 +5249,6 @@ def real_vehicle_card(v):
         border=f"1px solid {border()}",
         border_radius="12px",
         background=surface(),
-        box_shadow=theme_value("0 1px 3px rgba(16, 24, 32, 0.06)", "none"),
         width="100%",
     )
 
@@ -5224,7 +5294,7 @@ def tracking_page():
 def settings_toggle_row(label, hint, value, on_change):
     return rx.hstack(
         rx.vstack(
-            rx.text(label, color=text(), font_size="14px", font_weight="700"),
+            rx.text(label, color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.text(hint, color=muted(), font_size="12px"),
             align="start",
             spacing="1",
@@ -5319,7 +5389,7 @@ def version_page():
                             color=muted(),
                             font_size="12px",
                         ),
-                        rx.text(State.current_version, color=text(), font_weight="700"),
+                        rx.text(State.current_version, color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                         align="start",
                         spacing="1",
                     ),
@@ -5336,7 +5406,7 @@ def version_page():
                         rx.text(
                             rx.cond(State.remote_version != "", State.remote_version, "—"),
                             color=text(),
-                            font_weight="700",
+                            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                         ),
                         align="start",
                         spacing="1",
@@ -5411,9 +5481,9 @@ def backup_item_row(item):
             rx.cond(
                 item["valid"],
                 fa_icon(tag="circle_check", size=16, color=ACCENT),
-                fa_icon(tag="triangle_alert", size=16, color="#e5484d"),
+                fa_icon(tag="triangle_alert", size=16, color=ui.STATUS_RED_TEXT),
             ),
-            rx.text(item["name"], color=text(), font_size="13px", font_weight="700"),
+            rx.text(item["name"], color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.spacer(),
             rx.text(item["created_at"], color=muted(), font_size="11px"),
             width="100%",
@@ -5429,7 +5499,7 @@ def backup_item_row(item):
                     item["contains_secrets"],
                     rx.text(
                         "Содержит config/mail.json — в архиве может быть пароль приложения",
-                        color="#f5a623",
+                        color=ui.STATUS_AMBER_TEXT,
                         font_size="12px",
                     ),
                     rx.box(),
@@ -5438,7 +5508,7 @@ def backup_item_row(item):
                 wrap="wrap",
                 width="100%",
             ),
-            rx.text(item["error"], color="#e5484d", font_size="12px"),
+            rx.text(item["error"], color=ui.STATUS_RED_TEXT, font_size="12px"),
         ),
         align="start",
         spacing="2",
@@ -5546,9 +5616,9 @@ def backup_page():
                 rx.vstack(
                     rx.text(
                         "Внимание: восстановление заменит текущую статистику, историю почты, списки маршрутов и настройки. Перед заменой будет создана страховочная копия текущего состояния.",
-                        color="#f5a623",
+                        color=ui.STATUS_AMBER_TEXT,
                         font_size="13px",
-                        font_weight="700",
+                        font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                     ),
                     rx.hstack(
                         primary_button(
@@ -5567,9 +5637,9 @@ def backup_page():
                     spacing="3",
                     width="100%",
                     padding="12px",
-                    border="1px solid rgba(245, 166, 35, 0.35)",
+                    border=f"1px solid {ui.LINE}",
                     border_radius="9px",
-                    background="rgba(245, 166, 35, 0.10)",
+                    background=ui.STATUS_AMBER_BG,
                 ),
                 rx.box(),
             ),
@@ -5732,7 +5802,7 @@ def help_chat_message_bubble(message):
     return rx.box(
         rx.text(
             message["content"],
-            color=rx.cond(is_user, "white", text()),
+            color=rx.cond(is_user, ui.WHITE, text()),
             font_size="13px",
             white_space="pre-wrap",
         ),
@@ -5751,7 +5821,7 @@ def help_chat_widget():
             rx.vstack(
                 rx.hstack(
                     fa_icon(tag="ai", size=15, color=ACCENT),
-                    rx.text("Чат-помощник", color=text(), font_weight="700", font_size="14px"),
+                    rx.text("Чат-помощник", color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, font_size="14px"),
                     rx.spacer(),
                     rx.button(
                         fa_icon(tag="x", size=13),
@@ -5789,7 +5859,7 @@ def help_chat_widget():
                 ),
                 rx.cond(
                     State.help_chat_status != "",
-                    rx.text(State.help_chat_status, color="#e5484d", font_size="12px"),
+                    rx.text(State.help_chat_status, color=ui.STATUS_RED_TEXT, font_size="12px"),
                     rx.box(),
                 ),
                 rx.hstack(
@@ -5805,7 +5875,7 @@ def help_chat_widget():
                         fa_icon(tag="send", size=14),
                         on_click=State.send_help_chat_message,
                         disabled=State.help_chat_busy,
-                        **button_base(height="38px", background=ACCENT, color="white"),
+                        **button_base(height="38px", background=ACCENT, color=ui.WHITE),
                     ),
                     width="100%",
                     align="center",
@@ -5817,7 +5887,6 @@ def help_chat_widget():
                 border_radius="14px",
                 background=surface(),
                 border=f"1px solid {border()}",
-                box_shadow="0 12px 36px rgba(0, 0, 0, 0.3)",
                 position="fixed",
                 bottom="92px",
                 right="24px",
@@ -5826,7 +5895,7 @@ def help_chat_widget():
             rx.box(),
         ),
         rx.button(
-            fa_icon(tag="ai", size=22, color="white"),
+            fa_icon(tag="ai", size=22, color=ui.WHITE),
             on_click=State.toggle_help_chat,
             position="fixed",
             bottom="24px",
@@ -5835,7 +5904,6 @@ def help_chat_widget():
             height="56px",
             border_radius="999px",
             background=ACCENT,
-            box_shadow="0 8px 24px rgba(0, 0, 0, 0.35)",
             cursor="pointer",
             z_index="999",
             _hover={"background": ACCENT_HOVER},
@@ -5959,8 +6027,8 @@ class DriverState(rx.State):
 
 def driver_vehicle_button(key, label, color):
     return rx.button(
-        fa_icon(tag="truck", size=22, color="white"),
-        rx.text(label, font_size="17px", font_weight="800", color="white"),
+        fa_icon(tag="truck", size=22, color=ui.WHITE),
+        rx.text(label, font_size="17px", font_weight=ui.FONT_WEIGHT_SEMIBOLD, color=ui.WHITE),
         on_click=DriverState.select_vehicle(key, label),
         width="100%",
         height="76px",
@@ -6024,8 +6092,8 @@ def driver_upload_box():
                 width="100%",
                 border_radius="9px",
                 background=ACCENT,
-                color="white",
-                font_weight="700",
+                color=ui.WHITE,
+                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                 cursor="pointer",
             ),
             rx.button(
@@ -6063,7 +6131,7 @@ def driver_stop_card(stop):
                 fa_icon(tag="circle_check", size=20, color=ACCENT),
                 fa_icon(tag="circle", size=20, color=muted()),
             ),
-            rx.text(stop["name"], color=text(), font_size="16px", font_weight="700"),
+            rx.text(stop["name"], color=text(), font_size="16px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.spacer(),
             rx.cond(
                 stop["status"] == "done",
@@ -6091,8 +6159,8 @@ def driver_stop_card(stop):
                     height="46px",
                     border_radius="9px",
                     background=ACCENT,
-                    color="white",
-                    font_weight="700",
+                    color=ui.WHITE,
+                    font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                     cursor="pointer",
                 ),
             ),
@@ -6155,18 +6223,16 @@ def driver_page():
 app = rx.App(
     api_transformer=custom_api,
     stylesheets=[
-        "https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700;800&display=swap",
-        # Единый вид скроллбаров (светлая/тёмная тема, включая прокрутку
-        # всей страницы) — обычный статический файл в assets/, а не
-        # App.style: App.style компилируется в theme.js вне React-дерева,
-        # где привязка к State.theme ломает страницу ("State is not
-        # defined"), а вложенный ("&::-webkit-scrollbar") селектор всё
-        # равно не достаёт html/body — они предок обёртки, а не потомок.
+        "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap",
+        "/theme.css",
         "/scrollbar.css",
     ],
     style={
-        "font_family": "'Roboto', sans-serif",
-        "--default-font-family": "'Roboto', sans-serif",
+        "font_family": ui.FONT_FAMILY,
+        "--default-font-family": ui.FONT_FAMILY,
+        "background": ui.PAGE,
+        "color": ui.INK,
+        "font_size": ui.FONT_SIZE_BODY,
     },
 )
 app.add_page(dashboard, route="/", title="Обработка заказов", on_load=State.load_history)
