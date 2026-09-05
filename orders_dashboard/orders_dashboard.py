@@ -184,6 +184,10 @@ TABLER_ICON_MAP = {
     "edit": "IconEdit",
     "ai": "IconSparkles",
     "send": "IconSend",
+    "warehouse": "IconBuildingWarehouse",
+    "search": "IconSearch",
+    "chevron_right": "IconChevronRight",
+    "chevron_down": "IconChevronDown",
 }
 
 
@@ -251,19 +255,55 @@ HELP_CHAT_MODEL_BY_LABEL = {"Sonnet": HELP_CHAT_MODEL_SONNET, "Haiku": HELP_CHAT
 HELP_CHAT_MODEL_OPTIONS = list(HELP_CHAT_MODEL_BY_LABEL)
 VERSION_HISTORY = load_changelog()
 
-NAV_ITEMS = [
-    ("Dashboard", "layout_dashboard"),
-    ("Заказы", "package"),
-    ("Почта", "mail"),
-    ("Маршруты", "route"),
-    ("Вес", "scale"),
-    ("OCR накладных", "camera"),
-    ("Трекинг", "truck"),
-    ("История", "history"),
-    ("Настройки", "settings"),
-    ("Версия", "info"),
-    ("Резервные копии", "save"),
+NAV_GROUPS = [
+    {"label": "Сводка", "icon": "layout_dashboard", "target": "Dashboard"},
+    {"label": "Заказы", "icon": "package", "target": "Заказы"},
+    {"label": "Рейсы", "icon": "route", "target": "Маршруты"},
+    {"label": "Накладные", "icon": "file_spreadsheet", "target": "OCR накладных"},
+    {"label": "Вес", "icon": "scale", "target": "Вес"},
+    {"label": "Настройки", "icon": "settings", "target": "Настройки"},
 ]
+
+PAGE_GROUPS = {
+    "Dashboard": "Сводка",
+    "Заказы": "Заказы",
+    "Почта": "Заказы",
+    "История": "Заказы",
+    "Маршруты": "Рейсы",
+    "Трекинг": "Рейсы",
+    "OCR накладных": "Накладные",
+    "Вес": "Вес",
+    "Настройки": "Настройки",
+    "Резервные копии": "Настройки",
+    "Версия": "Настройки",
+}
+
+PAGE_LABELS = {
+    "Dashboard": "Сводка дня",
+    **{page: page for page in PAGE_GROUPS if page != "Dashboard"},
+}
+
+GROUP_TABS = {
+    "Сводка": [{"label": "Сводка дня", "page": "Dashboard", "icon": "layout_dashboard"}],
+    "Заказы": [
+        {"label": "Заказы", "page": "Заказы", "icon": "package"},
+        {"label": "Почта", "page": "Почта", "icon": "mail"},
+        {"label": "История", "page": "История", "icon": "history"},
+    ],
+    "Рейсы": [
+        {"label": "Маршруты", "page": "Маршруты", "icon": "list"},
+        {"label": "Трекинг", "page": "Трекинг", "icon": "map"},
+    ],
+    "Накладные": [
+        {"label": "OCR накладных", "page": "OCR накладных", "icon": "camera"},
+    ],
+    "Вес": [{"label": "Вес", "page": "Вес", "icon": "scale"}],
+    "Настройки": [
+        {"label": "Настройки", "page": "Настройки", "icon": "settings"},
+        {"label": "Резервные копии", "page": "Резервные копии", "icon": "save"},
+        {"label": "Версия", "page": "Версия", "icon": "info"},
+    ],
+}
 
 ICON_TINTS = {
     "green": (ui.INK_2, ui.STATUS_GRAY_BG),
@@ -462,7 +502,6 @@ class State(rx.State):
     mode_auto_note: str = ""
     mode_detection_warning: str = ""
     duplicate_note: str = ""
-    theme: str = "light"
     status: str = "Ожидает загрузки файла"
     is_processing: bool = False
     is_previewing: bool = False
@@ -509,6 +548,8 @@ class State(rx.State):
     update_available: bool = False
 
     current_page: str = "Dashboard"
+    search_query: str = ""
+    nav_groups: list[dict] = NAV_GROUPS
 
     routes_source: str = "Область"
     # Списки по маршрутам (индексы 0..MAX_ROUTES-1 соответствуют ROUTE_KEYS);
@@ -632,6 +673,21 @@ class State(rx.State):
     help_chat_input: str = ""
     help_chat_busy: bool = False
     help_chat_status: str = ""
+
+    @rx.var
+    def current_group(self) -> str:
+        return PAGE_GROUPS.get(self.current_page, "Сводка")
+
+    @rx.var
+    def current_page_label(self) -> str:
+        return PAGE_LABELS.get(self.current_page, self.current_page)
+
+    @rx.var
+    def current_tabs(self) -> list[dict]:
+        return GROUP_TABS.get(self.current_group, GROUP_TABS["Сводка"])
+
+    def set_search_query(self, value: str):
+        self.search_query = value
 
     @rx.var
     def weight_visible_rows(self) -> list[dict]:
@@ -2377,12 +2433,6 @@ class State(rx.State):
         if self.uploaded_file_path:
             self.status = "Режим изменён. Постройте предварительный просмотр заново."
 
-    def set_theme(self, theme: str):
-        self.theme = theme
-
-    def set_dark_mode(self, enabled: bool):
-        self.theme = "dark" if enabled else "light"
-
     def preview_order(self):
         if not self.uploaded_file_path:
             self.status = "Сначала загрузите Excel-файл"
@@ -2799,80 +2849,197 @@ def table_container(*children):
     )
 
 
-def sidebar_logo():
-    return rx.hstack(
-        rx.box(
-            fa_icon(tag="boxes", size=16, color=ui.WHITE),
-            display="flex",
-            align_items="center",
-            justify_content="center",
-            width="30px",
-            height="30px",
-            border_radius="8px",
-            background=ACCENT,
-        ),
-        rx.vstack(
-            rx.heading("Orders", color=SIDEBAR_TEXT, size="4", line_height="1.1"),
-            rx.text("Обработка заказов v2.0", color=SIDEBAR_MUTED, font_size="10px"),
-            align="start",
-            spacing="0",
-        ),
-        spacing="3",
-        align="center",
-        width="100%",
+def navigation_icon(name, size=19):
+    return rx.match(
+        name,
+        ("layout_dashboard", fa_icon(tag="layout_dashboard", size=size)),
+        ("package", fa_icon(tag="package", size=size)),
+        ("route", fa_icon(tag="route", size=size)),
+        ("file_spreadsheet", fa_icon(tag="file_spreadsheet", size=size)),
+        ("scale", fa_icon(tag="scale", size=size)),
+        ("settings", fa_icon(tag="settings", size=size)),
+        ("mail", fa_icon(tag="mail", size=size)),
+        ("history", fa_icon(tag="history", size=size)),
+        ("list", fa_icon(tag="list", size=size)),
+        ("map", fa_icon(tag="map", size=size)),
+        ("camera", fa_icon(tag="camera", size=size)),
+        ("save", fa_icon(tag="save", size=size)),
+        ("info", fa_icon(tag="info", size=size)),
+        fa_icon(tag="circle", size=size),
     )
 
 
-def theme_switch_row():
-    return rx.hstack(
-        rx.cond(
-            State.theme == "light",
-            fa_icon(tag="sun", size=16, color=SIDEBAR_MUTED),
-            fa_icon(tag="moon", size=16, color=SIDEBAR_MUTED),
-        ),
-        rx.text("Тёмная тема", color=SIDEBAR_TEXT, font_size="13px", font_weight="600"),
-        rx.spacer(),
-        rx.switch(
-            checked=State.theme == "dark",
-            on_change=State.set_dark_mode,
-            color_scheme="green",
-        ),
-        width="100%",
-        align="center",
-        spacing="2",
-        padding="12px 14px",
-        border=f"1px solid {SIDEBAR_BORDER}",
-        border_radius="12px",
-        background=SIDEBAR_SURFACE_ALT,
+def sidebar_logo():
+    return rx.box(
+        "Э",
+        display="flex",
+        align_items="center",
+        justify_content="center",
+        width="32px",
+        height="32px",
+        min_height="32px",
+        color=ui.WHITE,
+        background=ui.PURPLE,
+        border_radius=ui.RADIUS_CONTROL,
+        font_size="15px",
+        font_weight=ui.FONT_WEIGHT_SEMIBOLD,
+        margin_bottom="8px",
+        aria_label="Склад",
+    )
+
+
+def rail_item(item):
+    active = State.current_group == item["label"]
+    return rx.button(
+        navigation_icon(item["icon"], 20),
+        rx.text(item["label"], class_name="app-rail-label", font_size="10px", line_height="1.1"),
+        on_click=State.set_page(item["target"]),
+        aria_label=item["label"],
+        width="52px",
+        min_width="52px",
+        height="52px",
+        padding="6px 2px",
+        display="flex",
+        flex_direction="column",
+        align_items="center",
+        justify_content="center",
+        gap="3px",
+        color=rx.cond(active, ui.PURPLE, ui.INK_2),
+        background=rx.cond(active, ui.PURPLE_BG, ui.TRANSPARENT),
+        border="1px solid transparent",
+        border_radius=ui.RADIUS_CONTROL,
+        font_weight=ui.FONT_WEIGHT_REGULAR,
+        _hover={"background": rx.cond(active, ui.PURPLE_BG, ui.STATUS_GRAY_BG)},
+        class_name="app-rail-item prototype-interactive",
     )
 
 
 def sidebar():
     return rx.vstack(
         sidebar_logo(),
-        rx.vstack(
-            rx.text("ГЛАВНОЕ МЕНЮ", color=SIDEBAR_MUTED, font_size="11px"),
-            rx.vstack(
-                *[nav_button(label, icon) for label, icon in NAV_ITEMS],
-                spacing="2",
-                width="100%",
-            ),
-            align="start",
-            spacing="3",
-            width="100%",
-        ),
-        theme_switch_row(),
-        align="start",
-        spacing="5",
-        width="216px",
-        min_width="216px",
+        rx.foreach(State.nav_groups, rail_item),
+        align="center",
+        spacing="1",
+        width="64px",
+        min_width="64px",
         height="100vh",
-        padding="20px 12px 14px",
-        background=SIDEBAR_BG,
-        border_right=f"1px solid {SIDEBAR_BORDER}",
+        padding="12px 0",
+        background=ui.PANEL,
+        border_right=f"1px solid {ui.LINE}",
         position="sticky",
         top="0",
         overflow_y="auto",
+        class_name="app-rail",
+    )
+
+
+def app_header():
+    return rx.hstack(
+        rx.hstack(
+            fa_icon(tag="warehouse", size=16, color=ui.INK_2),
+            rx.text("Склад", color=ui.INK_2),
+            fa_icon(tag="chevron_right", size=14, color=ui.INK_3),
+            rx.text(State.current_group, color=ui.INK_2),
+            fa_icon(tag="chevron_right", size=14, color=ui.INK_3),
+            rx.text(
+                State.current_page_label,
+                color=ui.INK,
+                font_weight=ui.FONT_WEIGHT_MEDIUM,
+            ),
+            spacing="2",
+            align="center",
+            min_width="0",
+        ),
+        rx.spacer(),
+        rx.cond(
+            (State.current_page == "Маршруты") | (State.current_page == "OCR накладных"),
+            rx.hstack(
+                fa_icon(tag="search", size=16, color=ui.INK_3),
+                rx.input(
+                    value=State.search_query,
+                    on_change=State.set_search_query,
+                    placeholder="Найти магазин или товар",
+                    variant="soft",
+                    border="0",
+                    background=ui.TRANSPARENT,
+                    width="100%",
+                    height="30px",
+                ),
+                width="220px",
+                height="32px",
+                padding="0 8px",
+                border=f"1px solid {ui.LINE}",
+                border_radius=ui.RADIUS_CONTROL,
+                background=ui.PAGE,
+                align="center",
+                spacing="1",
+                class_name="app-search",
+            ),
+            rx.box(),
+        ),
+        width="100%",
+        height="52px",
+        min_height="52px",
+        padding="0 16px",
+        background=ui.PANEL,
+        border_bottom=f"1px solid {ui.LINE}",
+        align="center",
+        spacing="3",
+    )
+
+
+def page_tab(item):
+    active = State.current_page == item["page"]
+    return rx.button(
+        navigation_icon(item["icon"], 16),
+        item["label"],
+        on_click=State.set_page(item["page"]),
+        height="44px",
+        padding="0 12px",
+        color=rx.cond(active, ui.INK, ui.INK_2),
+        background=ui.TRANSPARENT,
+        border="0",
+        border_bottom=rx.cond(active, f"2px solid {ui.PURPLE}", "2px solid transparent"),
+        border_radius="0",
+        font_weight=rx.cond(active, ui.FONT_WEIGHT_MEDIUM, ui.FONT_WEIGHT_REGULAR),
+        _hover={"color": ui.INK, "background": ui.TRANSPARENT},
+        white_space="nowrap",
+        class_name="prototype-interactive",
+    )
+
+
+def page_primary_action():
+    return rx.match(
+        State.current_page,
+        (
+            "Dashboard",
+            primary_button("Добавить заказ", on_click=State.set_page("Заказы"), width="150px"),
+        ),
+        (
+            "Маршруты",
+            primary_button("Добавить маршрут", on_click=State.add_route, width="170px"),
+        ),
+        rx.box(),
+    )
+
+
+def app_tabs():
+    return rx.hstack(
+        rx.hstack(
+            rx.foreach(State.current_tabs, page_tab),
+            spacing="0",
+            overflow_x="auto",
+            min_width="0",
+        ),
+        rx.spacer(),
+        page_primary_action(),
+        width="100%",
+        min_height="45px",
+        padding="0 16px",
+        background=ui.PANEL,
+        border_bottom=f"1px solid {ui.LINE}",
+        align="center",
+        spacing="3",
     )
 
 
@@ -3296,24 +3463,23 @@ def page_shell(*children):
         align="start",
         spacing="4",
         width="100%",
-        min_height="100vh",
-        padding="20px",
-        background=page_bg(),
+        max_width="1180px",
+        padding="18px 16px 40px",
+        background=ui.PAGE,
+        class_name="app-main-view",
     )
 
 
 def topbar(title: str, subtitle: str, actions=None):
+    del title
     return rx.hstack(
-        rx.vstack(
-            rx.heading(title, color=text(), size="6"),
-            rx.text(subtitle, color=muted(), font_size="12px"),
-            align="start",
-            spacing="1",
-        ),
+        rx.text(subtitle, color=ui.INK_2, font_size=ui.FONT_SIZE_LABEL),
         rx.spacer(),
         *(actions or []),
         width="100%",
+        min_height="32px",
         align="center",
+        spacing="3",
     )
 
 
@@ -3321,19 +3487,24 @@ def panel_shell(*children):
     return rx.vstack(
         *children,
         align="start",
-        spacing="4",
-        padding="18px",
-        border=f"1px solid {border()}",
-        border_radius="14px",
-        background=surface(),
+        spacing="3",
+        padding="16px",
+        border=f"1px solid {ui.LINE}",
+        border_radius=ui.RADIUS_CARD,
+        background=ui.PANEL,
         width="100%",
     )
 
 
 def panel_title(icon: str, title: str):
     return rx.hstack(
-        fa_icon(tag=icon, size=17, color=text()),
-        rx.heading(title, color=text(), size="4"),
+        fa_icon(tag=icon, size=16, color=ui.INK_2),
+        rx.text(
+            title,
+            color=ui.INK,
+            font_size=ui.FONT_SIZE_CARD_TITLE,
+            font_weight=ui.FONT_WEIGHT_SEMIBOLD,
+        ),
         spacing="2",
         align="center",
     )
@@ -5802,13 +5973,13 @@ def help_chat_message_bubble(message):
     return rx.box(
         rx.text(
             message["content"],
-            color=rx.cond(is_user, ui.WHITE, text()),
+            color=rx.cond(is_user, ui.PURPLE_DARK, text()),
             font_size="13px",
             white_space="pre-wrap",
         ),
         padding="8px 12px",
         border_radius="10px",
-        background=rx.cond(is_user, ACCENT, surface_alt()),
+        background=rx.cond(is_user, ui.PURPLE_BG, surface_alt()),
         max_width="85%",
         margin_left=rx.cond(is_user, "auto", "0"),
     )
@@ -5895,18 +6066,22 @@ def help_chat_widget():
             rx.box(),
         ),
         rx.button(
-            fa_icon(tag="ai", size=22, color=ui.WHITE),
+            fa_icon(tag="ai", size=20, color=ui.INK_2),
             on_click=State.toggle_help_chat,
             position="fixed",
             bottom="24px",
             right="24px",
-            width="56px",
-            height="56px",
-            border_radius="999px",
-            background=ACCENT,
+            width="48px",
+            height="48px",
+            border_radius=ui.RADIUS_PILL,
+            color=ui.INK_2,
+            background=ui.PANEL,
+            border=f"1px solid {ui.LINE}",
             cursor="pointer",
             z_index="999",
-            _hover={"background": ACCENT_HOVER},
+            _hover={"background": ui.STATUS_GRAY_BG, "color": ui.INK},
+            class_name="prototype-interactive",
+            aria_label="Открыть помощника",
         ),
     )
 
@@ -5915,11 +6090,22 @@ def dashboard():
     return rx.fragment(
         rx.hstack(
             sidebar(),
-            main_content(),
+            rx.vstack(
+                app_header(),
+                app_tabs(),
+                main_content(),
+                align="start",
+                spacing="0",
+                width="100%",
+                min_width="0",
+                min_height="100vh",
+                background=ui.PAGE,
+            ),
             align="start",
             spacing="0",
+            width="100%",
             min_height="100vh",
-            background=page_bg(),
+            background=ui.PAGE,
         ),
         order_details_drawer(),
         help_chat_widget(),
