@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import TypedDict
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import asyncio
@@ -305,13 +306,28 @@ GROUP_TABS = {
     ],
 }
 
-ICON_TINTS = {
-    "green": (ui.INK_2, ui.STATUS_GRAY_BG),
-    "blue": (ui.INK_2, ui.STATUS_GRAY_BG),
-    "violet": (ui.INK_2, ui.STATUS_GRAY_BG),
-    "amber": (ui.STATUS_AMBER_TEXT, ui.STATUS_AMBER_BG),
-    "red": (ui.STATUS_RED_TEXT, ui.STATUS_RED_BG),
-}
+
+
+class RouteStoreView(TypedDict):
+    name: str
+    status: str
+    done: bool
+
+
+class RouteGroupView(TypedDict):
+    index: int
+    label: str
+    area: str
+    title: str
+    point_count: int
+    point_count_label: str
+    driver: str
+    driver_initials: str
+    driver_assigned: bool
+    stores: list[RouteStoreView]
+    collapsed: bool
+    adding: bool
+
 
 SETTINGS_LABELS = {
     "open_file_after_processing": (
@@ -557,6 +573,8 @@ class State(rx.State):
     route_stores: list[list[str]] = [[] for _ in range(MAX_ROUTES)]
     active_route_count: int = DEFAULT_ROUTE_COUNT
     selected_route_index: int = 0
+    collapsed_route_indices: list[int] = []
+    route_add_index: int = -1
     new_store_input: str = ""
     routes_status: str = ""
     route_backup_labels: list[str] = []
@@ -1459,8 +1477,13 @@ class State(rx.State):
         data = load_stores(self.stores_file)
         self.route_stores = [list(data.get(key, [])) for key in ROUTE_KEYS]
         self.active_route_count = load_route_count()
+        drivers = load_route_drivers()
+        self.route_driver_names = [drivers.get(key, "----") for key in ROUTE_KEYS]
+        self.refresh_real_data()
+        self.search_query = ""
         if self.selected_route_index >= self.active_route_count:
             self.selected_route_index = 0
+        self.route_add_index = -1
         self.routes_status = ""
         self.refresh_route_backups()
 
@@ -1471,6 +1494,103 @@ class State(rx.State):
     @rx.var
     def selected_route_label(self) -> str:
         return f"Маршрут №{self.selected_route_index + 1}"
+
+    @rx.var
+    def route_groups(self) -> list[RouteGroupView]:
+        """Маршруты для таблицы: только сохранённые магазины и реальные статусы водителей."""
+
+        real_by_index = {
+            int(vehicle.get("route_index", -1)): vehicle
+            for vehicle in self.real_vehicles
+        }
+        query = self.search_query.strip().lower()
+        groups = []
+
+        for index in range(self.active_route_count):
+            route_label = f"Маршрут №{index + 1}"
+            area = ROUTE_AREAS[index] if index < len(ROUTE_AREAS) else ""
+            driver = self.route_driver_names[index] if index < len(self.route_driver_names) else "----"
+            driver_assigned = bool(driver and driver != "----")
+            parts = [part for part in driver.split() if part]
+            if len(parts) > 1:
+                driver_initials = "".join(part[0] for part in parts[:2]).upper()
+            elif parts:
+                driver_initials = parts[0][:2].upper()
+            else:
+                driver_initials = ""
+
+            vehicle = real_by_index.get(index, {})
+            status_by_store = {
+                str(stop.get("name", "")).strip().lower(): stop.get("status", "pending")
+                for stop in vehicle.get("stops", [])
+            }
+            source_stores = self.route_stores[index] if index < len(self.route_stores) else []
+            group_matches = query in " ".join((route_label, area, driver)).lower()
+            stores = []
+            for name in source_stores:
+                if query and not group_matches and query not in name.lower():
+                    continue
+                done = status_by_store.get(name.strip().lower()) == "done"
+                stores.append({
+                    "name": name,
+                    "status": "Отгружен" if done else "Ожидает",
+                    "done": done,
+                })
+
+            if query and not group_matches and not stores:
+                continue
+
+            point_count = len(source_stores)
+            last_two = point_count % 100
+            last_digit = point_count % 10
+            if 11 <= last_two <= 14:
+                point_word = "точек"
+            elif last_digit == 1:
+                point_word = "точка"
+            elif 2 <= last_digit <= 4:
+                point_word = "точки"
+            else:
+                point_word = "точек"
+
+            groups.append({
+                "index": index,
+                "label": route_label,
+                "area": area,
+                "title": f"{route_label} — {area}" if area else route_label,
+                "point_count": point_count,
+                "point_count_label": f"{point_count} {point_word}",
+                "driver": driver if driver_assigned else "Водитель не назначен",
+                "driver_initials": driver_initials,
+                "driver_assigned": driver_assigned,
+                "stores": stores,
+                "collapsed": index in self.collapsed_route_indices,
+                "adding": self.route_add_index == index,
+            })
+
+        return groups
+
+    def toggle_route_group(self, index: int):
+        collapsed = list(self.collapsed_route_indices)
+        if index in collapsed:
+            collapsed.remove(index)
+        else:
+            collapsed.append(index)
+        self.collapsed_route_indices = collapsed
+
+    def start_route_store_add(self, index: int):
+        if 0 <= index < self.active_route_count:
+            self.selected_route_index = index
+            self.route_add_index = index
+            self.new_store_input = ""
+
+    def cancel_route_store_add(self):
+        self.route_add_index = -1
+        self.new_store_input = ""
+
+    def remove_route_store(self, index: int, name: str):
+        if 0 <= index < self.active_route_count:
+            self.selected_route_index = index
+            self.remove_store(name)
 
     def select_route(self, value: str):
         index = route_index_from_name(value)
@@ -1485,6 +1605,12 @@ class State(rx.State):
         self.active_route_count += 1
         save_route_count(self.active_route_count)
         self.selected_route_index = self.active_route_count - 1
+        self.route_add_index = self.selected_route_index
+        self.collapsed_route_indices = [
+            index
+            for index in getattr(self, "collapsed_route_indices", [])
+            if index != self.selected_route_index
+        ]
         self.routes_status = (
             f"Добавлен «Маршрут №{self.active_route_count}» — впишите магазины и сохраните"
         )
@@ -2805,11 +2931,12 @@ def status_pill(status):
     )
 
 
-def driver_avatar(initials, assigned=True):
+def driver_avatar(initials, assigned=True, label=""):
     return rx.cond(
         assigned,
         rx.box(
             initials,
+            title=label,
             display="inline-flex",
             align_items="center",
             justify_content="center",
@@ -2824,6 +2951,7 @@ def driver_avatar(initials, assigned=True):
         ),
         rx.box(
             "+",
+            title=label,
             display="inline-flex",
             align_items="center",
             justify_content="center",
@@ -3047,7 +3175,7 @@ def upload_area():
     return rx.upload(
         rx.hstack(
             rx.box(
-                fa_icon(tag="upload", size=18, color=ICON_TINTS["green"][0]),
+                fa_icon(tag="upload", size=18, color=ui.INK_2),
                 display="flex",
                 align_items="center",
                 justify_content="center",
@@ -3055,7 +3183,7 @@ def upload_area():
                 height="40px",
                 min_width="40px",
                 border_radius="10px",
-                background=ICON_TINTS["green"][1],
+                background=ui.STATUS_GRAY_BG,
             ),
             rx.vstack(
                 rx.text("1. Выберите Excel-файл", color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
@@ -4966,87 +5094,170 @@ def mail_page():
     )
 
 
-def store_row(name, on_remove):
-    return rx.hstack(
-        fa_icon(tag="map_pin", size=13, color=muted()),
-        rx.text(name, color=text(), font_size="13px"),
-        rx.spacer(),
-        rx.button(
-            fa_icon(tag="x", size=13),
-            on_click=on_remove(name),
-            size="1",
-            variant="ghost",
-            color=muted(),
-            cursor="pointer",
+def route_store_row(group, store):
+    return rx.box(
+        rx.hstack(
+            rx.cond(
+                store["done"],
+                fa_icon(tag="circle_check", size=17, color=ui.STATUS_GREEN_TEXT),
+                fa_icon(tag="circle", size=17, color=ui.LINE_STRONG),
+            ),
+            rx.text(
+                store["name"],
+                color=rx.cond(store["done"], ui.INK_3, ui.INK),
+                text_decoration=rx.cond(store["done"], "line-through", "none"),
+                overflow="hidden",
+                text_overflow="ellipsis",
+                white_space="nowrap",
+            ),
+            spacing="2",
+            align="center",
+            min_width="0",
         ),
-        spacing="2",
-        width="100%",
-        align="center",
-        padding="6px 10px",
-        border_radius="7px",
-        background=surface_alt(),
+        rx.box(
+            driver_avatar(
+                group["driver_initials"],
+                group["driver_assigned"],
+                group["driver"],
+            ),
+            class_name="responsive-secondary-column",
+        ),
+        status_pill(store["status"]),
+        icon_button(
+            "x",
+            on_click=State.remove_route_store(group["index"], store["name"]),
+            label="Удалить точку",
+        ),
+        align_items="center",
+        min_height="45px",
+        padding="7px 12px",
+        border_bottom=f"1px solid {ui.LINE_SOFT}",
+        class_name="route-table-row prototype-row prototype-interactive",
     )
 
 
-def route_edit_card():
-    return rx.vstack(
-        rx.hstack(
-            fa_icon(tag="route", size=15, color=text()),
-            rx.text(State.selected_route_label, color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-            spacing="2",
-            align="center",
-        ),
-        rx.vstack(
-            rx.foreach(
-                State.route_stores[State.selected_route_index],
-                lambda name: store_row(name, State.remove_store),
-            ),
-            spacing="1",
-            width="100%",
-            max_height="320px",
-            overflow_y="auto",
-        ),
+def route_add_row(group):
+    return rx.cond(
+        group["adding"],
         rx.hstack(
             rx.input(
                 placeholder="Название магазина",
                 value=State.new_store_input,
                 on_change=State.set_new_store,
                 width="100%",
+                height="32px",
+                background=ui.PANEL,
             ),
-            rx.button(
-                fa_icon(tag="plus", size=15),
-                "Добавить",
-                on_click=State.add_store,
-                height="36px",
-            ),
+            secondary_button("Добавить", on_click=State.add_store, width="110px"),
+            icon_button("x", on_click=State.cancel_route_store_add, label="Отменить"),
             width="100%",
+            padding="10px 12px",
             spacing="2",
+            align="center",
+        ),
+        rx.button(
+            fa_icon(tag="plus", size=16),
+            "Добавить точку",
+            on_click=State.start_route_store_add(group["index"]),
+            width="calc(100% - 24px)",
+            height="32px",
+            margin="8px 12px",
+            justify_content="flex-start",
+            color=ui.INK_3,
+            background=ui.PANEL,
+            border=f"1px solid {ui.LINE}",
+            border_radius=ui.RADIUS_CONTROL,
+            font_weight=ui.FONT_WEIGHT_REGULAR,
+            _hover={"color": ui.INK, "background": ui.STATUS_GRAY_BG},
+            class_name="prototype-interactive",
+        ),
+    )
+
+
+def route_group(group):
+    return rx.vstack(
+        rx.button(
+            fa_icon(
+                tag="chevron_down",
+                size=16,
+                color=ui.INK_2,
+                transform=rx.cond(group["collapsed"], "rotate(-90deg)", "rotate(0deg)"),
+                class_name="prototype-chevron",
+            ),
+            rx.text(
+                group["title"],
+                color=ui.INK,
+                background=ui.STATUS_GRAY_BG,
+                border_radius=ui.RADIUS_PILL,
+                padding="3px 10px",
+                font_size=ui.FONT_SIZE_LABEL,
+                font_weight=ui.FONT_WEIGHT_MEDIUM,
+                white_space="nowrap",
+            ),
+            rx.text(group["point_count_label"], color=ui.INK_3, font_size=ui.FONT_SIZE_LABEL),
+            rx.text("·", color=ui.INK_3, class_name="responsive-secondary-column"),
+            rx.text(
+                group["driver"],
+                color=ui.INK_3,
+                font_size=ui.FONT_SIZE_LABEL,
+                class_name="responsive-secondary-column",
+            ),
+            on_click=State.toggle_route_group(group["index"]),
+            width="100%",
+            min_height="34px",
+            padding="4px 2px 8px",
+            justify_content="flex-start",
+            gap="8px",
+            color=ui.INK,
+            background=ui.TRANSPARENT,
+            border="0",
+            border_radius="0",
+            font_weight=ui.FONT_WEIGHT_REGULAR,
+            _hover={"background": ui.TRANSPARENT},
+            text_align="left",
+        ),
+        rx.cond(
+            group["collapsed"],
+            rx.box(),
+            table_container(
+                rx.box(
+                    rx.text("Магазин"),
+                    rx.text("Водитель", class_name="responsive-secondary-column"),
+                    rx.text("Статус"),
+                    rx.box(),
+                    align_items="center",
+                    min_height="34px",
+                    padding="7px 12px",
+                    color=ui.INK_3,
+                    font_size=ui.FONT_SIZE_CAPTION,
+                    border_bottom=f"1px solid {ui.LINE_SOFT}",
+                    class_name="route-table-row",
+                ),
+                rx.foreach(group["stores"], lambda store: route_store_row(group, store)),
+                route_add_row(group),
+            ),
         ),
         align="start",
-        spacing="3",
-        padding="18px",
-        border=f"1px solid {border()}",
-        border_radius="12px",
-        background=surface(),
+        spacing="0",
         width="100%",
     )
 
 
 def routes_backup_bar():
     return rx.hstack(
-        primary_button("Сохранить маршруты", on_click=State.save_routes, width="210px"),
-        secondary_button("Создать копию", on_click=State.create_route_backup, width="165px"),
+        secondary_button("Сохранить маршруты", on_click=State.save_routes, width="190px"),
+        secondary_button("Создать копию", on_click=State.create_route_backup, width="150px"),
         rx.spacer(),
-        fa_icon(tag="history", size=15, color=muted()),
+        fa_icon(tag="history", size=16, color=ui.INK_3),
         rx.select(
             State.route_backup_labels,
             value=State.selected_route_backup,
             on_change=State.set_selected_route_backup,
             placeholder="Резервные копии",
-            width="270px",
+            width="250px",
         ),
-        secondary_button("Восстановить", on_click=State.restore_route_backup, width="150px"),
-        spacing="3",
+        secondary_button("Восстановить", on_click=State.restore_route_backup, width="140px"),
+        spacing="2",
         align="center",
         width="100%",
         wrap="wrap",
@@ -5057,25 +5268,30 @@ def routes_page():
     return page_shell(
         topbar(
             "Маршруты",
-            "Списки магазинов по маршрутам для режимов Город/Область.",
+            "Магазины сгруппированы по маршрутам. Статус берётся из приложения водителя.",
             actions=[segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source)],
         ),
-        panel_shell(
-            rx.hstack(
-                weight_select_field(
-                    "Маршрут", State.selected_route_label, State.select_route, State.route_name_options
-                ),
-                secondary_button("+ Новый маршрут", on_click=State.add_route, width="180px"),
-                spacing="3",
-                align="end",
+        rx.cond(
+            State.route_groups.length() > 0,
+            rx.vstack(
+                rx.foreach(State.route_groups, route_group),
+                spacing="4",
                 width="100%",
             ),
+            rx.box(
+                rx.text("По вашему запросу маршруты и магазины не найдены", color=ui.INK_2),
+                padding="28px 16px",
+                width="100%",
+                text_align="center",
+                border=f"1px solid {ui.LINE}",
+                border_radius=ui.RADIUS_CARD,
+                background=ui.PANEL,
+            ),
         ),
-        route_edit_card(),
         routes_backup_bar(),
         rx.cond(
             State.routes_status != "",
-            rx.text(State.routes_status, color=muted(), font_size="13px"),
+            rx.text(State.routes_status, color=ui.INK_2, font_size=ui.FONT_SIZE_BODY),
             rx.box(),
         ),
     )
