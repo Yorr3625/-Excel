@@ -58,7 +58,7 @@ def detect_mode(input_file, mode_groups, conflict_fill):
     return best_mode, scores
 
 
-def process_order(input_file, settings, groups, conflict_fill):
+def process_order(input_file, settings, groups, conflict_fill, drivers: dict | None = None):
     """
     Выполняет полный цикл обработки одного файла заказа:
     очистка данных -> поиск и раскраска маршрутов -> создание листов
@@ -72,7 +72,7 @@ def process_order(input_file, settings, groups, conflict_fill):
     now = datetime.now()
     output_file, date_folder = build_output_path(now)
 
-    create_route_sheets(wb, ws, groups)
+    create_route_sheets(wb, ws, groups, drivers)
     route_totals = add_sum_column_to_all_sheets(wb)
     stats["route_totals"] = route_totals
     wb.save(output_file)

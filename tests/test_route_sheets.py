@@ -50,6 +50,16 @@ def test_create_route_sheets_sets_page_header_with_driver_and_area(groups):
     assert wb["Маршрут №2"].oddHeader.center.text == "Маршрут №2 (Азер) - Центр"
 
 
+def test_create_route_sheets_uses_supplied_driver_snapshot(groups):
+    wb, ws = _build_order_sheet()
+    route_drivers.save_route_drivers({"route_1": "Глобальный"})
+
+    create_route_sheets(wb, ws, groups, {"route_1": "Назначенный"})
+
+    assert wb["Маршрут №1"].oddHeader.center.text == "Маршрут №1 (Назначенный) - Текстильщик"
+    assert route_drivers.load_route_drivers()["route_1"] == "Глобальный"
+
+
 def test_create_route_sheets_skips_header_for_unrecognized_group_name():
     wb, ws = _build_order_sheet()
     unnamed_group = [{"name": "Служебный лист", "names": ["фм 4"], "fill": None}]

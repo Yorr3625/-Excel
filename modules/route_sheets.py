@@ -16,7 +16,7 @@ DEFAULT_BORDER = Border(
 )
 
 
-def create_route_sheets(wb, ws, groups):
+def create_route_sheets(wb, ws, groups, drivers: dict | None = None):
     """
     Для каждой группы (маршрута) создаёт отдельный лист-копию исходного
     листа, оставляя только столбцы, относящиеся к этому маршруту,
@@ -26,7 +26,7 @@ def create_route_sheets(wb, ws, groups):
     Район» — виден при печати и в предпросмотре печати.
     """
 
-    drivers = load_route_drivers()
+    drivers = drivers if drivers is not None else load_route_drivers()
 
     for group in groups:
 

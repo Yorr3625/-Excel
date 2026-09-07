@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "drivers": [],
+  "vehicles": [
+    {
+      "name": "Газель",
+      "plate": "СИНЯЯ",
+      "odometer_km": 0,
+      "description": "",
+      "notes": "",
+      "active": true,
+      "id": "34c30aa9-3539-4ef7-ac81-4e85c10363a1"
+    }
+  ]
+}

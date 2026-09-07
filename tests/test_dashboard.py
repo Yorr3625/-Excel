@@ -519,3 +519,102 @@ def test_weight_reconciliation_matches_when_stages_balance():
 
     assert result["difference"] == "0"
     assert result["has_difference"] == ""
+
+
+def test_route_assignment_dialog_uses_only_active_fleet_entries(monkeypatch):
+    state = SimpleNamespace(
+        preview_ready=True,
+        preview_source="upload.xlsx",
+        uploaded_file_path="upload.xlsx",
+        preview_mode="Город",
+        mode="Город",
+        active_route_count=2,
+        route_driver_names=["Иван", "Старое имя"],
+        route_assignments=[],
+        route_assignment_open=False,
+        status="",
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "active_drivers",
+        lambda: [
+            {"id": "driver-1", "name": "Иван", "default_vehicle_id": "vehicle-1"},
+        ],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "active_vehicles",
+        lambda: [{"id": "vehicle-1", "name": "Газель", "plate": "А123ВС71"}],
+    )
+
+    dashboard.State.open_route_assignment_dialog.fn(state)
+
+    assert state.route_assignment_open is True
+    assert state.route_assignments == [
+        {
+            "route": "route_1",
+            "label": "Маршрут №1",
+            "driver_id": "driver-1",
+            "driver_name": "Иван",
+            "vehicle_id": "vehicle-1",
+            "vehicle_name": "Газель",
+            "vehicle_plate": "А123ВС71",
+        },
+        {
+            "route": "route_2",
+            "label": "Маршрут №2",
+            "driver_id": "",
+            "driver_name": "Старое имя",
+            "vehicle_id": "",
+            "vehicle_name": "",
+            "vehicle_plate": "",
+        },
+    ]
+
+
+def test_cancel_route_assignments_does_not_process_or_persist():
+    state = SimpleNamespace(route_assignment_open=True, route_assignments=[{"route": "route_1"}])
+
+    dashboard.State.cancel_route_assignments.fn(state)
+
+    assert state.route_assignment_open is False
+    assert state.route_assignments == []
+
+
+def test_confirm_route_assignments_rejects_stale_preview():
+    state = SimpleNamespace(
+        preview_ready=False,
+        preview_source="old.xlsx",
+        uploaded_file_path="upload.xlsx",
+        preview_mode="Город",
+        mode="Город",
+        route_assignment_open=True,
+        route_assignments=[{"route": "route_1"}],
+        status="",
+    )
+    state.cancel_route_assignments = dashboard.State.cancel_route_assignments.fn.__get__(state)
+
+    dashboard.State.confirm_route_assignments.fn(state)
+
+    assert state.route_assignment_open is False
+    assert state.route_assignments == []
+    assert "устарел" in state.status
+
+
+def test_confirm_route_assignments_starts_processing_for_current_preview():
+    calls = []
+    state = SimpleNamespace(
+        preview_ready=True,
+        preview_source="upload.xlsx",
+        uploaded_file_path="upload.xlsx",
+        preview_mode="Город",
+        mode="Город",
+        route_assignment_open=True,
+        route_assignments=[{"route": "route_1"}],
+        process_order=lambda: calls.append(True),
+    )
+
+    dashboard.State.confirm_route_assignments.fn(state)
+
+    assert state.route_assignment_open is False
+    assert calls == [True]

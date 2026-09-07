@@ -60,6 +60,50 @@ button {
   outline-offset: 2px;
 }
 
+input:not([type="checkbox"]):not([type="file"]),
+textarea,
+select,
+button[role="combobox"],
+.rt-TextFieldRoot,
+.rt-TextAreaRoot,
+.rt-SelectTrigger {
+  background-color: var(--line-soft) !important;
+  border: none !important;
+  border-radius: var(--radius-control) !important;
+  color: var(--ink) !important;
+  box-shadow: none !important;
+  transition: box-shadow 150ms ease, background-color 150ms ease;
+}
+
+input:not([type="checkbox"]):not([type="file"]):hover,
+textarea:hover,
+select:hover,
+button[role="combobox"]:hover,
+.rt-TextFieldRoot:hover,
+.rt-TextAreaRoot:hover,
+.rt-SelectTrigger:hover {
+  background-color: var(--line) !important;
+}
+
+input:not([type="checkbox"]):not([type="file"]):focus,
+textarea:focus,
+select:focus,
+button[role="combobox"]:focus,
+.rt-TextFieldRoot:has(input:focus),
+.rt-TextAreaRoot:has(textarea:focus),
+.rt-SelectTrigger:focus,
+.rt-SelectTrigger[data-state="open"] {
+  background-color: var(--panel) !important;
+  box-shadow: 0 0 0 2px var(--purple) !important;
+}
+
+input::placeholder,
+textarea::placeholder,
+button[role="combobox"][data-placeholder] {
+  color: var(--ink-3) !important;
+  opacity: 1;
+}
+
 .prototype-row:hover {
   background: var(--row-hover);
 }

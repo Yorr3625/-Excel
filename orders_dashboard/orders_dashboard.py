@@ -77,6 +77,19 @@ from modules.mail_watcher import (
     unlink_invoice,
 )
 from modules.pipeline import detect_mode, process_order as run_pipeline
+from modules.fleet import (
+    FleetError,
+    active_drivers,
+    active_vehicles,
+    add_driver,
+    add_vehicle,
+    delete_driver,
+    delete_vehicle,
+    load_fleet,
+    record_order_route_assignments,
+    update_driver,
+    update_vehicle,
+)
 from modules.order_preview import PreviewError, build_order_preview
 from modules.styles import conflict_fill, fills_for
 from modules.version import APP_NAME, APP_VERSION, Release, load_changelog
@@ -272,6 +285,7 @@ PAGE_GROUPS = {
     "История": "Заказы",
     "Маршруты": "Рейсы",
     "Трекинг": "Рейсы",
+    "Водители и транспорт": "Рейсы",
     "OCR накладных": "Накладные",
     "Вес": "Вес",
     "Настройки": "Настройки",
@@ -294,6 +308,7 @@ GROUP_TABS = {
     "Рейсы": [
         {"label": "Маршруты", "page": "Маршруты", "icon": "list"},
         {"label": "Трекинг", "page": "Трекинг", "icon": "map"},
+        {"label": "Водители и транспорт", "page": "Водители и транспорт", "icon": "truck"},
     ],
     "Накладные": [
         {"label": "OCR накладных", "page": "OCR накладных", "icon": "camera"},
@@ -646,6 +661,32 @@ class State(rx.State):
     route_driver_names: list[str] = ["----", "Азер", "Фарид", "Раван", "----", "----", "----", "----"]
     route_drivers_status: str = ""
 
+    fleet_tab: str = "Водители"
+    fleet_drivers: list[dict] = []
+    fleet_vehicles: list[dict] = []
+    fleet_driver_options: list[str] = [""]
+    fleet_vehicle_options: list[str] = [""]
+    fleet_status: str = ""
+    fleet_driver_id: str = ""
+    fleet_driver_name: str = ""
+    fleet_driver_phone: str = ""
+    fleet_driver_rating: str = "5"
+    fleet_driver_hired_on: str = ""
+    fleet_driver_notes: str = ""
+    fleet_driver_default_vehicle: str = ""
+    fleet_driver_active: bool = True
+    fleet_vehicle_id: str = ""
+    fleet_vehicle_name: str = ""
+    fleet_vehicle_plate: str = ""
+    fleet_vehicle_odometer: str = "0"
+    fleet_vehicle_description: str = ""
+    fleet_vehicle_notes: str = ""
+    fleet_vehicle_active: bool = True
+    route_assignment_open: bool = False
+    route_assignments: list[dict] = []
+    fleet_delete_pending_id: str = ""
+    fleet_delete_pending_kind: str = ""
+
     weight_rows: list[dict] = []
     weight_order: str = WEIGHT_NO_BINDING
     weight_route: str = WEIGHT_NO_BINDING
@@ -813,6 +854,8 @@ class State(rx.State):
             self.load_backups()
         elif page == "Трекинг" and not self.vehicles:
             self.init_tracking()
+        elif page == "Водители и транспорт":
+            self.load_fleet()
         elif page == "Вес":
             self.load_weight()
         elif page == "OCR накладных":
@@ -2660,6 +2703,259 @@ class State(rx.State):
         finally:
             self.is_previewing = False
 
+    def load_fleet(self):
+        data = load_fleet()
+        vehicles_by_id = {item.get("id", ""): item for item in data["vehicles"]}
+        self.fleet_vehicles = data["vehicles"]
+        self.fleet_driver_options = [""] + [item.get("name", "") for item in data["drivers"] if item.get("active")]
+        self.fleet_vehicle_options = [""] + [item.get("plate", "") for item in data["vehicles"] if item.get("active")]
+        self.fleet_drivers = [
+            {
+                **driver,
+                "default_vehicle": vehicles_by_id.get(driver.get("default_vehicle_id", ""), {}).get("plate", "—"),
+            }
+            for driver in data["drivers"]
+        ]
+
+    def set_fleet_tab(self, value: str):
+        self.fleet_tab = value
+        self.fleet_status = ""
+
+    def set_fleet_driver_field(self, field: str, value: str):
+        if field in {"name", "phone", "rating", "hired_on", "notes", "default_vehicle"}:
+            setattr(self, f"fleet_driver_{field}", value)
+
+    def set_fleet_driver_active(self, value: bool):
+        self.fleet_driver_active = value
+
+    def clear_fleet_driver_form(self):
+        self.fleet_driver_id = ""
+        self.fleet_driver_name = ""
+        self.fleet_driver_phone = ""
+        self.fleet_driver_rating = "5"
+        self.fleet_driver_hired_on = ""
+        self.fleet_driver_notes = ""
+        self.fleet_driver_default_vehicle = ""
+        self.fleet_driver_active = True
+
+    def edit_fleet_driver(self, driver_id: str):
+        driver = next((item for item in load_fleet()["drivers"] if item.get("id") == driver_id), None)
+        if driver is None:
+            self.fleet_status = "Водитель не найден"
+            return
+        self.fleet_driver_id = driver_id
+        self.fleet_driver_name = driver.get("name", "")
+        self.fleet_driver_phone = driver.get("phone", "")
+        self.fleet_driver_rating = str(driver.get("rating", 5))
+        self.fleet_driver_hired_on = driver.get("hired_on", "")
+        self.fleet_driver_notes = driver.get("notes", "")
+        self.fleet_driver_default_vehicle = next(
+            (
+                item.get("plate", "")
+                for item in load_fleet()["vehicles"]
+                if item.get("id") == driver.get("default_vehicle_id", "")
+            ),
+            "",
+        )
+        self.fleet_driver_active = bool(driver.get("active"))
+
+    def save_fleet_driver(self):
+        try:
+            default_vehicle_id = next(
+                (
+                    item.get("id", "")
+                    for item in load_fleet()["vehicles"]
+                    if item.get("plate") == self.fleet_driver_default_vehicle
+                ),
+                "",
+            )
+            if self.fleet_driver_default_vehicle and not default_vehicle_id:
+                raise FleetError("Выбранный транспорт не найден")
+            if self.fleet_driver_id:
+                update_driver(
+                    self.fleet_driver_id, self.fleet_driver_name, self.fleet_driver_phone,
+                    self.fleet_driver_rating, self.fleet_driver_active, self.fleet_driver_hired_on,
+                    self.fleet_driver_notes, default_vehicle_id,
+                )
+                self.fleet_status = "Карточка водителя обновлена"
+            else:
+                add_driver(
+                    self.fleet_driver_name, self.fleet_driver_phone, self.fleet_driver_rating,
+                    self.fleet_driver_active, self.fleet_driver_hired_on, self.fleet_driver_notes,
+                    default_vehicle_id,
+                )
+                self.fleet_status = "Водитель добавлен"
+            self.clear_fleet_driver_form()
+            self.load_fleet()
+        except FleetError as error:
+            self.fleet_status = str(error)
+
+    def delete_fleet_driver(self, driver_id: str):
+        try:
+            delete_driver(driver_id)
+            self.clear_fleet_driver_form()
+            self.load_fleet()
+            self.fleet_status = "Водитель удалён"
+        except FleetError as error:
+            self.fleet_status = str(error)
+
+    def set_fleet_vehicle_field(self, field: str, value: str):
+        if field in {"name", "plate", "odometer", "description", "notes"}:
+            setattr(self, f"fleet_vehicle_{field}", value)
+
+    def set_fleet_vehicle_active(self, value: bool):
+        self.fleet_vehicle_active = value
+
+    def clear_fleet_vehicle_form(self):
+        self.fleet_vehicle_id = ""
+        self.fleet_vehicle_name = ""
+        self.fleet_vehicle_plate = ""
+        self.fleet_vehicle_odometer = "0"
+        self.fleet_vehicle_description = ""
+        self.fleet_vehicle_notes = ""
+        self.fleet_vehicle_active = True
+
+    def edit_fleet_vehicle(self, vehicle_id: str):
+        vehicle = next((item for item in load_fleet()["vehicles"] if item.get("id") == vehicle_id), None)
+        if vehicle is None:
+            self.fleet_status = "Транспорт не найден"
+            return
+        self.fleet_vehicle_id = vehicle_id
+        self.fleet_vehicle_name = vehicle.get("name", "")
+        self.fleet_vehicle_plate = vehicle.get("plate", "")
+        self.fleet_vehicle_odometer = str(vehicle.get("odometer_km", 0))
+        self.fleet_vehicle_description = vehicle.get("description", "")
+        self.fleet_vehicle_notes = vehicle.get("notes", "")
+        self.fleet_vehicle_active = bool(vehicle.get("active"))
+
+    def save_fleet_vehicle(self):
+        try:
+            if self.fleet_vehicle_id:
+                update_vehicle(
+                    self.fleet_vehicle_id, self.fleet_vehicle_name, self.fleet_vehicle_plate,
+                    self.fleet_vehicle_odometer, self.fleet_vehicle_description,
+                    self.fleet_vehicle_notes, self.fleet_vehicle_active,
+                )
+                self.fleet_status = "Карточка транспорта обновлена"
+            else:
+                add_vehicle(
+                    self.fleet_vehicle_name, self.fleet_vehicle_plate, self.fleet_vehicle_odometer,
+                    self.fleet_vehicle_description, self.fleet_vehicle_notes, self.fleet_vehicle_active,
+                )
+                self.fleet_status = "Транспорт добавлен"
+            self.clear_fleet_vehicle_form()
+            self.load_fleet()
+        except FleetError as error:
+            self.fleet_status = str(error)
+
+    def delete_fleet_vehicle(self, vehicle_id: str):
+        try:
+            delete_vehicle(vehicle_id)
+            self.clear_fleet_vehicle_form()
+            self.load_fleet()
+            self.fleet_status = "Транспорт удалён"
+        except FleetError as error:
+            self.fleet_status = str(error)
+
+    def ask_delete_fleet_item(self, kind: str, item_id: str):
+        if kind in {"driver", "vehicle"}:
+            self.fleet_delete_pending_kind = kind
+            self.fleet_delete_pending_id = item_id
+
+    def cancel_delete_fleet_item(self):
+        self.fleet_delete_pending_kind = ""
+        self.fleet_delete_pending_id = ""
+
+    def confirm_delete_fleet_item(self):
+        item_id = self.fleet_delete_pending_id
+        kind = self.fleet_delete_pending_kind
+        self.cancel_delete_fleet_item()
+        if kind == "driver":
+            self.delete_fleet_driver(item_id)
+        elif kind == "vehicle":
+            self.delete_fleet_vehicle(item_id)
+
+    def open_route_assignment_dialog(self):
+        if (
+            not self.preview_ready
+            or self.preview_source != self.uploaded_file_path
+            or self.preview_mode != self.mode
+        ):
+            self.status = "Сначала постройте предварительный просмотр для этого режима"
+            return
+        drivers = active_drivers()
+        vehicles = active_vehicles()
+        driver_by_name = {item.get("name", ""): item for item in drivers}
+        vehicle_by_id = {item.get("id", ""): item for item in vehicles}
+        assignments = []
+        for index in range(self.active_route_count):
+            legacy_name = self.route_driver_names[index] if index < len(self.route_driver_names) else "----"
+            driver = driver_by_name.get(legacy_name, {})
+            vehicle = vehicle_by_id.get(driver.get("default_vehicle_id", ""), {})
+            assignments.append({
+                "route": f"route_{index + 1}",
+                "label": f"Маршрут №{index + 1}",
+                "driver_id": driver.get("id", ""),
+                "driver_name": driver.get("name", legacy_name if legacy_name != "----" else ""),
+                "vehicle_id": vehicle.get("id", ""),
+                "vehicle_name": vehicle.get("name", ""),
+                "vehicle_plate": vehicle.get("plate", ""),
+            })
+        self.fleet_driver_options = [""] + [item.get("name", "") for item in drivers]
+        self.fleet_driver_options += [
+            item["driver_name"]
+            for item in assignments
+            if item["driver_name"] and item["driver_name"] not in self.fleet_driver_options
+        ]
+        self.fleet_vehicle_options = [""] + [item.get("plate", "") for item in vehicles]
+        self.route_assignments = assignments
+        self.route_assignment_open = True
+
+    def cancel_route_assignments(self):
+        self.route_assignment_open = False
+        self.route_assignments = []
+
+    def set_route_assignment_driver(self, index: int, driver_name: str):
+        assignments = list(self.route_assignments)
+        if not 0 <= index < len(assignments):
+            return
+        driver = next((item for item in active_drivers() if item.get("name") == driver_name), {})
+        vehicle = next((item for item in active_vehicles() if item.get("id") == driver.get("default_vehicle_id")), {})
+        assignments[index] = {
+            **assignments[index],
+            "driver_id": driver.get("id", ""),
+            "driver_name": driver.get("name", ""),
+            "vehicle_id": vehicle.get("id", ""),
+            "vehicle_name": vehicle.get("name", ""),
+            "vehicle_plate": vehicle.get("plate", ""),
+        }
+        self.route_assignments = assignments
+
+    def set_route_assignment_vehicle(self, index: int, plate: str):
+        assignments = list(self.route_assignments)
+        if not 0 <= index < len(assignments):
+            return
+        vehicle = next((item for item in active_vehicles() if item.get("plate") == plate), {})
+        assignments[index] = {
+            **assignments[index],
+            "vehicle_id": vehicle.get("id", ""),
+            "vehicle_name": vehicle.get("name", ""),
+            "vehicle_plate": vehicle.get("plate", ""),
+        }
+        self.route_assignments = assignments
+
+    def confirm_route_assignments(self):
+        if (
+            not self.preview_ready
+            or self.preview_source != self.uploaded_file_path
+            or self.preview_mode != self.mode
+        ):
+            self.cancel_route_assignments()
+            self.status = "Предварительный просмотр устарел. Постройте его заново"
+            return
+        self.route_assignment_open = False
+        self.process_order()
+
     def process_order(self):
         if not self.uploaded_file_path:
             self.status = "Сначала загрузите Excel-файл"
@@ -2685,11 +2981,17 @@ class State(rx.State):
             fills = fills_for(self.active_route_count)
             groups = build_groups(stores, fills, self.active_route_count)
 
+            assigned_drivers = {
+                item["route"]: item["driver_name"]
+                for item in self.route_assignments
+                if item.get("driver_name")
+            }
             output_file, log_file, stats = run_pipeline(
                 self.uploaded_file_path,
                 settings,
                 groups,
                 conflict_fill,
+                assigned_drivers or None,
             )
 
             route_totals = list(stats.get("route_totals", {}).values())
@@ -2702,6 +3004,14 @@ class State(rx.State):
             self.unknown_count = len(stats.get("unknown_stores", []))
             self.output_file = str(output_file)
             self.log_file = str(log_file)
+            if self.route_assignments:
+                record_order_route_assignments(
+                    self.selected_file,
+                    self.mode,
+                    self.output_file,
+                    self.route_assignments,
+                )
+            self.route_assignments = []
             self.status = "Обработка завершена"
 
             record_processing(self.selected_file, stats)
@@ -3300,7 +3610,7 @@ def order_panel():
         ),
         primary_button(
             rx.cond(State.is_processing, "Обработка...", "Подтвердить обработку"),
-            on_click=State.process_order,
+            on_click=State.open_route_assignment_dialog,
             disabled=State.is_processing,
             width="100%",
         ),
@@ -6167,12 +6477,190 @@ def settings_page():
     )
 
 
+def fleet_text_field(label: str, value, on_change, input_type: str = "text"):
+    return rx.vstack(
+        rx.text(label, color=muted(), font_size="12px"),
+        rx.input(value=value, on_change=on_change, type=input_type, width="100%"),
+        spacing="1", align="start", width="100%",
+    )
+
+
+def fleet_driver_card(item):
+    return rx.hstack(
+        rx.vstack(
+            rx.text(item["name"], color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            rx.text(item["phone"], color=muted(), font_size="12px"),
+            rx.text("Рейтинг: ", item["rating"], " / 5", color=muted(), font_size="12px"),
+            rx.text("Транспорт: ", item["default_vehicle"], color=muted(), font_size="12px"),
+            rx.text(rx.cond(item["active"], "Активен", "Неактивен"), color=rx.cond(item["active"], ui.STATUS_GREEN_TEXT, ui.STATUS_AMBER_TEXT), font_size="12px"),
+            align="start", spacing="1",
+        ),
+        rx.spacer(),
+        rx.hstack(
+            rx.button("Изменить", on_click=State.edit_fleet_driver(item["id"]), variant="soft", size="2"),
+            rx.button("Удалить", on_click=State.ask_delete_fleet_item("driver", item["id"]), variant="soft", color_scheme="red", size="2"),
+            spacing="2",
+        ),
+        width="100%", padding="14px", border=f"1px solid {border()}", border_radius="10px", background=surface_alt(),
+    )
+
+
+def fleet_vehicle_card(item):
+    return rx.hstack(
+        rx.vstack(
+            rx.text(item["name"], color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            rx.text(item["plate"], color=text(), font_size="14px"),
+            rx.text("Пробег: ", item["odometer_km"], " км", color=muted(), font_size="12px"),
+            rx.text(rx.cond(item["active"], "Активен", "Неактивен"), color=rx.cond(item["active"], ui.STATUS_GREEN_TEXT, ui.STATUS_AMBER_TEXT), font_size="12px"),
+            align="start", spacing="1",
+        ),
+        rx.spacer(),
+        rx.hstack(
+            rx.button("Изменить", on_click=State.edit_fleet_vehicle(item["id"]), variant="soft", size="2"),
+            rx.button("Удалить", on_click=State.ask_delete_fleet_item("vehicle", item["id"]), variant="soft", color_scheme="red", size="2"),
+            spacing="2",
+        ),
+        width="100%", padding="14px", border=f"1px solid {border()}", border_radius="10px", background=surface_alt(),
+    )
+
+
+def fleet_drivers_tab():
+    return rx.vstack(
+        rx.hstack(
+            fleet_text_field("ФИО", State.fleet_driver_name, lambda value: State.set_fleet_driver_field("name", value)),
+            fleet_text_field("Телефон", State.fleet_driver_phone, lambda value: State.set_fleet_driver_field("phone", value)),
+            fleet_text_field("Рейтинг (1–5)", State.fleet_driver_rating, lambda value: State.set_fleet_driver_field("rating", value), "number"),
+            width="100%", spacing="3",
+        ),
+        rx.hstack(
+            fleet_text_field("Дата приёма", State.fleet_driver_hired_on, lambda value: State.set_fleet_driver_field("hired_on", value), "date"),
+            rx.vstack(
+                rx.text("Транспорт по умолчанию", color=muted(), font_size="12px"),
+                rx.select(
+                    State.fleet_vehicle_options,
+                    value=State.fleet_driver_default_vehicle,
+                    on_change=lambda value: State.set_fleet_driver_field("default_vehicle", value),
+                    placeholder="Не назначен",
+                    width="100%",
+                ),
+                spacing="1", align="start", width="100%",
+            ),
+            rx.vstack(
+                rx.text("Активность", color=muted(), font_size="12px"),
+                rx.checkbox("Активен", checked=State.fleet_driver_active, on_change=State.set_fleet_driver_active),
+                spacing="1", align="start", width="100%",
+            ),
+            width="100%", spacing="3",
+        ),
+        fleet_text_field("Заметка", State.fleet_driver_notes, lambda value: State.set_fleet_driver_field("notes", value)),
+        rx.hstack(
+            primary_button("Сохранить водителя", on_click=State.save_fleet_driver),
+            secondary_button("Очистить", on_click=State.clear_fleet_driver_form),
+            spacing="3",
+        ),
+        rx.cond(State.fleet_drivers.length() > 0, rx.vstack(rx.foreach(State.fleet_drivers, fleet_driver_card), width="100%", spacing="2"), rx.text("Водителей пока нет", color=muted())),
+        spacing="3", width="100%", align="start",
+    )
+
+
+def fleet_vehicles_tab():
+    return rx.vstack(
+        rx.hstack(
+            fleet_text_field("Название / модель", State.fleet_vehicle_name, lambda value: State.set_fleet_vehicle_field("name", value)),
+            fleet_text_field("Госномер", State.fleet_vehicle_plate, lambda value: State.set_fleet_vehicle_field("plate", value)),
+            fleet_text_field("Пробег, км", State.fleet_vehicle_odometer, lambda value: State.set_fleet_vehicle_field("odometer", value), "number"),
+            width="100%", spacing="3",
+        ),
+        fleet_text_field("Краткое описание", State.fleet_vehicle_description, lambda value: State.set_fleet_vehicle_field("description", value)),
+        fleet_text_field("Заметка", State.fleet_vehicle_notes, lambda value: State.set_fleet_vehicle_field("notes", value)),
+        rx.hstack(
+            rx.checkbox("Активен", checked=State.fleet_vehicle_active, on_change=State.set_fleet_vehicle_active),
+            primary_button("Сохранить транспорт", on_click=State.save_fleet_vehicle),
+            secondary_button("Очистить", on_click=State.clear_fleet_vehicle_form),
+            spacing="3", align="center",
+        ),
+        rx.cond(State.fleet_vehicles.length() > 0, rx.vstack(rx.foreach(State.fleet_vehicles, fleet_vehicle_card), width="100%", spacing="2"), rx.text("Транспорт пока не добавлен", color=muted())),
+        spacing="3", width="100%", align="start",
+    )
+
+
+def fleet_page():
+    return page_shell(
+        topbar(
+            "Водители и транспорт",
+            "Локальный справочник для назначения рейсов. Технические GPS-ключи маршрутов не изменяются.",
+        ),
+        rx.vstack(
+            segmented_control(["Водители", "Транспорт"], State.fleet_tab, State.set_fleet_tab),
+            rx.cond(State.fleet_tab == "Водители", fleet_drivers_tab(), fleet_vehicles_tab()),
+            rx.cond(
+                State.fleet_delete_pending_id != "",
+                rx.hstack(
+                    rx.text("Удалить карточку без возможности восстановления?", color=ui.STATUS_RED_TEXT, font_size="13px"),
+                    rx.button("Удалить", on_click=State.confirm_delete_fleet_item, color_scheme="red", size="2"),
+                    secondary_button("Отмена", on_click=State.cancel_delete_fleet_item),
+                    spacing="3", align="center", wrap="wrap",
+                ),
+                rx.box(),
+            ),
+            rx.cond(State.fleet_status != "", rx.text(State.fleet_status, color=muted(), font_size="13px"), rx.box()),
+            width="100%", spacing="4", align="start",
+        ),
+    )
+
+
+def route_assignment_row(item, index):
+    return rx.hstack(
+        rx.text(item["label"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, min_width="130px"),
+        rx.select(
+            State.fleet_driver_options,
+            value=item["driver_name"],
+            on_change=lambda value: State.set_route_assignment_driver(index, value),
+            placeholder="Водитель не назначен",
+            width="100%",
+        ),
+        rx.select(
+            State.fleet_vehicle_options,
+            value=item["vehicle_plate"],
+            on_change=lambda value: State.set_route_assignment_vehicle(index, value),
+            placeholder="Транспорт не назначен",
+            width="100%",
+        ),
+        width="100%", spacing="3", align="center", wrap="wrap",
+    )
+
+
+def route_assignment_dialog():
+    return rx.cond(
+        State.route_assignment_open,
+        rx.box(
+            rx.box(
+                rx.vstack(
+                    rx.text("Назначение рейсов", color=text(), font_size="20px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+                    rx.text("Выберите водителя и транспорт для каждого активного маршрута. Поля можно оставить пустыми.", color=muted(), font_size="13px"),
+                    rx.vstack(rx.foreach(State.route_assignments, route_assignment_row), width="100%", spacing="3"),
+                    rx.hstack(
+                        secondary_button("Отмена", on_click=State.cancel_route_assignments),
+                        primary_button("Обработать заказ", on_click=State.confirm_route_assignments),
+                        justify="end", width="100%", spacing="3",
+                    ),
+                    spacing="4", width="100%", align="start",
+                ),
+                width="min(760px, calc(100vw - 32px))", max_height="calc(100vh - 32px)", overflow_y="auto", padding="24px", border_radius="14px", background=surface(), box_shadow="0 16px 48px rgba(0,0,0,.28)",
+            ),
+            position="fixed", inset="0", z_index="1000", background="rgba(0,0,0,.45)", display="flex", align_items="center", justify_content="center", padding="16px",
+        ),
+        rx.box(),
+    )
+
+
 def main_content():
     return rx.match(
         State.current_page,
         ("Заказы", orders_page()),
         ("Почта", mail_page()),
         ("Маршруты", routes_page()),
+        ("Водители и транспорт", fleet_page()),
         ("Вес", weight_page()),
         ("OCR накладных", invoice_ocr_page()),
         ("Трекинг", tracking_page()),
@@ -6324,6 +6812,7 @@ def dashboard():
             background=ui.PAGE,
         ),
         order_details_drawer(),
+        route_assignment_dialog(),
         help_chat_widget(),
     )
 
