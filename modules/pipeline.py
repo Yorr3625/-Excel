@@ -6,6 +6,7 @@ from modules.excel_cleaner import (
     remove_unused_rows_and_cols,
     delete_columns_by_text,
     delete_total_rows,
+    convert_text_numbers_to_numbers,
 )
 from modules.route_finder import find_and_mark_routes
 from modules.route_sheets import create_route_sheets, add_sum_column_to_all_sheets
@@ -32,6 +33,7 @@ def prepare_order(input_file, groups, conflict_fill):
     remove_unused_rows_and_cols(ws)
     delete_columns_by_text(ws, DELETE_TEXT)
     delete_total_rows(ws)
+    convert_text_numbers_to_numbers(ws)
 
     stats = find_and_mark_routes(ws, groups, conflict_fill)
 

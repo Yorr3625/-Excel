@@ -86,7 +86,17 @@ def test_sources_add_categories_and_olga_to_legacy_mail_config():
 
     assert configured[0]["categories"] == []
     assert configured[1]["categories"] == [
-        {"name": "Молоко", "markers": ("фм 40", "фм40", "мдв")},
+        {
+            "name": "Молоко",
+            "markers": (
+                "фм 40",
+                "фм40",
+                "мдв",
+                "упд кировское торез",
+                "упд горловка",
+                "упд макеевка харцизц",
+            ),
+        },
         {"name": "Парус", "markers": ("парус",)},
         {"name": "Краймери", "markers": ("краймер", "краймар")},
     ]

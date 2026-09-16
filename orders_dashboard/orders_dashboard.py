@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from modules import driver_data, paths
+from modules import driver_data, gdemoi, paths
 from modules.backup import (
     BackupError,
     create_backup,
@@ -682,10 +682,16 @@ class State(rx.State):
     fleet_vehicle_description: str = ""
     fleet_vehicle_notes: str = ""
     fleet_vehicle_active: bool = True
+    fleet_vehicle_tracker_id: str = ""
     route_assignment_open: bool = False
     route_assignments: list[dict] = []
     fleet_delete_pending_id: str = ""
     fleet_delete_pending_kind: str = ""
+
+    gdemoi_api_key_input: str = ""
+    gdemoi_configured: bool = False
+    gdemoi_settings_status: str = ""
+    gdemoi_poll_status: str = ""
 
     weight_rows: list[dict] = []
     weight_order: str = WEIGHT_NO_BINDING
@@ -850,6 +856,7 @@ class State(rx.State):
         elif page == "Настройки":
             self.load_settings_form()
             self.load_ai_settings_form()
+            self.load_gdemoi_settings_form()
         elif page == "Резервные копии":
             self.load_backups()
         elif page == "Трекинг" and not self.vehicles:
@@ -1874,6 +1881,22 @@ class State(rx.State):
                     self.real_watching = False
                     return
 
+            try:
+                await asyncio.to_thread(gdemoi.poll_and_record)
+                gdemoi_error = ""
+            except gdemoi.GdemoiError as error:
+                gdemoi_error = str(error)
+
+            async with self:
+                if (
+                    not self.real_watching
+                    or self.tracking_view != "Реальные данные"
+                    or not self._client_connected()
+                ):
+                    self.real_watching = False
+                    return
+
+                self.gdemoi_poll_status = gdemoi_error
                 self.refresh_real_data()
 
     def load_history(self):
@@ -2436,6 +2459,22 @@ class State(rx.State):
             else "Укажите ключ Yandex Vision и ID каталога"
         )
 
+    def load_gdemoi_settings_form(self):
+        self.gdemoi_api_key_input = ""
+        self.gdemoi_configured = gdemoi.is_configured()
+        self.gdemoi_settings_status = ""
+
+    def set_gdemoi_api_key_input(self, value: str):
+        self.gdemoi_api_key_input = value
+
+    def save_gdemoi_settings_form(self):
+        settings = gdemoi.save_settings(self.gdemoi_api_key_input)
+        self.gdemoi_api_key_input = ""
+        self.gdemoi_configured = gdemoi.is_configured(settings)
+        self.gdemoi_settings_status = (
+            "Настройки сохранены" if self.gdemoi_configured else "Укажите ключ API ГдеМои"
+        )
+
     def toggle_help_chat(self):
         self.help_chat_open = not self.help_chat_open
 
@@ -2706,7 +2745,9 @@ class State(rx.State):
     def load_fleet(self):
         data = load_fleet()
         vehicles_by_id = {item.get("id", ""): item for item in data["vehicles"]}
-        self.fleet_vehicles = data["vehicles"]
+        self.fleet_vehicles = [
+            {"tracker_id": "", **item} for item in data["vehicles"]
+        ]
         self.fleet_driver_options = [""] + [item.get("name", "") for item in data["drivers"] if item.get("active")]
         self.fleet_vehicle_options = [""] + [item.get("plate", "") for item in data["vehicles"] if item.get("active")]
         self.fleet_drivers = [
@@ -2800,7 +2841,7 @@ class State(rx.State):
             self.fleet_status = str(error)
 
     def set_fleet_vehicle_field(self, field: str, value: str):
-        if field in {"name", "plate", "odometer", "description", "notes"}:
+        if field in {"name", "plate", "odometer", "description", "notes", "tracker_id"}:
             setattr(self, f"fleet_vehicle_{field}", value)
 
     def set_fleet_vehicle_active(self, value: bool):
@@ -2814,6 +2855,7 @@ class State(rx.State):
         self.fleet_vehicle_description = ""
         self.fleet_vehicle_notes = ""
         self.fleet_vehicle_active = True
+        self.fleet_vehicle_tracker_id = ""
 
     def edit_fleet_vehicle(self, vehicle_id: str):
         vehicle = next((item for item in load_fleet()["vehicles"] if item.get("id") == vehicle_id), None)
@@ -2827,6 +2869,7 @@ class State(rx.State):
         self.fleet_vehicle_description = vehicle.get("description", "")
         self.fleet_vehicle_notes = vehicle.get("notes", "")
         self.fleet_vehicle_active = bool(vehicle.get("active"))
+        self.fleet_vehicle_tracker_id = vehicle.get("tracker_id", "")
 
     def save_fleet_vehicle(self):
         try:
@@ -2834,13 +2877,14 @@ class State(rx.State):
                 update_vehicle(
                     self.fleet_vehicle_id, self.fleet_vehicle_name, self.fleet_vehicle_plate,
                     self.fleet_vehicle_odometer, self.fleet_vehicle_description,
-                    self.fleet_vehicle_notes, self.fleet_vehicle_active,
+                    self.fleet_vehicle_notes, self.fleet_vehicle_active, self.fleet_vehicle_tracker_id,
                 )
                 self.fleet_status = "Карточка транспорта обновлена"
             else:
                 add_vehicle(
                     self.fleet_vehicle_name, self.fleet_vehicle_plate, self.fleet_vehicle_odometer,
                     self.fleet_vehicle_description, self.fleet_vehicle_notes, self.fleet_vehicle_active,
+                    self.fleet_vehicle_tracker_id,
                 )
                 self.fleet_status = "Транспорт добавлен"
             self.clear_fleet_vehicle_form()
@@ -5954,13 +5998,18 @@ def real_data_section():
     return rx.vstack(
         rx.hstack(
             rx.text(
-                "Данные от водителей за сегодня — открывается на /driver, обновляется каждые ~5 сек.",
+                "Данные от водителей и GPS-трекеров ГдеМои за сегодня — обновляется каждые ~5 сек.",
                 color=muted(), font_size="13px",
             ),
             rx.spacer(),
             secondary_button("Обновить", on_click=State.refresh_real_data, width="120px"),
             width="100%",
             align="center",
+        ),
+        rx.cond(
+            State.gdemoi_poll_status != "",
+            rx.text(State.gdemoi_poll_status, color=ui.STATUS_AMBER_TEXT, font_size="12px"),
+            rx.box(),
         ),
         rx.grid(
             rx.foreach(State.real_vehicles, real_vehicle_card),
@@ -6474,6 +6523,45 @@ def settings_page():
                 font_size="11px",
             ),
         ),
+        panel_shell(
+            rx.hstack(
+                panel_title("truck", "GPS-трекер ГдеМои"),
+                rx.spacer(),
+                rx.cond(
+                    State.gdemoi_configured,
+                    rx.badge("Настроено", color_scheme="green", variant="soft"),
+                    rx.badge("Не настроено", color_scheme="gray", variant="soft"),
+                ),
+                width="100%",
+                align="center",
+            ),
+            rx.text(
+                "Живые координаты трекера ГдеМои А2 подмешиваются в маршрут на "
+                "вкладке «Трекинг» (вид «Реальные данные»). Трекер привязывается к "
+                "конкретной машине в справочнике «Водители и транспорт» — полем "
+                "«ID трекера ГдеМои».",
+                color=muted(),
+                font_size="12px",
+            ),
+            weight_field(
+                "Ключ API ГдеМои",
+                State.gdemoi_api_key_input,
+                State.set_gdemoi_api_key_input,
+                "пустое поле оставит сохранённый ключ",
+                input_type="password",
+            ),
+            rx.hstack(
+                secondary_button("Сохранить ключ ГдеМои", on_click=State.save_gdemoi_settings_form, width="220px"),
+                rx.text(State.gdemoi_settings_status, color=muted(), font_size="13px"),
+                spacing="4",
+                align="center",
+            ),
+            rx.text(
+                "Ключ хранится только локально в config/gdemoi.json, который исключён из Git.",
+                color=muted(),
+                font_size="11px",
+            ),
+        ),
     )
 
 
@@ -6511,6 +6599,11 @@ def fleet_vehicle_card(item):
             rx.text(item["name"], color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.text(item["plate"], color=text(), font_size="14px"),
             rx.text("Пробег: ", item["odometer_km"], " км", color=muted(), font_size="12px"),
+            rx.cond(
+                item["tracker_id"] != "",
+                rx.text("Трекер ГдеМои: ", item["tracker_id"], color=muted(), font_size="12px"),
+                rx.box(),
+            ),
             rx.text(rx.cond(item["active"], "Активен", "Неактивен"), color=rx.cond(item["active"], ui.STATUS_GREEN_TEXT, ui.STATUS_AMBER_TEXT), font_size="12px"),
             align="start", spacing="1",
         ),
@@ -6573,6 +6666,14 @@ def fleet_vehicles_tab():
         ),
         fleet_text_field("Краткое описание", State.fleet_vehicle_description, lambda value: State.set_fleet_vehicle_field("description", value)),
         fleet_text_field("Заметка", State.fleet_vehicle_notes, lambda value: State.set_fleet_vehicle_field("notes", value)),
+        rx.vstack(
+            fleet_text_field("ID трекера ГдеМои", State.fleet_vehicle_tracker_id, lambda value: State.set_fleet_vehicle_field("tracker_id", value)),
+            rx.text(
+                "Числовой ID трекера из личного кабинета ГдеМои. Оставьте пустым, если на машине нет трекера.",
+                color=muted(), font_size="11px",
+            ),
+            spacing="1", align="start", width="100%",
+        ),
         rx.hstack(
             rx.checkbox("Активен", checked=State.fleet_vehicle_active, on_change=State.set_fleet_vehicle_active),
             primary_button("Сохранить транспорт", on_click=State.save_fleet_vehicle),

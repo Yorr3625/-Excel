@@ -4,6 +4,7 @@ from modules.excel_cleaner import (
     remove_unused_rows_and_cols,
     delete_total_rows,
     delete_columns_by_text,
+    convert_text_numbers_to_numbers,
 )
 
 
@@ -72,3 +73,21 @@ def test_delete_columns_by_text_no_match_leaves_sheet_untouched():
     delete_columns_by_text(ws, ["не найдётся"])
 
     assert [c.value for c in ws[1]] == ["Товар", "фм 4"]
+
+
+def test_convert_text_numbers_to_numbers_converts_only_order_values():
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Товар", "фм 4"])
+    ws.append(["Товар 20", "20"])
+    ws.append(["Товар B", "1,5"])
+    ws.append(["Товар C", "1 000"])
+    ws.append(["Товар D", "20 шт"])
+
+    convert_text_numbers_to_numbers(ws)
+
+    assert ws.cell(2, 1).value == "Товар 20"
+    assert ws.cell(2, 2).value == 20
+    assert ws.cell(3, 2).value == 1.5
+    assert ws.cell(4, 2).value == 1000
+    assert ws.cell(5, 2).value == "20 шт"

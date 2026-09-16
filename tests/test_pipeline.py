@@ -80,3 +80,26 @@ def test_detect_mode_picks_group_set_with_more_matches(tmp_path, groups, sample_
     assert best_mode == "Хорошо"
     assert scores["Хорошо"] > scores["Плохо"]
     assert scores["Плохо"] == 0
+
+
+def test_process_order_converts_textual_order_amounts(
+    tmp_path, monkeypatch, groups, sample_order_workbook
+):
+    monkeypatch.chdir(tmp_path)
+    input_file = tmp_path / "заказ.xlsx"
+    sheet = sample_order_workbook.active
+    sheet.cell(row=3, column=4, value="5")
+    sheet.cell(row=3, column=5, value="3")
+    sample_order_workbook.save(input_file)
+
+    output_file, _, stats = process_order(
+        str(input_file),
+        {"open_file_after_processing": False, "open_folder_after_processing": False},
+        groups,
+        conflict_fill,
+    )
+
+    result = load_workbook(output_file)
+    assert result["Маршрут №1"].cell(row=2, column=3).value == 5
+    assert result["Маршрут №2"].cell(row=2, column=3).value == 3
+    assert stats["route_totals"] == {"Маршрут №1": 5, "Маршрут №2": 5}

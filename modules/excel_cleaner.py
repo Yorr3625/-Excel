@@ -57,3 +57,21 @@ def delete_columns_by_text(ws, texts):
     # удаляем с конца, чтобы номера столбцов не сбились
     for col_num in sorted(set(cols_to_delete), reverse=True):
         ws.delete_cols(col_num)
+
+
+def convert_text_numbers_to_numbers(ws):
+    """Преобразует текстовые количества в товарных ячейках в числа."""
+
+    for row in ws.iter_rows(min_row=2, min_col=2):
+        for cell in row:
+            if not isinstance(cell.value, str):
+                continue
+
+            text = cell.value.strip().replace(" ", "").replace(" ", "").replace(",", ".")
+
+            try:
+                number = float(text)
+            except ValueError:
+                continue
+
+            cell.value = int(number) if number.is_integer() else number

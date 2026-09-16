@@ -44,6 +44,7 @@ INVOICE_OCR_PHOTOS_FOLDER = DATA_DIR / "invoice_ocr_photos"
 ORDER_ROUTE_ASSIGNMENTS_FILE = DATA_DIR / "order_route_assignments.json"
 DRIVER_PHOTOS_FOLDER = DATA_DIR / "driver_photos"
 DRIVER_DOCUMENTS_FOLDER = DATA_DIR / "driver_documents"
+GDEMOI_FILE = CONFIG_DIR / "gdemoi.json"
 
 
 def stores_file_for(mode: str) -> Path:

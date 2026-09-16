@@ -75,6 +75,7 @@ def _vehicle_payload(
     description: str,
     notes: str,
     active: bool,
+    tracker_id: str = "",
 ) -> dict:
     name = _text(name)
     plate = normalize_plate(plate)
@@ -97,6 +98,7 @@ def _vehicle_payload(
         "description": _text(description),
         "notes": _text(notes),
         "active": bool(active),
+        "tracker_id": _text(tracker_id),
     }
 
 
@@ -112,9 +114,10 @@ def add_vehicle(
     description: str = "",
     notes: str = "",
     active: bool = True,
+    tracker_id: str = "",
 ) -> dict:
     data = load_fleet()
-    vehicle = _vehicle_payload(name, plate, odometer_km, description, notes, active)
+    vehicle = _vehicle_payload(name, plate, odometer_km, description, notes, active, tracker_id)
     _assert_unique_plate(data["vehicles"], vehicle["plate"])
     vehicle["id"] = str(uuid.uuid4())
     data["vehicles"].append(vehicle)
@@ -130,9 +133,10 @@ def update_vehicle(
     description: str,
     notes: str,
     active: bool,
+    tracker_id: str = "",
 ) -> dict:
     data = load_fleet()
-    vehicle = _vehicle_payload(name, plate, odometer_km, description, notes, active)
+    vehicle = _vehicle_payload(name, plate, odometer_km, description, notes, active, tracker_id)
     _assert_unique_plate(data["vehicles"], vehicle["plate"], vehicle_id)
 
     for index, item in enumerate(data["vehicles"]):

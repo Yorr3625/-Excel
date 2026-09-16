@@ -50,7 +50,14 @@ INVOICE_CATEGORY_UNCATEGORIZED = "Без категории"
 ACCOUNTANT_INVOICE_CATEGORIES = (
     {
         "name": INVOICE_CATEGORY_MILK,
-        "markers": ("фм 40", "фм40", "мдв"),
+        "markers": (
+            "фм 40",
+            "фм40",
+            "мдв",
+            "упд кировское торез",
+            "упд горловка",
+            "упд макеевка харцизц",
+        ),
     },
     {
         "name": INVOICE_CATEGORY_PARUS,
