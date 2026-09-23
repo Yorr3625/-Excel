@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title">
+  <title id="title">Логистика</title>
+  <rect width="192" height="192" rx="40" fill="#7B68EE"/>
+  <path d="M46 62h64l36 36v32H46z" fill="#fff" opacity=".96"/>
+  <path d="M110 62v36h36" fill="none" stroke="#7B68EE" stroke-width="10" stroke-linejoin="round"/>
+  <circle cx="76" cy="136" r="13" fill="#5B4FD6"/>
+  <circle cx="132" cy="136" r="13" fill="#5B4FD6"/>
+  <path d="M55 80h34M55 98h25" stroke="#7B68EE" stroke-width="9" stroke-linecap="round"/>
+</svg>

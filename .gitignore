@@ -30,6 +30,9 @@ config/backup.json
 # Ключ Anthropic API для ИИ-разбора во вкладке «Вес» — секрет, не в git.
 config/ai.json
 
+# Учётная запись администратора веб-дашборда хранится локально.
+config/auth.json
+
 # Ключ API ГдеМои для GPS-трекеров — секрет, не в git.
 config/gdemoi.json
 

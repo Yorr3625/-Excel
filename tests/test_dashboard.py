@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 
 import orders_dashboard.orders_dashboard as dashboard
 from modules.config import MAX_ROUTES
@@ -618,3 +619,131 @@ def test_confirm_route_assignments_starts_processing_for_current_preview():
 
     assert state.route_assignment_open is False
     assert calls == [True]
+
+
+def test_login_authenticates_and_clears_credentials(monkeypatch):
+    state = SimpleNamespace(
+        login_username="admin",
+        login_password="admin",
+        login_error="старое сообщение",
+        is_authenticated=False,
+    )
+    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
+
+    redirect = dashboard.State.login.fn(state)
+
+    assert state.is_authenticated is True
+    assert state.login_username == ""
+    assert state.login_password == ""
+    assert state.login_error == ""
+    assert redirect is not None
+
+
+def test_login_rejects_invalid_credentials_and_clears_password(monkeypatch):
+    state = SimpleNamespace(
+        login_username="admin",
+        login_password="wrong",
+        login_error="",
+        is_authenticated=False,
+    )
+    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: False)
+
+    result = dashboard.State.login.fn(state)
+
+    assert result is None
+    assert state.is_authenticated is False
+    assert state.login_username == "admin"
+    assert state.login_password == ""
+    assert state.login_error == "Неверное имя пользователя или пароль."
+
+
+def test_login_hides_auth_configuration_errors(monkeypatch):
+    state = SimpleNamespace(
+        login_username="admin",
+        login_password="admin",
+        login_error="",
+        is_authenticated=False,
+    )
+
+    def unavailable(username, password):
+        raise dashboard.AuthConfigurationError("повреждено")
+
+    monkeypatch.setattr(dashboard, "verify_credentials", unavailable)
+
+    dashboard.State.login.fn(state)
+
+    assert state.is_authenticated is False
+    assert state.login_password == ""
+    assert state.login_error == "Вход временно недоступен."
+
+
+def test_load_dashboard_redirects_anonymous_user_before_loading_history():
+    state = SimpleNamespace(is_authenticated=False)
+
+    redirect = dashboard.State.load_dashboard.fn(state)
+
+    assert redirect is not None
+
+
+def test_load_dashboard_loads_history_for_authenticated_user():
+    calls = []
+    state = SimpleNamespace(is_authenticated=True, load_history=lambda: calls.append(True))
+
+    result = dashboard.State.load_dashboard.fn(state)
+
+    assert result is None
+    assert calls == [True]
+
+
+def test_logout_stops_background_controls_and_resets_state():
+    resets = []
+    state = SimpleNamespace(
+        mail_auto=True,
+        tracking_running=True,
+        real_watching=True,
+        reset=lambda: resets.append(True),
+    )
+
+    redirect = dashboard.State.logout.fn(state)
+
+    assert state.mail_auto is False
+    assert state.tracking_running is False
+    assert state.real_watching is False
+    assert resets == [True]
+    assert redirect is not None
+
+
+def test_auth_middleware_allows_only_public_events_when_anonymous():
+    class StateStore:
+        async def get_state(self, state_class):
+            assert state_class is dashboard.State
+            return SimpleNamespace(is_authenticated=False)
+
+    middleware = dashboard.DashboardAuthMiddleware()
+    prefix = f"{dashboard.State.get_full_name()}."
+    public_event = SimpleNamespace(name=f"{prefix}login", router_data={})
+    protected_event = SimpleNamespace(name=f"{prefix}set_page", router_data={})
+
+    assert asyncio.run(middleware.preprocess(None, StateStore(), public_event)) is None
+    update = asyncio.run(middleware.preprocess(None, StateStore(), protected_event))
+
+    assert update is not None
+    assert len(update.events) == 1
+    assert update.events[0].name == "_redirect"
+
+
+def test_auth_middleware_allows_authenticated_and_driver_events():
+    class StateStore:
+        async def get_state(self, state_class):
+            assert state_class is dashboard.State
+            return SimpleNamespace(is_authenticated=True)
+
+    middleware = dashboard.DashboardAuthMiddleware()
+    dashboard_event = SimpleNamespace(
+        name=f"{dashboard.State.get_full_name()}.set_page",
+        router_data={},
+    )
+    driver_event = SimpleNamespace(name="DriverState.load_active_routes", router_data={})
+
+    assert asyncio.run(middleware.preprocess(None, StateStore(), dashboard_event)) is None
+    assert asyncio.run(middleware.preprocess(None, StateStore(), driver_event)) is None

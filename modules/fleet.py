@@ -1,7 +1,11 @@
 """Локальный справочник водителей, транспорта и назначений заказов."""
 
+import base64
+import hashlib
+import hmac
 import json
 import re
+import secrets
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -149,6 +153,21 @@ def update_vehicle(
     raise FleetError("Транспорт не найден")
 
 
+def _driver_login(value: str) -> str:
+    login = _text(value)
+    if login and not re.fullmatch(r"[A-Za-z0-9_-]{3,32}", login):
+        raise FleetError("Код входа должен содержать 3–32 латинские буквы, цифры, «-» или «_»")
+    return login
+
+
+def _assert_unique_driver_login(drivers: list[dict], login: str, current_id: str = "") -> None:
+    if login and any(
+        item.get("id") != current_id and str(item.get("login", "")).casefold() == login.casefold()
+        for item in drivers
+    ):
+        raise FleetError("Водитель с таким кодом входа уже есть")
+
+
 def _driver_payload(
     name: str,
     phone: str,
@@ -159,6 +178,7 @@ def _driver_payload(
     default_vehicle_id: str,
     photo: str = "",
     documents: list[dict] | None = None,
+    login: str = "",
 ) -> dict:
     name = _text(name)
     if not name:
@@ -181,6 +201,7 @@ def _driver_payload(
         "default_vehicle_id": _text(default_vehicle_id),
         "photo": photo,
         "documents": documents or [],
+        "login": _driver_login(login),
     }
 
 
@@ -197,11 +218,15 @@ def add_driver(
     hired_on: str = "",
     notes: str = "",
     default_vehicle_id: str = "",
+    login: str = "",
 ) -> dict:
     data = load_fleet()
     _assert_vehicle_exists(data["vehicles"], default_vehicle_id)
-    driver = _driver_payload(name, phone, rating, active, hired_on, notes, default_vehicle_id)
+    driver = _driver_payload(name, phone, rating, active, hired_on, notes, default_vehicle_id, login=login)
     driver["id"] = str(uuid.uuid4())
+    if not driver["login"]:
+        driver["login"] = f"drv-{driver['id'].replace('-', '')[:8]}"
+    _assert_unique_driver_login(data["drivers"], driver["login"])
     data["drivers"].append(driver)
     save_fleet(data)
     return driver
@@ -216,6 +241,7 @@ def update_driver(
     hired_on: str,
     notes: str,
     default_vehicle_id: str,
+    login: str = "",
 ) -> dict:
     data = load_fleet()
     _assert_vehicle_exists(data["vehicles"], default_vehicle_id)
@@ -232,8 +258,13 @@ def update_driver(
                 default_vehicle_id,
                 item.get("photo", ""),
                 item.get("documents") if isinstance(item.get("documents"), list) else [],
+                login or item.get("login", ""),
             )
             driver["id"] = driver_id
+            _assert_unique_driver_login(data["drivers"], driver["login"], driver_id)
+            for credential_field in ("pin_algorithm", "pin_iterations", "pin_salt", "pin_hash"):
+                if credential_field in item:
+                    driver[credential_field] = item[credential_field]
             data["drivers"][index] = driver
             save_fleet(data)
             return driver
@@ -270,6 +301,80 @@ def delete_driver(driver_id: str) -> None:
 
 def active_drivers() -> list[dict]:
     return [item for item in load_fleet()["drivers"] if item.get("active")]
+
+
+PIN_ALGORITHM = "pbkdf2_sha256"
+PIN_ITERATIONS = 300_000
+_PIN_SALT_BYTES = 16
+_PIN_HASH_BYTES = 32
+
+
+def _validate_pin(pin: str) -> str:
+    pin = str(pin or "").strip()
+    if not pin.isdigit() or not 4 <= len(pin) <= 12:
+        raise FleetError("PIN должен содержать от 4 до 12 цифр")
+    return pin
+
+
+def set_driver_pin(driver_id: str, pin: str) -> None:
+    pin = _validate_pin(pin)
+    data = load_fleet()
+    for driver in data["drivers"]:
+        if driver.get("id") != driver_id:
+            continue
+        salt = secrets.token_bytes(_PIN_SALT_BYTES)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", pin.encode("utf-8"), salt, PIN_ITERATIONS, dklen=_PIN_HASH_BYTES
+        )
+        driver.update({
+            "pin_algorithm": PIN_ALGORITHM,
+            "pin_iterations": PIN_ITERATIONS,
+            "pin_salt": base64.b64encode(salt).decode("ascii"),
+            "pin_hash": base64.b64encode(digest).decode("ascii"),
+        })
+        save_fleet(data)
+        return
+    raise FleetError("Водитель не найден")
+
+
+def verify_driver_pin(driver_id: str, pin: str) -> bool:
+    pin = str(pin or "").strip()
+    if not pin.isdigit() or not 4 <= len(pin) <= 12:
+        return False
+    driver = next((item for item in load_fleet()["drivers"] if item.get("id") == driver_id), None)
+    if not driver or not driver.get("active"):
+        return False
+    if driver.get("pin_algorithm") != PIN_ALGORITHM:
+        return False
+    try:
+        salt = base64.b64decode(driver["pin_salt"], validate=True)
+        expected = base64.b64decode(driver["pin_hash"], validate=True)
+        iterations = int(driver["pin_iterations"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not 100_000 <= iterations <= 1_000_000 or len(salt) < _PIN_SALT_BYTES:
+        return False
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256", pin.encode("utf-8"), salt, iterations, dklen=_PIN_HASH_BYTES
+    )
+    return hmac.compare_digest(candidate, expected)
+
+
+def driver_by_id(driver_id: str) -> dict | None:
+    return next((item for item in load_fleet()["drivers"] if item.get("id") == driver_id), None)
+
+
+def driver_by_login(login: str) -> dict | None:
+    normalized = _text(login).casefold()
+    if not normalized:
+        return None
+    return next(
+        (
+            item for item in load_fleet()["drivers"]
+            if str(item.get("login", "")).casefold() == normalized
+        ),
+        None,
+    )
 
 
 def active_vehicles() -> list[dict]:

@@ -20,6 +20,7 @@ for _dir in (
     paths.LOGS_FOLDER,
     paths.UPLOADS_FOLDER,
     paths.TRACKING_FOLDER,
+    paths.DRIVER_ORDERS_FOLDER,
 ):
     _dir.mkdir(parents=True, exist_ok=True)
 

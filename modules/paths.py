@@ -39,11 +39,13 @@ WEIGHT_LOG_FILE = DATA_DIR / "weight_log.xlsx"
 ROUTE_DRIVERS_FILE = CONFIG_DIR / "route_drivers.json"
 FLEET_FILE = CONFIG_DIR / "fleet.json"
 AI_SETTINGS_FILE = CONFIG_DIR / "ai.json"
+DASHBOARD_AUTH_FILE = CONFIG_DIR / "auth.json"
 INVOICE_OCR_JOURNAL_FILE = DATA_DIR / "invoice_ocr_journal.json"
 INVOICE_OCR_PHOTOS_FOLDER = DATA_DIR / "invoice_ocr_photos"
 ORDER_ROUTE_ASSIGNMENTS_FILE = DATA_DIR / "order_route_assignments.json"
 DRIVER_PHOTOS_FOLDER = DATA_DIR / "driver_photos"
 DRIVER_DOCUMENTS_FOLDER = DATA_DIR / "driver_documents"
+DRIVER_ORDERS_FOLDER = DATA_DIR / "driver_orders"
 GDEMOI_FILE = CONFIG_DIR / "gdemoi.json"
 
 

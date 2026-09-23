@@ -133,3 +133,26 @@ def test_records_assignment_snapshot():
     assert data["version"] == 1
     assert data["items"][0]["order_file"] == "order.xlsx"
     assert data["items"][0]["routes"][0]["driver_name"] == "Иван"
+
+
+def test_driver_pin_is_hashed_and_can_be_verified():
+    driver = fleet.add_driver("Иван")
+
+    fleet.set_driver_pin(driver["id"], "1234")
+
+    saved = fleet.load_fleet()["drivers"][0]
+    assert saved["pin_hash"] != "1234"
+    assert saved["pin_salt"]
+    assert fleet.verify_driver_pin(driver["id"], "1234") is True
+    assert fleet.verify_driver_pin(driver["id"], "9999") is False
+
+
+def test_driver_pin_validation_and_update_preserve_credentials():
+    driver = fleet.add_driver("Иван")
+    fleet.set_driver_pin(driver["id"], "123456")
+
+    with pytest.raises(fleet.FleetError, match="от 4 до 12"):
+        fleet.set_driver_pin(driver["id"], "123")
+
+    fleet.update_driver(driver["id"], "Иванов", "", 5, True, "", "", "")
+    assert fleet.verify_driver_pin(driver["id"], "123456") is True

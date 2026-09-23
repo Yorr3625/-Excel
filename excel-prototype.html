@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>-Excel — прототип интерфейса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.7.0/dist/tabler-icons.min.css">
+<style>
+:root{
+  --purple:#7B68EE;
+  --purple-dark:#5B4FD6;
+  --purple-bg:#F0EEFE;
+  --page:#F7F8FA;
+  --panel:#FFFFFF;
+  --line:#E7E9EE;
+  --line-soft:#F0F1F4;
+  --ink:#2B3038;
+  --ink-2:#6E7684;
+  --ink-3:#9AA1AC;
+  --gray-bg:#F1F2F5;
+  --blue:#3B82F6;  --blue-bg:#E8F1FE;
+  --amber:#B06E00;  --amber-bg:#FDF1DC;
+  --green:#177245;  --green-bg:#E4F5EA;
+  --red:#C6362F;    --red-bg:#FDEAE8;
+  --r:8px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:Inter,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:var(--page); color:var(--ink);
+  font-size:13px; line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+button{font-family:inherit;font-size:inherit;cursor:pointer}
+input{font-family:inherit;font-size:inherit}
+:focus-visible{outline:2px solid var(--purple);outline-offset:2px}
+
+.app{display:flex;min-height:100vh}
+
+/* ---------- левый рельс ---------- */
+.rail{
+  width:64px;flex:none;background:var(--panel);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;align-items:center;gap:4px;padding:12px 0;
+}
+.logo{
+  width:32px;height:32px;border-radius:9px;background:var(--purple);color:#fff;
+  display:flex;align-items:center;justify-content:center;font-weight:600;font-size:15px;margin-bottom:10px;
+}
+.rail-item{
+  width:52px;padding:7px 0;border:0;background:none;border-radius:var(--r);
+  display:flex;flex-direction:column;align-items:center;gap:3px;color:var(--ink-2);
+}
+.rail-item i{font-size:20px}
+.rail-item span{font-size:10px;letter-spacing:.1px}
+.rail-item:hover{background:var(--gray-bg)}
+.rail-item.on{color:var(--purple);background:var(--purple-bg)}
+
+/* ---------- шапка ---------- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{
+  background:var(--panel);border-bottom:1px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;height:52px;
+}
+.crumbs{display:flex;align-items:center;gap:7px;color:var(--ink-2);min-width:0}
+.crumbs i{font-size:16px}
+.crumbs .sep{color:var(--ink-3)}
+.crumbs .now{color:var(--ink);font-weight:500}
+.top-actions{display:flex;align-items:center;gap:8px}
+.search{
+  display:flex;align-items:center;gap:6px;background:var(--page);border:1px solid var(--line);
+  border-radius:var(--r);padding:0 10px;height:32px;width:200px;
+}
+.search i{color:var(--ink-3);font-size:16px}
+.search input{border:0;background:none;outline:none;width:100%;color:var(--ink)}
+.btn{
+  height:32px;padding:0 12px;border:1px solid var(--line);background:var(--panel);
+  border-radius:var(--r);color:var(--ink);display:inline-flex;align-items:center;gap:6px;white-space:nowrap;
+}
+.btn:hover{background:var(--gray-bg)}
+.btn i{font-size:16px}
+.btn-primary{background:var(--purple);border-color:var(--purple);color:#fff;font-weight:500}
+.btn-primary:hover{background:var(--purple-dark)}
+
+/* ---------- вкладки ---------- */
+.tabs{
+  background:var(--panel);border-bottom:1px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;
+}
+.tablist{display:flex;gap:2px;overflow-x:auto}
+.tab{
+  border:0;background:none;color:var(--ink-2);padding:11px 12px;
+  display:inline-flex;align-items:center;gap:6px;border-bottom:2px solid transparent;white-space:nowrap;
+}
+.tab i{font-size:16px}
+.tab:hover{color:var(--ink)}
+.tab.on{color:var(--ink);font-weight:500;border-bottom-color:var(--purple)}
+.tabs .btn-primary{margin:8px 0}
+
+.view{padding:18px 16px 40px;max-width:1180px}
+.view[hidden]{display:none}
+
+/* ---------- карточки метрик ---------- */
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.metric .lbl{color:var(--ink-2);font-size:12px}
+.metric .num{font-size:26px;font-weight:600;letter-spacing:-.5px;margin-top:2px}
+.metric .sub{font-size:11px;color:var(--ink-3)}
+.metric .num.ok{color:var(--green)}
+.metric .num.warn{color:var(--amber)}
+
+.cols{display:grid;grid-template-columns:1.35fr 1fr;gap:16px;align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.card-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;border-bottom:1px solid var(--line-soft);
+}
+.card-head h2{margin:0;font-size:14px;font-weight:600}
+.card-head .link{color:var(--purple);border:0;background:none;padding:0;font-weight:500}
+.card-body{padding:6px 16px 14px}
+
+/* загрузка маршрутов */
+.load-row{padding:11px 0;border-bottom:1px solid var(--line-soft)}
+.load-row:last-child{border-bottom:0}
+.load-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}
+.load-name{display:flex;align-items:center;gap:8px;min-width:0}
+.load-name b{font-weight:500}
+.load-meta{color:var(--ink-3);font-size:11px;white-space:nowrap}
+.bar{height:6px;border-radius:99px;background:var(--gray-bg);overflow:hidden}
+.bar span{display:block;height:100%;border-radius:99px;background:var(--purple)}
+.bar span.full{background:var(--green)}
+.bar span.over{background:var(--red)}
+
+/* лента внимания */
+.alert{display:flex;gap:10px;padding:11px 0;border-bottom:1px solid var(--line-soft)}
+.alert:last-child{border-bottom:0}
+.alert i{font-size:18px;flex:none;margin-top:1px}
+.alert .t{font-weight:500}
+.alert .d{color:var(--ink-2);font-size:12px}
+.i-red{color:var(--red)} .i-amber{color:var(--amber)} .i-blue{color:var(--blue)}
+
+/* ---------- группы и таблица ---------- */
+.group{margin-bottom:22px}
+.group-head{display:flex;align-items:center;gap:9px;padding:6px 2px 9px;width:100%;border:0;background:none;text-align:left}
+.group-head .chev{color:var(--ink-2);font-size:16px;transition:transform .15s}
+.group.closed .chev{transform:rotate(-90deg)}
+.group.closed .table-wrap{display:none}
+.pill{font-size:12px;font-weight:500;padding:3px 11px;border-radius:99px;white-space:nowrap}
+.p-purple{background:var(--purple-bg);color:var(--purple-dark)}
+.p-blue{background:var(--blue-bg);color:#1D4FA8}
+.p-amber{background:var(--amber-bg);color:var(--amber)}
+.p-green{background:var(--green-bg);color:var(--green)}
+.p-red{background:var(--red-bg);color:var(--red)}
+.p-gray{background:var(--gray-bg);color:var(--ink-2)}
+.group-meta{color:var(--ink-3);font-size:12px}
+
+.table-wrap{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th{
+  text-align:left;font-weight:400;color:var(--ink-3);font-size:11px;
+  padding:8px 12px;border-bottom:1px solid var(--line-soft);
+}
+td{padding:10px 12px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:#FAFAFC}
+.c-name{width:40%}
+.c-drv{width:11%} .c-time{width:16%} .c-st{width:17%} .c-qty{width:11%;text-align:right}
+.cell-name{display:flex;align-items:center;gap:9px;min-width:0}
+.cell-name .txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tick{
+  width:17px;height:17px;flex:none;border:1.5px solid #C6CAD2;border-radius:50%;background:none;padding:0;
+  display:flex;align-items:center;justify-content:center;color:transparent;
+}
+.tick i{font-size:11px}
+.tick:hover{border-color:var(--purple)}
+tr.done .tick{background:var(--green);border-color:var(--green);color:#fff}
+tr.done .cell-name .txt{color:var(--ink-3);text-decoration:line-through}
+.avatar{
+  width:24px;height:24px;border-radius:50%;background:var(--purple-bg);color:var(--purple-dark);
+  display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;
+}
+.avatar.empty{background:none;border:1px dashed #C6CAD2;color:var(--ink-3);font-weight:400;font-size:13px}
+.muted{color:var(--ink-2)}
+.sub-row .cell-name{padding-left:26px}
+.sub-row .txt{color:var(--ink-2)}
+.addrow td{color:var(--ink-3)}
+.addrow:hover td{color:var(--purple)}
+
+/* ---------- накладные ---------- */
+.scan{display:flex;align-items:center;gap:12px;padding:11px 14px;border-bottom:1px solid var(--line-soft)}
+.scan:last-child{border-bottom:0}
+.scan.confirmed{background:#FBFCFB}
+.thumb{
+  width:38px;height:38px;flex:none;border-radius:var(--r);background:var(--gray-bg);
+  display:flex;align-items:center;justify-content:center;color:var(--ink-3);
+}
+.thumb i{font-size:19px}
+.scan .info{flex:1;min-width:0}
+.scan .info b{font-weight:500;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.scan .info small{color:var(--ink-3);font-size:11px}
+.scan .info small.bad{color:var(--red)}
+.qty{width:56px;height:32px;text-align:center;border:1px solid var(--line);border-radius:var(--r);background:var(--panel);color:var(--ink)}
+.qty:focus{outline:none;border-color:var(--purple);box-shadow:0 0 0 3px var(--purple-bg)}
+.ok-btn{
+  width:32px;height:32px;flex:none;border:1px solid var(--line);background:var(--panel);
+  border-radius:var(--r);color:var(--ink-3);display:flex;align-items:center;justify-content:center;
+}
+.ok-btn i{font-size:17px}
+.ok-btn:hover{border-color:var(--green);color:var(--green)}
+.scan.confirmed .ok-btn{background:var(--green);border-color:var(--green);color:#fff}
+.empty{padding:26px 16px;text-align:center;color:var(--ink-2)}
+.empty b{display:block;font-weight:500;color:var(--ink);margin-bottom:3px}
+
+@media (max-width:820px){
+  .cols{grid-template-columns:1fr}
+  .search{display:none}
+  .c-drv,.c-time{display:none}
+  .c-name{width:52%} .c-st{width:30%} .c-qty{width:18%}
+  .rail{width:52px}
+  .rail-item span{display:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <nav class="rail" aria-label="Разделы">
+    <div class="logo">Э</div>
+    <button class="rail-item" data-go="summary"><i class="ti ti-layout-dashboard"></i><span>Сводка</span></button>
+    <button class="rail-item on" data-go="routes"><i class="ti ti-truck-delivery"></i><span>Рейсы</span></button>
+    <button class="rail-item" data-go="scans"><i class="ti ti-file-invoice"></i><span>Накладные</span></button>
+    <button class="rail-item"><i class="ti ti-users"></i><span>Водители</span></button>
+    <button class="rail-item"><i class="ti ti-settings"></i><span>Настройки</span></button>
+  </nav>
+
+  <div class="main">
+
+    <header class="topbar">
+      <div class="crumbs">
+        <i class="ti ti-building-warehouse"></i>
+        <span>Склад</span><span class="sep">/</span>
+        <span>Рейсы</span><span class="sep">/</span>
+        <span class="now">12 сентября</span>
+      </div>
+      <div class="top-actions">
+        <div class="search"><i class="ti ti-search"></i><input id="q" placeholder="Найти магазин или товар"></div>
+        <button class="btn"><i class="ti ti-upload"></i>Загрузить файл</button>
+        <button class="btn"><i class="ti ti-download"></i>Экспорт</button>
+      </div>
+    </header>
+
+    <div class="tabs">
+      <div class="tablist" role="tablist">
+        <button class="tab" data-go="summary"><i class="ti ti-chart-pie"></i>Сводка дня</button>
+        <button class="tab on" data-go="routes"><i class="ti ti-list"></i>Маршруты</button>
+        <button class="tab" data-go="scans"><i class="ti ti-scan"></i>Накладные</button>
+        <button class="tab"><i class="ti ti-map-2"></i>Карта</button>
+      </div>
+      <button class="btn btn-primary"><i class="ti ti-plus"></i>Новый заказ</button>
+    </div>
+
+    <!-- ================= СВОДКА ================= -->
+    <section class="view" id="summary" hidden>
+      <div class="metrics">
+        <div class="metric"><div class="lbl">Заказов на день</div><div class="num">128</div><div class="sub">на 9 маршрутов</div></div>
+        <div class="metric"><div class="lbl">Отгружено</div><div class="num ok">86</div><div class="sub">67% плана</div></div>
+        <div class="metric"><div class="lbl">Свободных мест</div><div class="num">41</div><div class="sub">из 340 по фургонам</div></div>
+        <div class="metric"><div class="lbl">Требует решения</div><div class="num warn">5</div><div class="sub">2 просрочены</div></div>
+      </div>
+
+      <div class="cols">
+        <div class="card">
+          <div class="card-head">
+            <h2>Загрузка маршрутов</h2>
+            <button class="link" data-go="routes">Открыть список</button>
+          </div>
+          <div class="card-body">
+            <div class="load-row">
+              <div class="load-top">
+                <div class="load-name"><span class="pill p-purple">Маршрут 1</span><b>Восток</b><span class="muted">· Ковалёв</span></div>
+                <span class="load-meta">38 / 40 мест</span>
+              </div>
+              <div class="bar"><span style="width:95%"></span></div>
+            </div>
+            <div class="load-row">
+              <div class="load-top">
+                <div class="load-name"><span class="pill p-blue">Маршрут 2</span><b>Юг</b><span class="muted">· без водителя</span></div>
+                <span class="load-meta">22 / 40 мест</span>
+              </div>
+              <div class="bar"><span style="width:55%"></span></div>
+            </div>
+            <div class="load-row">
+              <div class="load-top">
+                <div class="load-name"><span class="pill p-green">Маршрут 3</span><b>Центр</b><span class="muted">· Пахомов</span></div>
+                <span class="load-meta">40 / 40 мест</span>
+              </div>
+              <div class="bar"><span class="full" style="width:100%"></span></div>
+            </div>
+            <div class="load-row">
+              <div class="load-top">
+                <div class="load-name"><span class="pill p-red">Маршрут 4</span><b>Запад</b><span class="muted">· Гринёв</span></div>
+                <span class="load-meta">44 / 40 мест</span>
+              </div>
+              <div class="bar"><span class="over" style="width:100%"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Требует решения</h2><span class="muted">5</span></div>
+          <div class="card-body">
+            <div class="alert">
+              <i class="ti ti-alert-triangle i-red"></i>
+              <div><div class="t">Маршрут 4 перегружен</div><div class="d">4 короба не влезают в фургон — перенести на маршрут 2</div></div>
+            </div>
+            <div class="alert">
+              <i class="ti ti-user-off i-amber"></i>
+              <div><div class="t">На маршрут 2 не назначен водитель</div><div class="d">Выезд через 40 минут</div></div>
+            </div>
+            <div class="alert">
+              <i class="ti ti-clock-exclamation i-red"></i>
+              <div><div class="t">Бристоль, пр. Мира 4</div><div class="d">Окно приёмки закрылось в 11:00</div></div>
+            </div>
+            <div class="alert">
+              <i class="ti ti-scan i-blue"></i>
+              <div><div class="t">44 строки в накладных на проверку</div><div class="d">Распознавание не уверено в количестве</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= МАРШРУТЫ ================= -->
+    <section class="view" id="routes">
+
+      <div class="group">
+        <button class="group-head">
+          <i class="ti ti-chevron-down chev"></i>
+          <span class="pill p-purple">Маршрут 1 — Восток</span>
+          <span class="group-meta">6 точек · Ковалёв · выезд 07:30</span>
+        </button>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th class="c-name">Магазин</th><th class="c-drv">Водитель</th>
+              <th class="c-time">Окно приёмки</th><th class="c-st">Статус</th><th class="c-qty">Мест</th>
+            </tr></thead>
+            <tbody>
+              <tr class="done">
+                <td><div class="cell-name"><button class="tick" aria-label="Отметить"><i class="ti ti-check"></i></button><span class="txt">Магнит, ул. Артёма 118</span></div></td>
+                <td><span class="avatar">КВ</span></td>
+                <td class="muted">08:00–10:00</td>
+                <td><span class="pill p-green">Отгружен</span></td>
+                <td class="c-qty muted">14</td>
+              </tr>
+              <tr>
+                <td><div class="cell-name"><button class="tick" aria-label="Отметить"><i class="ti ti-check"></i></button><span class="txt">Пятёрочка №241, б-р Шевченко</span></div></td>
+                <td><span class="avatar">КВ</span></td>
+                <td class="muted">10:00–12:00</td>
+                <td><span class="pill p-amber">В пути</span></td>
+                <td class="c-qty muted">9</td>
+              </tr>
+              <tr class="sub-row">
+                <td><div class="cell-name"><i class="ti ti-corner-down-right" style="color:#9AA1AC;font-size:14px"></i><span class="txt">Довоз: молочка, 2 короба</span></div></td>
+                <td><span class="avatar">КВ</span></td>
+                <td class="muted">12:30</td>
+                <td><span class="pill p-gray">Ожидает</span></td>
+                <td class="c-qty muted">2</td>
+              </tr>
+              <tr>
+                <td><div class="cell-name"><button class="tick" aria-label="Отметить"><i class="ti ti-check"></i></button><span class="txt">Аптека «Витамин», ул. Челюскинцев 6</span></div></td>
+                <td><span class="avatar">КВ</span></td>
+                <td class="muted">12:00–14:00</td>
+                <td><span class="pill p-gray">Ожидает</span></td>
+                <td class="c-qty muted">3</td>
+              </tr>
+              <tr class="addrow"><td colspan="5"><div class="cell-name"><i class="ti ti-plus" style="font-size:15px"></i><span>Добавить точку</span></div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="group">
+        <button class="group-head">
+          <i class="ti ti-chevron-down chev"></i>
+          <span class="pill p-blue">Маршрут 2 — Юг</span>
+          <span class="group-meta">4 точки · водитель не назначен</span>
+        </button>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th class="c-name">Магазин</th><th class="c-drv">Водитель</th>
+              <th class="c-time">Окно приёмки</th><th class="c-st">Статус</th><th class="c-qty">Мест</th>
+            </tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="cell-name"><button class="tick" aria-label="Отметить"><i class="ti ti-check"></i></button><span class="txt">Бристоль, пр. Мира 4</span></div></td>
+                <td><span class="avatar empty">+</span></td>
+                <td class="muted">09:00–11:00</td>
+                <td><span class="pill p-red">Просрочен</span></td>
+                <td class="c-qty muted">7</td>
+              </tr>
+              <tr>
+                <td><div class="cell-name"><button class="tick" aria-label="Отметить"><i class="ti ti-check"></i></button><span class="txt">Продукты 24, ул. Стадионная 2</span></div></td>
+                <td><span class="avatar empty">+</span></td>
+                <td class="muted">11:00–13:00</td>
+                <td><span class="pill p-gray">Ожидает</span></td>
+                <td class="c-qty muted">11</td>
+              </tr>
+              <tr class="addrow"><td colspan="5"><div class="cell-name"><i class="ti ti-plus" style="font-size:15px"></i><span>Добавить точку</span></div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="group closed">
+        <button class="group-head">
+          <i class="ti ti-chevron-down chev"></i>
+          <span class="pill p-gray">Без маршрута</span>
+          <span class="group-meta">3 заказа · не распределены</span>
+        </button>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th class="c-name">Магазин</th><th class="c-drv">Водитель</th>
+              <th class="c-time">Окно приёмки</th><th class="c-st">Статус</th><th class="c-qty">Мест</th>
+            </tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="cell-name"><button class="tick" aria-label="Отметить"><i class="ti ti-check"></i></button><span class="txt">Копейка, ул. Университетская 41</span></div></td>
+                <td><span class="avatar empty">+</span></td>
+                <td class="muted">весь день</td>
+                <td><span class="pill p-gray">Новый</span></td>
+                <td class="c-qty muted">6</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= НАКЛАДНЫЕ ================= -->
+    <section class="view" id="scans" hidden>
+      <div class="metrics">
+        <div class="metric"><div class="lbl">Страниц в партии</div><div class="num">63</div><div class="sub">загружены 09:12</div></div>
+        <div class="metric"><div class="lbl">Строк распознано</div><div class="num">918</div><div class="sub">Yandex Vision</div></div>
+        <div class="metric"><div class="lbl">Уверенно</div><div class="num ok">874</div><div class="sub">совпадение выше 85%</div></div>
+        <div class="metric"><div class="lbl">На проверку</div><div class="num warn" id="left-num">3</div><div class="sub">открыто ниже</div></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-head">
+          <h2>Требует проверки</h2>
+          <button class="btn btn-primary" id="all-btn"><i class="ti ti-checks"></i>Подтвердить все</button>
+        </div>
+        <div id="scan-list">
+          <div class="scan">
+            <div class="thumb"><i class="ti ti-photo"></i></div>
+            <div class="info"><b>Сметана 20% 400 г</b><small>в скане: «Смет 20 400» · страница 12</small></div>
+            <span class="pill p-amber">72%</span>
+            <input class="qty" value="8" inputmode="numeric">
+            <button class="ok-btn" aria-label="Подтвердить"><i class="ti ti-check"></i></button>
+          </div>
+          <div class="scan">
+            <div class="thumb"><i class="ti ti-photo"></i></div>
+            <div class="info"><b>Кефир 2,5% 900 мл</b><small class="bad">два похожих товара — выберите нужный</small></div>
+            <span class="pill p-red">41%</span>
+            <input class="qty" value="12" inputmode="numeric">
+            <button class="ok-btn" aria-label="Подтвердить"><i class="ti ti-check"></i></button>
+          </div>
+          <div class="scan">
+            <div class="thumb"><i class="ti ti-photo"></i></div>
+            <div class="info"><b>Масло сливочное 82,5%</b><small>в скане: «масло сл 82,5» · страница 14</small></div>
+            <span class="pill p-amber">68%</span>
+            <input class="qty" value="5" inputmode="numeric">
+            <button class="ok-btn" aria-label="Подтвердить"><i class="ti ti-check"></i></button>
+          </div>
+        </div>
+        <div class="empty" id="scan-empty" hidden>
+          <b>Все строки проверены</b>
+          Количества можно выгрузить в файл заказа.
+        </div>
+      </div>
+
+      <div class="group closed">
+        <button class="group-head">
+          <i class="ti ti-chevron-down chev"></i>
+          <span class="pill p-green">Распознано уверенно</span>
+          <span class="group-meta">874 строки · проверка не нужна</span>
+        </button>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th class="c-name">Товар</th><th class="c-drv"></th><th class="c-time">Страница</th><th class="c-st">Точность</th><th class="c-qty">Кол-во</th></tr></thead>
+            <tbody>
+              <tr><td><div class="cell-name"><span class="txt">Молоко 3,2% 1 л</span></div></td><td></td><td class="muted">3</td><td><span class="pill p-green">98%</span></td><td class="c-qty muted">24</td></tr>
+              <tr><td><div class="cell-name"><span class="txt">Творог 9% 200 г</span></div></td><td></td><td class="muted">3</td><td><span class="pill p-green">96%</span></td><td class="c-qty muted">18</td></tr>
+              <tr><td><div class="cell-name"><span class="txt">Ряженка 4% 450 мл</span></div></td><td></td><td class="muted">4</td><td><span class="pill p-green">92%</span></td><td class="c-qty muted">10</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<script>
+const views = document.querySelectorAll('.view');
+function show(id){
+  views.forEach(v => v.hidden = v.id !== id);
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.go === id));
+  document.querySelectorAll('.rail-item').forEach(t => t.classList.toggle('on', t.dataset.go === id));
+  document.querySelector('.crumbs .now').textContent =
+    id === 'summary' ? '12 сентября' : id === 'scans' ? 'Партия 3' : '12 сентября';
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('[data-go]').forEach(el =>
+  el.addEventListener('click', () => show(el.dataset.go)));
+
+document.querySelectorAll('.group-head').forEach(h =>
+  h.addEventListener('click', () => h.parentElement.classList.toggle('closed')));
+
+document.querySelectorAll('.tick').forEach(t =>
+  t.addEventListener('click', () => {
+    const row = t.closest('tr');
+    row.classList.toggle('done');
+    const pill = row.querySelector('.pill');
+    if(!pill) return;
+    if(row.classList.contains('done')){
+      pill.dataset.prev = pill.className + '|' + pill.textContent;
+      pill.className = 'pill p-green';
+      pill.textContent = 'Отгружен';
+    } else if(pill.dataset.prev){
+      const [cls, txt] = pill.dataset.prev.split('|');
+      pill.className = cls; pill.textContent = txt;
+    }
+  }));
+
+function refreshCount(){
+  const left = document.querySelectorAll('#scan-list .scan:not(.confirmed)').length;
+  document.getElementById('left-num').textContent = left;
+  document.getElementById('scan-empty').hidden = left !== 0;
+  document.getElementById('scan-list').hidden = left === 0;
+}
+document.querySelectorAll('.ok-btn').forEach(b =>
+  b.addEventListener('click', () => { b.closest('.scan').classList.toggle('confirmed'); refreshCount(); }));
+document.getElementById('all-btn').addEventListener('click', () => {
+  document.querySelectorAll('#scan-list .scan').forEach(s => s.classList.add('confirmed'));
+  refreshCount();
+});
+
+document.getElementById('q').addEventListener('input', e => {
+  const q = e.target.value.trim().toLowerCase();
+  document.querySelectorAll('tbody tr:not(.addrow)').forEach(r =>
+    r.style.display = !q || r.textContent.toLowerCase().includes(q) ? '' : 'none');
+  document.querySelectorAll('.scan').forEach(s =>
+    s.style.display = !q || s.textContent.toLowerCase().includes(q) ? '' : 'none');
+});
+</script>
+</body>
+</html>

@@ -9,12 +9,16 @@ import traceback
 import uuid
 
 import reflex as rx
+from reflex.state import StateUpdate
+from reflex_base.event import Event
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from modules import driver_data, gdemoi, paths
+from modules import driver_data, driver_orders, driver_sessions, gdemoi, paths
+from modules.driver_orders import DriverOrderConflict, DriverOrderError, DriverOrderNotFound
+from modules.auth import AuthConfigurationError, verify_credentials
 from modules.backup import (
     BackupError,
     create_backup,
@@ -85,10 +89,14 @@ from modules.fleet import (
     add_vehicle,
     delete_driver,
     delete_vehicle,
+    driver_by_id,
+    driver_by_login,
     load_fleet,
     record_order_route_assignments,
+    set_driver_pin,
     update_driver,
     update_vehicle,
+    verify_driver_pin,
 )
 from modules.order_preview import PreviewError, build_order_preview
 from modules.styles import conflict_fill, fills_for
@@ -134,30 +142,186 @@ from modules.help_chat import HelpChatError, send_chat_message
 from orders_dashboard import theme as ui
 
 
-async def gps_ping(request: Request):
+async def _json_payload(request: Request) -> dict | None:
     try:
         payload = await request.json()
     except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+        return None
+    return payload if isinstance(payload, dict) else None
 
-    if not isinstance(payload, dict):
-        return JSONResponse({"ok": False, "error": "bad payload"}, status_code=400)
 
-    vehicle = payload.get("vehicle", "")
+def _session(request: Request, mutate: bool = False):
+    token = request.cookies.get(driver_sessions.SESSION_COOKIE)
+    session = driver_sessions.get_session(token)
+    if session is None:
+        return None, JSONResponse({"ok": False, "error": "Требуется вход"}, status_code=401)
+    driver = driver_by_id(str(session.get("driver_id", "")))
+    if driver is None or not driver.get("active"):
+        driver_sessions.destroy_session(token)
+        return None, JSONResponse({"ok": False, "error": "Профиль недоступен"}, status_code=401)
+    cache_key = request.headers.get("x-driver-cache-key")
+    if cache_key and cache_key != session["driver_id"]:
+        return None, JSONResponse({"ok": False, "error": "Недействительный запрос"}, status_code=403)
+    if mutate and not driver_sessions.valid_csrf(
+        session, request.headers.get("x-driver-csrf")
+    ):
+        return None, JSONResponse({"ok": False, "error": "Недействительный запрос"}, status_code=403)
+    return session, None
 
-    if not driver_data.is_valid_vehicle(vehicle):
-        return JSONResponse({"ok": False, "error": "unknown vehicle"}, status_code=400)
 
-    driver_data.append_gps(
-        vehicle,
-        payload.get("lat"),
-        payload.get("lon"),
-        payload.get("speed"),
+def _set_driver_cookie(response: JSONResponse, request: Request, token: str) -> None:
+    response.set_cookie(
+        driver_sessions.SESSION_COOKIE,
+        token,
+        max_age=driver_sessions.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
     )
+
+
+def _assignment_for_session(session: dict) -> dict | None:
+    return driver_orders.find_assignment_for_driver(str(session.get("driver_id", "")))
+
+
+async def driver_login(request: Request):
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+    login = str(payload.get("driver_id", payload.get("login", ""))).strip()
+    pin = str(payload.get("pin", "")).strip()
+    driver = driver_by_login(login) or driver_by_id(login)
+    driver_id = str(driver.get("id", "")) if driver else ""
+    if not driver_id or not verify_driver_pin(driver_id, pin):
+        return JSONResponse({"ok": False, "error": "Неверный идентификатор или PIN"}, status_code=401)
+
+    token, session = driver_sessions.create_session(driver_id)
+    response = JSONResponse({
+        "ok": True,
+        "driver": {"id": driver_id, "name": driver.get("name", "")},
+        "csrf_token": session["csrf_token"],
+    })
+    _set_driver_cookie(response, request, token)
+    return response
+
+
+async def driver_logout(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        if error.status_code == 401:
+            error.delete_cookie(driver_sessions.SESSION_COOKIE, path="/")
+        return error
+    token = request.cookies.get(driver_sessions.SESSION_COOKIE)
+    driver_sessions.destroy_session(token)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(driver_sessions.SESSION_COOKIE, path="/")
+    return response
+
+
+async def driver_me(request: Request):
+    session, error = _session(request)
+    if error:
+        return error
+    driver = next(
+        (item for item in load_fleet().get("drivers", []) if item.get("id") == session["driver_id"]),
+        None,
+    )
+    if driver is None or not driver.get("active"):
+        return JSONResponse({"ok": False, "error": "Профиль недоступен"}, status_code=401)
+    assignment = _assignment_for_session(session)
+    return JSONResponse({
+        "ok": True,
+        "driver": {"id": driver.get("id", ""), "name": driver.get("name", "")},
+        "csrf_token": session["csrf_token"],
+        "assignment": driver_orders.public_snapshot(assignment) if assignment else None,
+    })
+
+
+async def driver_order(request: Request):
+    session, error = _session(request)
+    if error:
+        return error
+    assignment = _assignment_for_session(session)
+    if assignment is None:
+        return JSONResponse({"ok": True, "assignment": None})
+    return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
+
+
+async def driver_complete_store(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+    assignment = _assignment_for_session(session)
+    if assignment is None:
+        return JSONResponse({"ok": False, "error": "Активное назначение не найдено"}, status_code=404)
+    photo = str(payload.get("photo", ""))
+    if ".." in photo or photo.startswith(("/", "\\")):
+        return JSONResponse({"ok": False, "error": "Некорректная фотография"}, status_code=400)
+    try:
+        result = driver_orders.complete_store(
+            driver_orders.sidecar_path(assignment["assignment_id"]),
+            request.path_params["store_id"],
+            payload.get("quantities", {}),
+            str(payload.get("operation_id", "")),
+            payload.get("base_revision", -1),
+            photo,
+        )
+    except DriverOrderConflict as conflict:
+        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+    except DriverOrderNotFound as not_found:
+        return JSONResponse({"ok": False, "error": str(not_found)}, status_code=404)
+    except DriverOrderError as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+    return JSONResponse({"ok": True, "assignment": result})
+
+
+async def driver_sync(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    assignment = _assignment_for_session(session)
+    if assignment is None:
+        return JSONResponse({"ok": True, "assignment": None})
+    return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
+
+
+async def gps_ping(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+    assignment = _assignment_for_session(session)
+    vehicle = assignment.get("route_key") if assignment else ""
+    if not driver_data.is_valid_vehicle(vehicle):
+        return JSONResponse({"ok": False, "error": "Активное назначение не найдено"}, status_code=409)
+    try:
+        lat = float(payload.get("lat"))
+        lon = float(payload.get("lon"))
+        speed = payload.get("speed")
+        speed = float(speed) if speed is not None else None
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "Некорректные координаты"}, status_code=400)
+    if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        return JSONResponse({"ok": False, "error": "Некорректные координаты"}, status_code=400)
+    driver_data.append_gps(vehicle, lat, lon, speed)
     return JSONResponse({"ok": True})
 
 
-custom_api = Starlette(routes=[Route("/api/gps-ping", gps_ping, methods=["POST"])])
+custom_api = Starlette(routes=[
+    Route("/api/driver/login", driver_login, methods=["POST"]),
+    Route("/api/driver/logout", driver_logout, methods=["POST"]),
+    Route("/api/driver/me", driver_me, methods=["GET"]),
+    Route("/api/driver/order", driver_order, methods=["GET"]),
+    Route("/api/driver/order/stores/{store_id}/complete", driver_complete_store, methods=["POST"]),
+    Route("/api/driver/sync", driver_sync, methods=["POST"]),
+    Route("/api/gps-ping", gps_ping, methods=["POST"]),
+])
 
 
 TABLER_ICON_MAP = {
@@ -582,6 +746,52 @@ class State(rx.State):
     search_query: str = ""
     nav_groups: list[dict] = NAV_GROUPS
 
+    is_authenticated: bool = False
+    login_username: str = ""
+    login_password: str = ""
+    login_error: str = ""
+
+    def set_login_username(self, value: str):
+        self.login_username = value
+        self.login_error = ""
+
+    def set_login_password(self, value: str):
+        self.login_password = value
+        self.login_error = ""
+
+    def login(self):
+        try:
+            authenticated = verify_credentials(self.login_username, self.login_password)
+        except AuthConfigurationError:
+            authenticated = False
+            self.login_error = "Вход временно недоступен."
+        else:
+            self.login_error = "" if authenticated else "Неверное имя пользователя или пароль."
+
+        self.login_password = ""
+        if not authenticated:
+            return
+
+        self.is_authenticated = True
+        self.login_username = ""
+        return rx.redirect("/", replace=True)
+
+    def logout(self):
+        self.mail_auto = False
+        self.tracking_running = False
+        self.real_watching = False
+        self.reset()
+        return rx.redirect("/login", replace=True)
+
+    def load_dashboard(self):
+        if not self.is_authenticated:
+            return rx.redirect("/login", replace=True)
+        self.load_history()
+
+    def redirect_authenticated_user(self):
+        if self.is_authenticated:
+            return rx.redirect("/", replace=True)
+
     routes_source: str = "Область"
     # Списки по маршрутам (индексы 0..MAX_ROUTES-1 соответствуют ROUTE_KEYS);
     # сколько из них реально показываются — active_route_count.
@@ -668,12 +878,14 @@ class State(rx.State):
     fleet_vehicle_options: list[str] = [""]
     fleet_status: str = ""
     fleet_driver_id: str = ""
+    fleet_driver_login: str = ""
     fleet_driver_name: str = ""
     fleet_driver_phone: str = ""
     fleet_driver_rating: str = "5"
     fleet_driver_hired_on: str = ""
     fleet_driver_notes: str = ""
     fleet_driver_default_vehicle: str = ""
+    fleet_driver_pin: str = ""
     fleet_driver_active: bool = True
     fleet_vehicle_id: str = ""
     fleet_vehicle_name: str = ""
@@ -2753,6 +2965,7 @@ class State(rx.State):
         self.fleet_drivers = [
             {
                 **driver,
+                "login": driver.get("login") or driver.get("id", ""),
                 "default_vehicle": vehicles_by_id.get(driver.get("default_vehicle_id", ""), {}).get("plate", "—"),
             }
             for driver in data["drivers"]
@@ -2763,7 +2976,7 @@ class State(rx.State):
         self.fleet_status = ""
 
     def set_fleet_driver_field(self, field: str, value: str):
-        if field in {"name", "phone", "rating", "hired_on", "notes", "default_vehicle"}:
+        if field in {"login", "name", "phone", "rating", "hired_on", "notes", "default_vehicle", "pin"}:
             setattr(self, f"fleet_driver_{field}", value)
 
     def set_fleet_driver_active(self, value: bool):
@@ -2771,12 +2984,14 @@ class State(rx.State):
 
     def clear_fleet_driver_form(self):
         self.fleet_driver_id = ""
+        self.fleet_driver_login = ""
         self.fleet_driver_name = ""
         self.fleet_driver_phone = ""
         self.fleet_driver_rating = "5"
         self.fleet_driver_hired_on = ""
         self.fleet_driver_notes = ""
         self.fleet_driver_default_vehicle = ""
+        self.fleet_driver_pin = ""
         self.fleet_driver_active = True
 
     def edit_fleet_driver(self, driver_id: str):
@@ -2785,6 +3000,7 @@ class State(rx.State):
             self.fleet_status = "Водитель не найден"
             return
         self.fleet_driver_id = driver_id
+        self.fleet_driver_login = driver.get("login") or driver_id
         self.fleet_driver_name = driver.get("name", "")
         self.fleet_driver_phone = driver.get("phone", "")
         self.fleet_driver_rating = str(driver.get("rating", 5))
@@ -2798,6 +3014,7 @@ class State(rx.State):
             ),
             "",
         )
+        self.fleet_driver_pin = ""
         self.fleet_driver_active = bool(driver.get("active"))
 
     def save_fleet_driver(self):
@@ -2813,18 +3030,22 @@ class State(rx.State):
             if self.fleet_driver_default_vehicle and not default_vehicle_id:
                 raise FleetError("Выбранный транспорт не найден")
             if self.fleet_driver_id:
+                if self.fleet_driver_pin:
+                    set_driver_pin(self.fleet_driver_id, self.fleet_driver_pin)
                 update_driver(
                     self.fleet_driver_id, self.fleet_driver_name, self.fleet_driver_phone,
                     self.fleet_driver_rating, self.fleet_driver_active, self.fleet_driver_hired_on,
-                    self.fleet_driver_notes, default_vehicle_id,
+                    self.fleet_driver_notes, default_vehicle_id, self.fleet_driver_login,
                 )
                 self.fleet_status = "Карточка водителя обновлена"
             else:
-                add_driver(
+                driver = add_driver(
                     self.fleet_driver_name, self.fleet_driver_phone, self.fleet_driver_rating,
                     self.fleet_driver_active, self.fleet_driver_hired_on, self.fleet_driver_notes,
-                    default_vehicle_id,
+                    default_vehicle_id, self.fleet_driver_login,
                 )
+                if self.fleet_driver_pin:
+                    set_driver_pin(driver["id"], self.fleet_driver_pin)
                 self.fleet_status = "Водитель добавлен"
             self.clear_fleet_driver_form()
             self.load_fleet()
@@ -3055,6 +3276,17 @@ class State(rx.State):
                     self.output_file,
                     self.route_assignments,
                 )
+                published_assignments = [
+                    item for item in self.route_assignments
+                    if item.get("driver_id")
+                ]
+                if published_assignments:
+                    driver_orders.publish_assignments(
+                        self.output_file,
+                        self.mode,
+                        self.selected_file,
+                        published_assignments,
+                    )
             self.route_assignments = []
             self.status = "Обработка завершена"
 
@@ -3428,6 +3660,7 @@ def app_header():
                 color=ui.INK,
                 font_weight=ui.FONT_WEIGHT_MEDIUM,
             ),
+            class_name="app-header-breadcrumb",
             spacing="2",
             align="center",
             min_width="0",
@@ -3459,6 +3692,7 @@ def app_header():
             ),
             rx.box(),
         ),
+        secondary_button("Выйти", on_click=State.logout, width="72px"),
         width="100%",
         height="52px",
         min_height="52px",
@@ -6577,6 +6811,7 @@ def fleet_driver_card(item):
     return rx.hstack(
         rx.vstack(
             rx.text(item["name"], color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            rx.text(item["login"], color=muted(), font_size="12px"),
             rx.text(item["phone"], color=muted(), font_size="12px"),
             rx.text("Рейтинг: ", item["rating"], " / 5", color=muted(), font_size="12px"),
             rx.text("Транспорт: ", item["default_vehicle"], color=muted(), font_size="12px"),
@@ -6620,13 +6855,14 @@ def fleet_vehicle_card(item):
 def fleet_drivers_tab():
     return rx.vstack(
         rx.hstack(
+            fleet_text_field("Код входа", State.fleet_driver_login, lambda value: State.set_fleet_driver_field("login", value)),
             fleet_text_field("ФИО", State.fleet_driver_name, lambda value: State.set_fleet_driver_field("name", value)),
             fleet_text_field("Телефон", State.fleet_driver_phone, lambda value: State.set_fleet_driver_field("phone", value)),
-            fleet_text_field("Рейтинг (1–5)", State.fleet_driver_rating, lambda value: State.set_fleet_driver_field("rating", value), "number"),
             width="100%", spacing="3",
         ),
         rx.hstack(
             fleet_text_field("Дата приёма", State.fleet_driver_hired_on, lambda value: State.set_fleet_driver_field("hired_on", value), "date"),
+            fleet_text_field("PIN водителя", State.fleet_driver_pin, lambda value: State.set_fleet_driver_field("pin", value), "password"),
             rx.vstack(
                 rx.text("Транспорт по умолчанию", color=muted(), font_size="12px"),
                 rx.select(
@@ -6645,6 +6881,7 @@ def fleet_drivers_tab():
             ),
             width="100%", spacing="3",
         ),
+        rx.text("Оставьте PIN пустым при редактировании, чтобы сохранить прежний PIN.", color=muted(), font_size="11px"),
         fleet_text_field("Заметка", State.fleet_driver_notes, lambda value: State.set_fleet_driver_field("notes", value)),
         rx.hstack(
             primary_button("Сохранить водителя", on_click=State.save_fleet_driver),
@@ -6891,7 +7128,71 @@ def help_chat_widget():
     )
 
 
-def dashboard():
+def login_page():
+    return rx.center(
+        rx.vstack(
+            rx.box(
+                "Э",
+                display="flex",
+                align_items="center",
+                justify_content="center",
+                width="40px",
+                height="40px",
+                color=ui.WHITE,
+                background=ui.PURPLE,
+                border_radius=ui.RADIUS_CONTROL,
+                font_size="18px",
+                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
+            ),
+            rx.vstack(
+                rx.heading("Вход в дашборд", size="6", color=ui.INK),
+                rx.text("Введите данные администратора", color=ui.INK_2, font_size="14px"),
+                align="start",
+                spacing="1",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Логин", color=ui.INK_2, font_size="13px"),
+                rx.input(
+                    value=State.login_username,
+                    on_change=State.set_login_username,
+                    placeholder="Логин",
+                    width="100%",
+                    auto_focus=True,
+                ),
+                rx.text("Пароль", color=ui.INK_2, font_size="13px"),
+                rx.input(
+                    value=State.login_password,
+                    on_change=State.set_login_password,
+                    placeholder="Пароль",
+                    type="password",
+                    width="100%",
+                ),
+                rx.cond(
+                    State.login_error != "",
+                    rx.text(State.login_error, color=ui.STATUS_RED_TEXT, font_size="13px"),
+                    rx.box(),
+                ),
+                primary_button("Войти", on_click=State.login, width="100%"),
+                align="start",
+                spacing="2",
+                width="100%",
+            ),
+            width="min(400px, calc(100vw - 32px))",
+            padding="28px",
+            background=ui.PANEL,
+            border=f"1px solid {ui.LINE}",
+            border_radius="14px",
+            spacing="5",
+        ),
+        width="100%",
+        min_height="100vh",
+        padding="16px",
+        background=ui.PAGE,
+    )
+
+
+def dashboard_shell():
     return rx.fragment(
         rx.hstack(
             sidebar(),
@@ -6915,6 +7216,19 @@ def dashboard():
         order_details_drawer(),
         route_assignment_dialog(),
         help_chat_widget(),
+    )
+
+
+def dashboard():
+    return rx.cond(
+        State.is_authenticated,
+        dashboard_shell(),
+        rx.center(
+            rx.spinner(size="3"),
+            width="100%",
+            min_height="100vh",
+            background=ui.PAGE,
+        ),
     )
 
 
@@ -7049,8 +7363,9 @@ def driver_select_screen():
         ),
         spacing="5",
         width="100%",
-        max_width="420px",
+        max_width="620px",
         padding="18px",
+        class_name="driver-select-screen",
     )
 
 
@@ -7112,6 +7427,7 @@ def driver_upload_box():
         border=f"1px solid {border()}",
         border_radius="10px",
         background=surface(),
+        class_name="driver-upload-box",
     )
 
 
@@ -7164,6 +7480,7 @@ def driver_stop_card(stop):
         border_radius="12px",
         background=surface(),
         width="100%",
+        class_name="driver-stop-card",
     )
 
 
@@ -7194,22 +7511,65 @@ def driver_stops_screen():
         ),
         spacing="4",
         width="100%",
-        max_width="480px",
+        max_width="620px",
         padding="20px",
+        class_name="driver-stops-screen",
     )
 
 
 def driver_page():
     return rx.center(
-        rx.cond(
-            DriverState.vehicle_key == "",
-            driver_select_screen(),
-            driver_stops_screen(),
-        ),
+        rx.box(id="driver-app", width="100%"),
+        rx.script(src="/driver-app.js"),
         width="100%",
         min_height="100vh",
         background=page_bg(),
+        class_name="driver-page",
     )
+
+
+class DashboardAuthMiddleware(rx.Middleware):
+    """Не даёт анонимному клиенту вызвать обработчики административного state."""
+
+    _PUBLIC_EVENTS = frozenset({
+        "hydrate",
+        "set_login_username",
+        "set_login_password",
+        "login",
+        "load_dashboard",
+        "redirect_authenticated_user",
+    })
+
+    async def preprocess(self, app, state, event) -> StateUpdate | None:
+        prefix = f"{State.get_full_name()}."
+        if not event.name.startswith(prefix):
+            return None
+
+        event_name = event.name.removeprefix(prefix)
+        if event_name in self._PUBLIC_EVENTS:
+            return None
+
+        dashboard_state = await state.get_state(State)
+        if dashboard_state.is_authenticated:
+            return None
+
+        return StateUpdate(
+            events=Event.from_event_type(
+                rx.redirect("/login", replace=True),
+                router_data=event.router_data,
+            )
+        )
+
+
+PWA_META = [
+    {"name": "theme-color", "content": "#7B68EE"},
+    {"name": "mobile-web-app-capable", "content": "yes"},
+    {"name": "apple-mobile-web-app-capable", "content": "yes"},
+    {"name": "apple-mobile-web-app-status-bar-style", "content": "default"},
+    {"name": "apple-mobile-web-app-title", "content": "Логистика"},
+    rx.el.link(rel="manifest", href="/manifest.webmanifest"),
+    rx.el.link(rel="icon", href="/icon-192.svg", type="image/svg+xml"),
+]
 
 
 app = rx.App(
@@ -7227,5 +7587,25 @@ app = rx.App(
         "font_size": ui.FONT_SIZE_BODY,
     },
 )
-app.add_page(dashboard, route="/", title="Обработка заказов", on_load=State.load_history)
-app.add_page(driver_page, route="/driver", title="Водитель", on_load=DriverState.load_active_routes)
+app.add_middleware(DashboardAuthMiddleware())
+app.add_page(
+    dashboard,
+    route="/",
+    title="Обработка заказов",
+    on_load=State.load_dashboard,
+    meta=PWA_META,
+)
+app.add_page(
+    login_page,
+    route="/login",
+    title="Вход",
+    on_load=State.redirect_authenticated_user,
+    meta=PWA_META,
+)
+app.add_page(
+    driver_page,
+    route="/driver",
+    title="Водитель",
+    on_load=DriverState.load_active_routes,
+    meta=PWA_META,
+)
