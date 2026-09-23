@@ -42,6 +42,22 @@ def test_build_snapshot_reads_route_sheet_without_changing_workbook(order_fixtur
     assert [line["required_qty"] for line in snapshot["stores"][1]["lines"]] == ["4", "0"]
     assert snapshot["revision"] == 0
 
+def test_build_snapshot_keeps_only_positions_present_for_each_store(tmp_path):
+    output = tmp_path / "processed.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Маршрут №1"
+    sheet.append(["Товар", "Сумма", "фм 10", "фм 14", "фм 20"])
+    sheet.append(["Яблоки", "", 10, None, None])
+    sheet.append(["Бананы", "", None, 2.5, None])
+    workbook.save(output)
+
+    snapshot = driver_orders.build_assignment_snapshot(output, "Город", assignment())
+
+    assert [store["name"] for store in snapshot["stores"]] == ["фм 10", "фм 14"]
+    assert [line["name"] for line in snapshot["stores"][0]["lines"]] == ["Яблоки"]
+    assert [line["name"] for line in snapshot["stores"][1]["lines"]] == ["Бананы"]
+
 
 def test_completion_updates_summary_and_is_idempotent(order_fixture):
     snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())

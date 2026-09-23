@@ -10,6 +10,29 @@ let selectedStoreId = "";
 let view = "login";
 let online = navigator.onLine;
 
+const apiBasePromise = (async () => {
+  try {
+    const response = await fetch("/env.json", {credentials: "same-origin"});
+    if (!response.ok) return window.location.origin;
+    const environment = await response.json();
+    const endpoint = new URL(environment.PING, window.location.origin);
+    if (["localhost", "0.0.0.0", "::", "0:0:0:0:0:0:0:0"].includes(endpoint.hostname)) {
+      endpoint.hostname = window.location.hostname;
+      if (window.location.protocol === "https:") {
+        endpoint.protocol = "https:";
+        endpoint.port = "";
+      }
+    }
+    return endpoint.origin;
+  } catch (_) {
+    return window.location.origin;
+  }
+})();
+
+async function apiUrl(path) {
+  return `${await apiBasePromise}${path}`;
+}
+
 function openDb() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -130,7 +153,7 @@ function renderLogin() {
     button.disabled = true;
     setMessage("Проверяем данные…");
     try {
-      const response = await fetch("/api/driver/login", {
+      const response = await fetch(await apiUrl("/api/driver/login"), {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         credentials: "include",
@@ -208,7 +231,7 @@ function renderStore() {
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
   if (options.method && options.method !== "GET") headers["X-Driver-CSRF"] = csrfToken;
-  const response = await fetch(path, {...options, headers, credentials: "include"});
+  const response = await fetch(await apiUrl(path), {...options, headers, credentials: "include"});
   if (!response.ok) {
     let data = {};
     try { data = await response.json(); } catch (_) {}

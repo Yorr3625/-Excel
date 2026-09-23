@@ -1,0 +1,82 @@
+name: dostavo
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dostavo-app:1.0.14
+    command:
+      - python
+      - -m
+      - reflex
+      - run
+      - --env
+      - prod
+      - --single-port
+      - --backend-port
+      - "8080"
+    init: true
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  mail-worker:
+    image: dostavo-app:1.0.14
+    command:
+      - python
+      - -m
+      - modules.mail_worker
+    init: true
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    depends_on:
+      app:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - certbot-webroot:/var/www/certbot:ro
+      - letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      app:
+        condition: service_healthy
+
+  certbot:
+    image: certbot/certbot:latest
+    profiles:
+      - certbot
+    volumes:
+      - certbot-webroot:/var/www/certbot
+      - letsencrypt:/etc/letsencrypt
+
+volumes:
+  certbot-webroot:
+  letsencrypt:

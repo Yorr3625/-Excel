@@ -1,0 +1,6 @@
+services:
+  nginx:
+    volumes:
+      - ./nginx.bootstrap.conf:/etc/nginx/nginx.conf:ro
+      - certbot-webroot:/var/www/certbot:ro
+      - letsencrypt:/etc/letsencrypt:ro

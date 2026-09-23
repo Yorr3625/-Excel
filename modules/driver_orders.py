@@ -198,14 +198,17 @@ def build_assignment_snapshot(
         lines = []
         for row, product_name in rows:
             value = sheet.cell(row, column).value
-            planned = _quantity(value) if value not in (None, "") else "0"
+            if value in (None, ""):
+                continue
             lines.append({
                 "line_id": _stable_id(order_id, route_key, store_name, str(row), product_name),
                 "name": product_name,
                 "unit": "",
-                "required_qty": planned,
+                "required_qty": _quantity(value),
                 "actual_qty": "",
             })
+        if not lines:
+            continue
         stores.append({
             "store_id": store_id,
             "name": store_name,

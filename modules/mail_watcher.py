@@ -9,8 +9,10 @@
 import email
 import imaplib
 import json
+import os
 import re
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -27,6 +29,7 @@ SEEN_FILE = DATA_DIR / "mail_seen.json"
 MAIL_ITEMS_FILE = DATA_DIR / "mail_items.json"
 MAIL_UID_CACHE_FILE = DATA_DIR / "mail_uid_cache.json"
 MAIL_ERROR_LOG_FILE = DATA_DIR / "mail_errors.json"
+MAIL_CHECK_LOCK_FILE = DATA_DIR / "mail_check.lock"
 
 SEEN_LIMIT = 500
 MAIL_ITEMS_LIMIT = 1000
@@ -800,7 +803,40 @@ def _base_item(message, source: dict, message_id: str) -> dict:
     }
 
 
-def check_mail(config: dict | None = None) -> dict:
+def _mail_check_lock():
+    """Блокирует обновление почтового кеша между worker и dashboard."""
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with MAIL_CHECK_LOCK_FILE.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+_mail_check_lock = contextmanager(_mail_check_lock)
+
+
+def _check_mail_unlocked(config: dict | None = None) -> dict:
     """Обновляет локальный кеш писем и скачивает только ещё не виденные UID."""
 
     config = config or load_mail_config()
@@ -939,6 +975,13 @@ def check_mail(config: dict | None = None) -> dict:
 
     result["ok"] = True
     return result
+
+
+def check_mail(config: dict | None = None) -> dict:
+    """Обновляет почтовый кеш под межпроцессной блокировкой."""
+
+    with _mail_check_lock():
+        return _check_mail_unlocked(config)
 
 
 def check_mail_with_retry(config: dict | None = None) -> dict:
