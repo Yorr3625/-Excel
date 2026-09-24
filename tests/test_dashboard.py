@@ -247,6 +247,7 @@ def test_load_invoice_ocr_uses_processed_orders_and_journal(monkeypatch):
                 "saved_at": "2026-02-01T10:00:00",
                 "order_file": "новый.xlsx",
                 "route": "Маршрут №1",
+                "store_number": "ФМ 16",
                 "lines": [{"name": "Банан"}],
                 "total": "3500",
             }
@@ -258,6 +259,7 @@ def test_load_invoice_ocr_uses_processed_orders_and_journal(monkeypatch):
     assert state.invoice_ocr_order_options == ["новый.xlsx", "старый.xlsx"]
     assert state.invoice_ocr_order == ""
     assert state.invoice_ocr_entries[0]["line_count"] == 1
+    assert state.invoice_ocr_entries[0]["store_number"] == "ФМ 16"
 
 
 def test_invoice_ocr_line_change_recalculates_total():
@@ -265,6 +267,7 @@ def test_invoice_ocr_line_change_recalculates_total():
         invoice_ocr_rows=[
             {
                 "id": "line",
+                "store_number": "ФМ 16",
                 "name": "Банан",
                 "unit": "кг",
                 "quantity": "2",
@@ -365,8 +368,8 @@ def test_route_groups_use_real_driver_statuses_and_filter():
     groups = route_groups(state)
 
     assert [group["title"] for group in groups] == [
-        "Маршрут №1 — Текстильщик",
-        "Маршрут №2 — Центр",
+        "Маршрут №1 — Горловка, Енакиево, Кировское",
+        "Маршрут №2 — Харцызск, Торез, Шахтерск, Снежное",
     ]
     assert groups[0]["driver_initials"] == "АЗ"
     assert groups[0]["stores"][0]["status"] == "Отгружен"
@@ -410,6 +413,22 @@ def test_route_group_ui_state_and_indexed_removal():
     assert state.route_add_index == -1
 
 
+def test_invoice_ocr_store_number_updates_all_rows():
+    state = SimpleNamespace(
+        invoice_ocr_store_number="ФМ 16",
+        invoice_ocr_rows=[
+            {"id": "first", "store_number": "ФМ 16"},
+            {"id": "second", "store_number": "ФМ 16"},
+        ],
+        invoice_ocr_status="старый статус",
+    )
+
+    dashboard.State.set_invoice_ocr_store_number.fn(state, "ФМ 21")
+
+    assert state.invoice_ocr_store_number == "ФМ 21"
+    assert [row["store_number"] for row in state.invoice_ocr_rows] == ["ФМ 21", "ФМ 21"]
+    assert state.invoice_ocr_status == ""
+
 def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):
     saved = []
     state = SimpleNamespace(
@@ -417,11 +436,13 @@ def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):
         invoice_ocr_order="заказ.xlsx",
         invoice_ocr_order_options=["заказ.xlsx"],
         invoice_ocr_route="Маршрут №1",
+        invoice_ocr_store_number="ФМ 16",
         invoice_ocr_draft_id="a" * 32,
         invoice_ocr_photo_refs=["invoice_ocr_photos/a/photo-01.jpg"],
         invoice_ocr_rows=[
             {
                 "id": "line",
+                "store_number": "ФМ 16",
                 "name": "Банан",
                 "unit": "кг",
                 "quantity": "25",
@@ -443,7 +464,8 @@ def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):
             "saved_at": "2026-02-01T10:00:00",
             "order_file": "заказ.xlsx",
             "route": "Маршрут №1",
-            "lines": [{"name": "Банан"}],
+            "store_number": "ФМ 16",
+            "lines": [{"name": "Банан", "store_number": "ФМ 16"}],
             "total": "3500",
         },
     )
@@ -451,6 +473,7 @@ def test_save_invoice_ocr_draft_saves_then_clears(monkeypatch):
     dashboard.State.save_invoice_ocr_draft.fn(state)
 
     assert len(saved) == 1
+    assert saved[0][3] == "ФМ 16"
     assert state.invoice_ocr_status == "Накладная сохранена в журнале"
     assert state.invoice_ocr_draft_id == ""
     assert state.invoice_ocr_entries[0]["total"] == "3500"

@@ -134,8 +134,10 @@ from modules.invoice_journal import (
 from modules.invoice_ocr import (
     InvoiceOcrError,
     MAX_PHOTOS,
+    OCR_TIMEOUT_SECONDS,
     parse_invoice_lines,
-    recognize_images,
+    parse_invoice_table,
+    recognize_invoice_page,
     validate_and_prepare_photo,
 )
 from modules.help_chat import HelpChatError, send_chat_message
@@ -680,12 +682,15 @@ def _empty_weight_draft_row() -> dict:
 
 
 def format_invoice_journal_entry(entry: dict) -> dict:
+    lines = entry.get("lines", [])
+    first_line = lines[0] if lines else {}
     return {
         "id": entry["id"],
         "saved_at": entry.get("saved_at", "").replace("T", " "),
         "order_file": entry.get("order_file", ""),
         "route": entry.get("route", ""),
-        "line_count": len(entry.get("lines", [])),
+        "store_number": entry.get("store_number", first_line.get("store_number", "")),
+        "line_count": len(lines),
         "total": entry.get("total", "0"),
     }
 
@@ -925,6 +930,7 @@ class State(rx.State):
     invoice_ocr_order: str = ""
     invoice_ocr_order_options: list[str] = []
     invoice_ocr_route: str = ""
+    invoice_ocr_store_number: str = ""
     invoice_ocr_busy: bool = False
     invoice_ocr_status: str = ""
     invoice_ocr_draft_id: str = ""
@@ -2463,8 +2469,15 @@ class State(rx.State):
         self.invoice_ocr_route = value
         self.invoice_ocr_status = ""
 
+    def set_invoice_ocr_store_number(self, value: str):
+        self.invoice_ocr_store_number = value
+        self.invoice_ocr_rows = [
+            {**row, "store_number": value} for row in self.invoice_ocr_rows
+        ]
+        self.invoice_ocr_status = ""
+
     def set_invoice_ocr_line_field(self, row_id: str, field: str, value: str):
-        if field not in {"name", "unit", "quantity", "unit_price", "line_total"}:
+        if field not in {"store_number", "name", "unit", "quantity", "unit_price", "line_total"}:
             return
 
         rows = []
@@ -2485,6 +2498,7 @@ class State(rx.State):
         self.invoice_ocr_rows = self.invoice_ocr_rows + [
             {
                 "id": uuid.uuid4().hex,
+                "store_number": self.invoice_ocr_store_number,
                 "name": "",
                 "unit": "",
                 "quantity": "",
@@ -2510,6 +2524,7 @@ class State(rx.State):
         self.invoice_ocr_draft_id = ""
         self.invoice_ocr_photo_refs = []
         self.invoice_ocr_photo_names = []
+        self.invoice_ocr_store_number = ""
         self.invoice_ocr_raw_text = ""
         self.invoice_ocr_rows = []
 
@@ -2555,21 +2570,46 @@ class State(rx.State):
                 stage_invoice_photos,
                 [(photo.original, photo.extension) for photo in prepared_photos],
             )
-            self.invoice_ocr_status = "Распознаю текст..."
+            recognized_pages = []
+            parsed_rows = []
+            store_number = ""
+            photo_count = len(prepared_photos)
+            for index, photo in enumerate(prepared_photos, start=1):
+                self.invoice_ocr_status = f"Распознаю фото {index} из {photo_count}..."
+                try:
+                    page = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            recognize_invoice_page,
+                            photo.ocr_content,
+                            photo.ocr_mime_type,
+                            api_key,
+                            folder_id,
+                        ),
+                        timeout=OCR_TIMEOUT_SECONDS + 5,
+                    )
+                except TimeoutError as error:
+                    raise InvoiceOcrError(
+                        f"Распознавание фото {index} из {photo_count} заняло слишком долго. "
+                        "Попробуйте загрузить его ещё раз или сделайте фото меньшего размера"
+                    ) from error
+                recognized_pages.append(page.text)
+                parsed_page = parse_invoice_table(page)
+                if not store_number:
+                    store_number = str(parsed_page["store_number"])
+                parsed_rows.extend(parsed_page["items"])
 
-            raw_text = await asyncio.to_thread(
-                recognize_images,
-                prepared_photos,
-                api_key,
-                folder_id,
-            )
-            rows = parse_invoice_lines(raw_text)
+            raw_text = "\n\n".join(page for page in recognized_pages if page.strip()).strip()
+            if not raw_text:
+                raise InvoiceOcrError("Yandex Vision не распознал текст на фотографиях")
+            rows = parsed_rows or parse_invoice_lines(raw_text)
             self.invoice_ocr_draft_id = draft_id
             self.invoice_ocr_photo_refs = photo_refs
             self.invoice_ocr_photo_names = photo_names
+            self.invoice_ocr_store_number = store_number
             self.invoice_ocr_raw_text = raw_text
             self.invoice_ocr_rows = [
-                {"id": uuid.uuid4().hex, **row} for row in rows
+                {"id": uuid.uuid4().hex, "store_number": store_number, **row}
+                for row in rows
             ]
             self.invoice_ocr_busy = False
             self.invoice_ocr_status = (
@@ -2599,6 +2639,9 @@ class State(rx.State):
         if self.invoice_ocr_route not in WEIGHT_ROUTES:
             self.invoice_ocr_status = "Выберите маршрут"
             return
+        if not self.invoice_ocr_store_number.strip():
+            self.invoice_ocr_status = "Укажите номер магазина"
+            return
         if not self.invoice_ocr_draft_id or not self.invoice_ocr_photo_refs:
             self.invoice_ocr_status = "Сначала загрузите и распознайте фотографии"
             return
@@ -2608,6 +2651,7 @@ class State(rx.State):
                 self.invoice_ocr_draft_id,
                 self.invoice_ocr_order,
                 self.invoice_ocr_route,
+                self.invoice_ocr_store_number,
                 self.invoice_ocr_photo_refs,
                 self.invoice_ocr_rows,
             )
@@ -4785,6 +4829,12 @@ def weight_page():
 def invoice_ocr_line(item):
     return rx.hstack(
         rx.input(
+            value=item["store_number"],
+            on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "store_number", value),
+            placeholder="Магазин",
+            width="130px",
+        ),
+        rx.input(
             value=item["name"],
             on_change=lambda value: State.set_invoice_ocr_line_field(item["id"], "name", value),
             placeholder="Наименование",
@@ -4840,6 +4890,7 @@ def invoice_ocr_journal_row(item):
             min_width="200px",
         ),
         weight_stat("Маршрут", item["route"]),
+        weight_stat("Магазин", item["store_number"]),
         weight_stat("Позиций", item["line_count"]),
         weight_stat("Итого", item["total"]),
         width="100%",
@@ -4956,6 +5007,12 @@ def invoice_ocr_page():
                     font_size="12px",
                     font_weight=ui.FONT_WEIGHT_SEMIBOLD,
                 ),
+                weight_field(
+                    "Номер магазина",
+                    State.invoice_ocr_store_number,
+                    State.set_invoice_ocr_store_number,
+                    "Например, ФМ 16",
+                ),
                 rx.text("Исходный текст OCR", color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 rx.box(
                     rx.text(
@@ -4972,10 +5029,11 @@ def invoice_ocr_page():
                     background=surface_alt(),
                 ),
                 rx.hstack(
+                    rx.text("Магазин", color=muted(), font_size="11px", width="130px"),
                     rx.text("Наименование", color=muted(), font_size="11px", min_width="190px", width="100%"),
                     rx.text("Ед.", color=muted(), font_size="11px", width="90px"),
-                    rx.text("Кол-во", color=muted(), font_size="11px", width="110px"),
-                    rx.text("Цена", color=muted(), font_size="11px", width="110px"),
+                    rx.text("Количество", color=muted(), font_size="11px", width="110px"),
+                    rx.text("Цена за ед.", color=muted(), font_size="11px", width="110px"),
                     rx.text("Сумма", color=muted(), font_size="11px", width="120px"),
                     rx.box(width="32px"),
                     width="100%",
