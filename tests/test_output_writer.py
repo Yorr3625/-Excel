@@ -46,3 +46,10 @@ def test_open_result_does_nothing_when_both_settings_disabled(monkeypatch):
     open_result("out.xlsx", {"open_file_after_processing": False, "open_folder_after_processing": False})
 
     assert calls == []
+
+
+def test_open_result_skips_opening_when_startfile_unavailable(monkeypatch):
+    monkeypatch.delattr(os, "startfile", raising=False)
+
+    open_result("out.xlsx", {"open_file_after_processing": True})
+    open_result("out.xlsx", {"open_folder_after_processing": True})

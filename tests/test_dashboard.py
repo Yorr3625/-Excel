@@ -621,6 +621,47 @@ def test_confirm_route_assignments_starts_processing_for_current_preview():
     assert calls == [True]
 
 
+def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
+    settings = {"open_file_after_processing": True, "open_folder_after_processing": True}
+    passed_settings = []
+    published = []
+    monkeypatch.setattr(dashboard, "load_settings", lambda: settings)
+    monkeypatch.setattr(dashboard, "load_stores", lambda path: {})
+    monkeypatch.setattr(dashboard, "run_pipeline", lambda source, options, *args: (
+        passed_settings.append(options) or ("result.xlsx", "order.log", {"route_totals": {}})
+    ))
+    monkeypatch.setattr(dashboard, "record_order_route_assignments", lambda *args: None)
+    monkeypatch.setattr(
+        dashboard.driver_orders, "publish_assignments",
+        lambda *args: published.append(args),
+    )
+    monkeypatch.setattr(dashboard, "record_processing", lambda *args: None)
+    monkeypatch.setattr(dashboard, "was_processed", lambda filename: "сегодня")
+    state = SimpleNamespace(
+        uploaded_file_path="upload.xlsx",
+        preview_ready=True,
+        preview_source="upload.xlsx",
+        preview_mode="Город",
+        mode="Город",
+        active_route_count=1,
+        route_assignments=[{"route": "route_1", "driver_id": "driver-1", "driver_name": "Иван"}],
+        selected_file="upload.xlsx",
+        load_history=lambda: None,
+        _reset_preview=lambda: None,
+    )
+
+    dashboard.State.process_order.fn(state)
+
+    assert state.status == "Обработка завершена"
+    assert state.output_file == "result.xlsx"
+    assert passed_settings == [{
+        "open_file_after_processing": False,
+        "open_folder_after_processing": False,
+    }]
+    assert settings["open_file_after_processing"] is True
+    assert len(published) == 1
+
+
 def test_login_authenticates_and_clears_credentials(monkeypatch):
     state = SimpleNamespace(
         login_username="admin",

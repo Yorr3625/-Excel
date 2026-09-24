@@ -3240,7 +3240,11 @@ class State(rx.State):
 
         try:
             stores_file = paths.stores_file_for(self.mode)
-            settings = load_settings()
+            settings = {
+                **load_settings(),
+                "open_file_after_processing": False,
+                "open_folder_after_processing": False,
+            }
 
             stores = load_stores(stores_file)
             fills = fills_for(self.active_route_count)

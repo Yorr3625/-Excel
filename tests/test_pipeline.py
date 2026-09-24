@@ -39,6 +39,24 @@ def test_process_order_respects_open_file_setting(tmp_path, monkeypatch, groups,
     assert calls == [output_file]
 
 
+def test_process_order_finishes_without_startfile(tmp_path, monkeypatch, groups, sample_order_workbook):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delattr(os, "startfile", raising=False)
+    input_file = tmp_path / "заказ.xlsx"
+    sample_order_workbook.save(input_file)
+
+    output_file, log_file, stats = process_order(
+        str(input_file),
+        {"open_file_after_processing": True, "open_folder_after_processing": False},
+        groups,
+        conflict_fill,
+    )
+
+    assert os.path.isfile(output_file)
+    assert os.path.isfile(log_file)
+    assert stats["route_totals"] == {"Маршрут №1": 5, "Маршрут №2": 5}
+
+
 def test_process_order_handles_a_converted_binary_workbook(
     tmp_path, monkeypatch, groups
 ):

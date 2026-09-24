@@ -23,8 +23,12 @@ def build_output_path(now):
 def open_result(output_file, settings):
     """Открывает готовый файл или папку с ним, согласно настройкам."""
 
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        return
+
     if settings.get("open_file_after_processing"):
-        os.startfile(output_file)
+        startfile(output_file)
 
     elif settings.get("open_folder_after_processing"):
-        os.startfile(os.path.dirname(output_file))
+        startfile(os.path.dirname(output_file))
