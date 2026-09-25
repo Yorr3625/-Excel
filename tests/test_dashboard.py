@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 import asyncio
 
+from starlette.testclient import TestClient
+
 import orders_dashboard.orders_dashboard as dashboard
 from modules.config import MAX_ROUTES
 from modules.weight_log import STAGE_LOADING, STAGE_STORE_SHIPMENT, STAGE_UNLOADING
@@ -226,6 +228,84 @@ def test_history_order_details_keep_processed_time_label():
     assert refreshes == [True]
 
 
+def test_opening_history_refreshes_processed_files():
+    calls = []
+    state = SimpleNamespace(current_page="Заказы", load_history=lambda: calls.append("loaded"))
+
+    dashboard.State.set_page.fn(state, "История")
+
+    assert state.current_page == "История"
+    assert calls == ["loaded"]
+
+
+def test_load_history_includes_downloadable_files_without_changing_order_history(monkeypatch):
+    entries = [{
+        "relative_path": "24.09.26/заказ_обработан.xlsx",
+        "filename": "заказ_обработан.xlsx",
+        "folder": "24.09.26",
+        "modified_at": "24.09.2026 12:30",
+        "size_label": "8 Б",
+    }]
+    monkeypatch.setattr(dashboard, "list_processed_files", lambda: entries)
+    monkeypatch.setattr(
+        dashboard, "load_processed_files", lambda: {"исходный.xlsx": "2026-09-24 12:30"}
+    )
+    monkeypatch.setattr(dashboard, "load_route_count", lambda: 4)
+    monkeypatch.setattr(dashboard, "build_volume_chart_data", lambda: [])
+    state = SimpleNamespace(
+        refresh_stores_total=lambda: None,
+        load_ai_settings_form=lambda: None,
+    )
+
+    dashboard.State.load_history.fn(state)
+
+    assert state.history_items == [{"file": "исходный.xlsx", "time": "2026-09-24 12:30"}]
+    assert state.processed_file_items == entries
+    assert state.processed_file_status == ""
+    assert state.orders_total_count == 1
+
+
+def test_history_download_issues_ticket_for_existing_file(tmp_path, monkeypatch):
+    from modules import paths
+
+    root = tmp_path / "processed_orders"
+    output = root / "24.09.26" / "заказ_обработан.xlsx"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"xlsx bytes")
+    monkeypatch.setattr(paths, "PROCESSED_FOLDER", root)
+    captured = {}
+
+    def fake_download(**kwargs):
+        captured.update(kwargs)
+        return "download-event"
+
+    monkeypatch.setattr(dashboard.rx, "download", fake_download)
+    state = SimpleNamespace(processed_file_status="старый статус")
+
+    result = dashboard.State.download_processed_file.fn(state, "24.09.26/заказ_обработан.xlsx")
+
+    assert result == "download-event"
+    assert captured["url"].startswith("/api/processed-files/download/")
+    assert captured["filename"] == "заказ_обработан.xlsx"
+    assert state.processed_file_status == ""
+
+    response = TestClient(dashboard.custom_api).get(captured["url"])
+    assert response.content == b"xlsx bytes"
+    assert response.status_code == 200
+
+
+def test_history_download_rejects_unavailable_file(monkeypatch):
+    issued = []
+    monkeypatch.setattr(dashboard, "create_download_ticket", lambda path: issued.append(path))
+    state = SimpleNamespace(processed_file_status="")
+
+    result = dashboard.State.download_processed_file.fn(state, "../private.xlsx")
+
+    assert result is None
+    assert issued == []
+    assert "недоступен" in state.processed_file_status
+
+
 def test_load_invoice_ocr_uses_processed_orders_and_journal(monkeypatch):
     state = SimpleNamespace(
         invoice_ocr_order="устаревший.xlsx",
@@ -368,8 +448,8 @@ def test_route_groups_use_real_driver_statuses_and_filter():
     groups = route_groups(state)
 
     assert [group["title"] for group in groups] == [
-        "Маршрут №1 — Горловка, Енакиево, Кировское",
-        "Маршрут №2 — Харцызск, Торез, Шахтерск, Снежное",
+        f"Маршрут №{index + 1} — {dashboard.ROUTE_AREAS[index]}"
+        for index in range(2)
     ]
     assert groups[0]["driver_initials"] == "АЗ"
     assert groups[0]["stores"][0]["status"] == "Отгружен"

@@ -13,7 +13,7 @@ from reflex.state import StateUpdate
 from reflex_base.event import Event
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
 from modules import driver_data, driver_orders, driver_sessions, gdemoi, paths
@@ -46,6 +46,13 @@ from modules.history import (
     was_processed,
 )
 from modules.order_positions import order_position_names
+from modules.processed_files import (
+    ProcessedFileError,
+    consume_download_ticket,
+    create_download_ticket,
+    list_processed_files,
+    resolve_processed_file,
+)
 from modules.weight_log import (
     STAGE_LOADING,
     STAGE_STORE_SHIPMENT,
@@ -315,7 +322,21 @@ async def gps_ping(request: Request):
     return JSONResponse({"ok": True})
 
 
+async def download_processed_file(request: Request):
+    try:
+        path = consume_download_ticket(request.path_params["ticket"])
+    except ProcessedFileError:
+        return JSONResponse({"ok": False, "error": "Файл недоступен"}, status_code=404)
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 custom_api = Starlette(routes=[
+    Route("/api/processed-files/download/{ticket}", download_processed_file, methods=["GET"]),
     Route("/api/driver/login", driver_login, methods=["POST"]),
     Route("/api/driver/logout", driver_logout, methods=["POST"]),
     Route("/api/driver/me", driver_me, methods=["GET"]),
@@ -846,6 +867,8 @@ class State(rx.State):
     mail_interval: int = 10
 
     history_items: list[dict] = []
+    processed_file_items: list[dict] = []
+    processed_file_status: str = ""
     order_details_open: bool = False
     selected_order: str = ""
     selected_order_time: str = ""
@@ -1067,7 +1090,9 @@ class State(rx.State):
     def set_page(self, page: str):
         self.current_page = page
 
-        if page == "Заказы":
+        if page == "История":
+            self.load_history()
+        elif page == "Заказы":
             self.load_route_drivers_form()
         elif page == "Маршруты":
             self.load_routes()
@@ -2117,7 +2142,22 @@ class State(rx.State):
                 self.gdemoi_poll_status = gdemoi_error
                 self.refresh_real_data()
 
+    def download_processed_file(self, relative_path: str):
+        try:
+            filename = resolve_processed_file(relative_path).name
+            ticket = create_download_ticket(relative_path)
+        except ProcessedFileError:
+            self.processed_file_status = "Файл больше недоступен. Обновите страницу."
+            return
+        self.processed_file_status = ""
+        return rx.download(
+            url=f"/api/processed-files/download/{ticket}",
+            filename=filename,
+        )
+
     def load_history(self):
+        self.processed_file_items = list_processed_files()
+        self.processed_file_status = ""
         data = load_processed_files()
         all_items = sorted(data.items(), key=lambda item: item[1], reverse=True)
         self.history_items = [
@@ -4417,6 +4457,41 @@ def orders_page():
     )
 
 
+def processed_file_row(item):
+    return rx.hstack(
+        fa_icon(tag="file_spreadsheet", size=17, color=muted()),
+        rx.vstack(
+            rx.text(
+                item["filename"],
+                color=text(),
+                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
+                font_size="14px",
+                word_break="break-all",
+            ),
+            rx.text(
+                item["folder"], " · ", item["modified_at"], " · ", item["size_label"],
+                color=muted(),
+                font_size="12px",
+            ),
+            align="start",
+            spacing="1",
+            min_width="0",
+        ),
+        rx.spacer(),
+        secondary_button(
+            "Скачать",
+            on_click=State.download_processed_file(item["relative_path"]),
+            width="100px",
+        ),
+        spacing="3",
+        align="center",
+        width="100%",
+        padding="12px",
+        border_radius="10px",
+        background=surface_alt(),
+    )
+
+
 def history_page():
     return page_shell(
         topbar("История", "Нажмите на заказ, чтобы открыть его накладные и дополнительные данные."),
@@ -4433,6 +4508,19 @@ def history_page():
                     width="100%",
                 ),
                 rx.text("Обработанных заказов пока нет", color=muted(), font_size="13px"),
+            ),
+        ),
+        panel_shell(
+            panel_title("file_spreadsheet", "Файлы для скачивания"),
+            rx.text(State.processed_file_status, color=ui.PURPLE_DARK, font_size="13px"),
+            rx.cond(
+                State.processed_file_items.length() > 0,
+                rx.vstack(
+                    rx.foreach(State.processed_file_items, processed_file_row),
+                    spacing="2",
+                    width="100%",
+                ),
+                rx.text("Обработанных файлов пока нет", color=muted(), font_size="13px"),
             ),
         ),
     )

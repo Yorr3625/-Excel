@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: dostavo-app:1.0.14
+    image: dostavo-app:1.0.15
     command:
       - python
       - -m
@@ -38,7 +38,7 @@ services:
       start_period: 120s
 
   mail-worker:
-    image: dostavo-app:1.0.14
+    image: dostavo-app:1.0.15
     command:
       - python
       - -m

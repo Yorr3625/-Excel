@@ -64,6 +64,11 @@ class PreparedPhoto:
     ocr_mime_type: str
 
 
+@dataclass(frozen=True)
+class InvoicePage:
+    text: str
+
+
 def validate_and_prepare_photo(filename: str, content: bytes) -> PreparedPhoto:
     """Проверяет фото и подготавливает его для OCR без записи на диск."""
 
@@ -156,6 +161,18 @@ def recognize_image(content: bytes, mime_type: str, api_key: str, folder_id: str
         raise InvoiceOcrError("Yandex Vision вернул некорректный ответ") from error
 
     return _extract_text(response_data)
+
+
+def recognize_invoice_page(content: bytes, mime_type: str, api_key: str, folder_id: str) -> InvoicePage:
+    """Возвращает текст страницы для формы редактирования накладной."""
+
+    return InvoicePage(text=recognize_image(content, mime_type, api_key, folder_id))
+
+
+def parse_invoice_table(page: InvoicePage) -> dict:
+    """Создаёт черновик из распознанного текста без догадок о номере магазина."""
+
+    return {"store_number": "", "items": parse_invoice_lines(page.text)}
 
 
 def parse_invoice_lines(text: str) -> list[dict[str, str]]:

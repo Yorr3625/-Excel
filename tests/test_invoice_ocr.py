@@ -87,6 +87,23 @@ def test_recognize_sends_expected_yandex_request(monkeypatch):
     assert text == "Банан кг"
 
 
+def test_invoice_page_adapter_keeps_existing_text_parser(monkeypatch):
+    monkeypatch.setattr(
+        invoice_ocr,
+        "recognize_image",
+        lambda *_args: "Банан - кг 25 цена 140",
+    )
+
+    page = invoice_ocr.recognize_invoice_page(b"image", "image/jpeg", "key", "folder")
+    table = invoice_ocr.parse_invoice_table(page)
+
+    assert page.text == "Банан - кг 25 цена 140"
+    assert table == {
+        "store_number": "",
+        "items": invoice_ocr.parse_invoice_lines(page.text),
+    }
+
+
 def test_parse_invoice_lines_calculates_total_when_it_is_missing():
     rows = invoice_ocr.parse_invoice_lines("Банан - кг 25 цена 140")
 

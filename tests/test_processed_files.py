@@ -95,6 +95,13 @@ def test_download_ticket_is_single_use_and_serves_file(processed_folder):
     assert response.content == b"xlsx bytes"
     assert response.headers["cache-control"] == "no-store"
     assert "attachment" in response.headers["content-disposition"]
+    assert (
+        "заказ.xlsx" in response.headers["content-disposition"]
+        or "filename*=" in response.headers["content-disposition"]
+    )
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     assert client.get(f"/api/processed-files/download/{ticket}").status_code == 404
 
 
@@ -120,4 +127,6 @@ def test_download_ticket_rechecks_file_and_rejects_expired(processed_folder, mon
 
 
 def test_download_endpoint_rejects_unknown_ticket():
-    assert TestClient(custom_api).get("/api/processed-files/download/not-a-ticket").status_code == 404
+    client = TestClient(custom_api)
+    assert client.get("/api/processed-files/download/not-a-ticket").status_code == 404
+    assert client.get("/api/processed-files/download/24.09.26/report.xlsx").status_code == 404
