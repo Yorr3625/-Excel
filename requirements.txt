@@ -4,6 +4,7 @@ python-calamine==0.6.1
 colorama==0.4.6
 reflex==0.9.8
 starlette==1.6.0
+tzdata==2025.2
 
 # Only for optional invoice OCR: validates images and converts WEBP before Yandex Vision.
 Pillow==12.1.1

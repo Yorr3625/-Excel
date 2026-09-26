@@ -334,6 +334,32 @@ body {
   color: var(--status-red-text);
 }
 
+.driver-modal-backdrop {
+  display: grid;
+  min-height: calc(100vh - 52px);
+  place-items: center;
+}
+
+.driver-modal {
+  width: min(100%, 430px);
+  padding: clamp(20px, 5vw, 30px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--panel);
+  box-shadow: 0 12px 36px rgba(43, 48, 56, .14);
+}
+
+.driver-modal .driver-secondary {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.driver-mileage-vehicle {
+  margin: 18px 0 0;
+  color: var(--ink);
+  font-weight: 700;
+}
+
 .driver-table-wrap {
   overflow-x: auto;
 }

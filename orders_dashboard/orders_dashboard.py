@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import TypedDict
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from http.cookies import CookieError, SimpleCookie
 import asyncio
 import json
 import os
@@ -16,7 +17,16 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from modules import driver_data, driver_orders, driver_sessions, gdemoi, paths
+from modules import (
+    dashboard_sessions,
+    driver_data,
+    driver_mileage,
+    driver_orders,
+    driver_sessions,
+    gdemoi,
+    paths,
+)
+from modules.driver_mileage import DriverMileageConflict, DriverMileageError
 from modules.driver_orders import DriverOrderConflict, DriverOrderError, DriverOrderNotFound
 from modules.auth import AuthConfigurationError, verify_credentials
 from modules.backup import (
@@ -151,6 +161,73 @@ from modules.help_chat import HelpChatError, send_chat_message
 from orders_dashboard import theme as ui
 
 
+def _admin_token(cookie_header: str) -> str | None:
+    try:
+        cookies = SimpleCookie()
+        cookies.load(cookie_header or "")
+    except CookieError:
+        return None
+    cookie = cookies.get(dashboard_sessions.SESSION_COOKIE)
+    return cookie.value if cookie else None
+
+
+def _admin_session_for_router(router) -> bool:
+    headers = getattr(router, "headers", None)
+    if headers is None and isinstance(router, dict):
+        headers = router.get("headers", {})
+    if isinstance(headers, dict):
+        cookie_header = headers.get("cookie", "")
+    else:
+        cookie_header = getattr(headers, "cookie", "")
+    return dashboard_sessions.valid_session(_admin_token(cookie_header))
+
+
+async def admin_login(request: Request):
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return JSONResponse(
+            {"ok": False, "error": "Некорректный запрос"}, status_code=400
+        )
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+    try:
+        authenticated = verify_credentials(
+            str(payload.get("username", "")), str(payload.get("password", ""))
+        )
+    except AuthConfigurationError:
+        return JSONResponse({"ok": False, "error": "Вход временно недоступен."}, status_code=503)
+    if not authenticated:
+        return JSONResponse({"ok": False, "error": "Неверное имя пользователя или пароль."}, status_code=401)
+
+    previous = request.cookies.get(dashboard_sessions.SESSION_COOKIE)
+    dashboard_sessions.destroy_session(previous)
+    token = dashboard_sessions.create_session()
+    response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.set_cookie(
+        dashboard_sessions.SESSION_COOKIE,
+        token,
+        max_age=dashboard_sessions.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=(
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto") == "https"
+        ),
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+async def admin_logout(request: Request):
+    if request.headers.get("x-dashboard-request") != "1":
+        return JSONResponse({"ok": False, "error": "Недействительный запрос"}, status_code=403)
+    dashboard_sessions.destroy_session(request.cookies.get(dashboard_sessions.SESSION_COOKIE))
+    response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(dashboard_sessions.SESSION_COOKIE, path="/")
+    return response
+
+
 async def _json_payload(request: Request) -> dict | None:
     try:
         payload = await request.json()
@@ -194,6 +271,52 @@ def _assignment_for_session(session: dict) -> dict | None:
     return driver_orders.find_assignment_for_driver(str(session.get("driver_id", "")))
 
 
+def _mileage_status(session: dict, assignment: dict | None = None) -> dict:
+    assignment = assignment if assignment is not None else _assignment_for_session(session)
+    if assignment is None:
+        return {"required": False, "available": False, "reason": "assignment_missing"}
+
+    vehicle_id = str(assignment.get("vehicle_id", "")).strip()
+    if not vehicle_id:
+        return {
+            "required": True,
+            "available": False,
+            "error": "В активном назначении не указан автомобиль",
+        }
+
+    day = driver_mileage.today_key()
+    try:
+        record = driver_mileage.get_record(str(session.get("driver_id", "")), vehicle_id, day)
+    except DriverMileageError as error:
+        return {"required": True, "available": False, "error": str(error)}
+    return {
+        "required": record is None,
+        "available": True,
+        "date": day,
+        "assignment_id": str(assignment.get("assignment_id", "")),
+        "vehicle": {
+            "id": vehicle_id,
+            "name": str(assignment.get("vehicle_name", "")),
+            "plate": str(assignment.get("vehicle_plate", "")),
+        },
+        "record": record,
+    }
+
+
+def _mileage_required_response(session: dict, assignment: dict | None = None) -> JSONResponse | None:
+    status = _mileage_status(session, assignment)
+    if not status["required"]:
+        return None
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": status.get("error") or "Перед работой укажите пробег автомобиля",
+            "mileage": status,
+        },
+        status_code=409,
+    )
+
+
 async def driver_login(request: Request):
     payload = await _json_payload(request)
     if payload is None:
@@ -210,6 +333,7 @@ async def driver_login(request: Request):
         "ok": True,
         "driver": {"id": driver_id, "name": driver.get("name", "")},
         "csrf_token": session["csrf_token"],
+        "mileage": _mileage_status(session),
     })
     _set_driver_cookie(response, request, token)
     return response
@@ -244,6 +368,67 @@ async def driver_me(request: Request):
         "driver": {"id": driver.get("id", ""), "name": driver.get("name", "")},
         "csrf_token": session["csrf_token"],
         "assignment": driver_orders.public_snapshot(assignment) if assignment else None,
+        "mileage": _mileage_status(session, assignment),
+    })
+
+
+async def driver_mileage_submit(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+
+    assignment = _assignment_for_session(session)
+    status = _mileage_status(session, assignment)
+    if assignment is None:
+        return JSONResponse(
+            {"ok": False, "error": "Активное назначение не найдено", "mileage": status},
+            status_code=409,
+        )
+    if not status["available"]:
+        return JSONResponse(
+            {"ok": False, "error": status["error"], "mileage": status}, status_code=409
+        )
+
+    expected_vehicle_id = status["vehicle"]["id"]
+    expected_day = status["date"]
+    expected_assignment_id = status["assignment_id"]
+    if (
+        str(payload.get("vehicle_id", "")) != expected_vehicle_id
+        or str(payload.get("date", "")) != expected_day
+        or str(payload.get("assignment_id", "")) != expected_assignment_id
+    ):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Назначение или дата изменились. Введите пробег снова.",
+                "mileage": status,
+            },
+            status_code=409,
+        )
+    try:
+        record, idempotent = driver_mileage.record_mileage(
+            str(session.get("driver_id", "")),
+            expected_vehicle_id,
+            status["vehicle"]["name"],
+            status["vehicle"]["plate"],
+            payload.get("odometer_km"),
+            expected_day,
+        )
+    except DriverMileageConflict as conflict:
+        return JSONResponse(
+            {"ok": False, "error": str(conflict), "mileage": _mileage_status(session, assignment)},
+            status_code=409,
+        )
+    except DriverMileageError as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+    return JSONResponse({
+        "ok": True,
+        "record": record,
+        "idempotent": idempotent,
+        "mileage": _mileage_status(session, assignment),
     })
 
 
@@ -252,6 +437,9 @@ async def driver_order(request: Request):
     if error:
         return error
     assignment = _assignment_for_session(session)
+    mileage_error = _mileage_required_response(session, assignment)
+    if mileage_error:
+        return mileage_error
     if assignment is None:
         return JSONResponse({"ok": True, "assignment": None})
     return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
@@ -261,6 +449,10 @@ async def driver_complete_store(request: Request):
     session, error = _session(request, mutate=True)
     if error:
         return error
+    assignment = _assignment_for_session(session)
+    mileage_error = _mileage_required_response(session, assignment)
+    if mileage_error:
+        return mileage_error
     payload = await _json_payload(request)
     if payload is None:
         return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
@@ -293,6 +485,9 @@ async def driver_sync(request: Request):
     if error:
         return error
     assignment = _assignment_for_session(session)
+    mileage_error = _mileage_required_response(session, assignment)
+    if mileage_error:
+        return mileage_error
     if assignment is None:
         return JSONResponse({"ok": True, "assignment": None})
     return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
@@ -336,10 +531,13 @@ async def download_processed_file(request: Request):
 
 
 custom_api = Starlette(routes=[
+    Route("/api/dashboard/login", admin_login, methods=["POST"]),
+    Route("/api/dashboard/logout", admin_logout, methods=["POST"]),
     Route("/api/processed-files/download/{ticket}", download_processed_file, methods=["GET"]),
     Route("/api/driver/login", driver_login, methods=["POST"]),
     Route("/api/driver/logout", driver_logout, methods=["POST"]),
     Route("/api/driver/me", driver_me, methods=["GET"]),
+    Route("/api/driver/mileage", driver_mileage_submit, methods=["POST"]),
     Route("/api/driver/order", driver_order, methods=["GET"]),
     Route("/api/driver/order/stores/{store_id}/complete", driver_complete_store, methods=["POST"]),
     Route("/api/driver/sync", driver_sync, methods=["POST"]),
@@ -773,48 +971,26 @@ class State(rx.State):
     nav_groups: list[dict] = NAV_GROUPS
 
     is_authenticated: bool = False
-    login_username: str = ""
-    login_password: str = ""
-    login_error: str = ""
-
-    def set_login_username(self, value: str):
-        self.login_username = value
-        self.login_error = ""
-
-    def set_login_password(self, value: str):
-        self.login_password = value
-        self.login_error = ""
-
-    def login(self):
-        try:
-            authenticated = verify_credentials(self.login_username, self.login_password)
-        except AuthConfigurationError:
-            authenticated = False
-            self.login_error = "Вход временно недоступен."
-        else:
-            self.login_error = "" if authenticated else "Неверное имя пользователя или пароль."
-
-        self.login_password = ""
-        if not authenticated:
-            return
-
-        self.is_authenticated = True
-        self.login_username = ""
-        return rx.redirect("/", replace=True)
 
     def logout(self):
         self.mail_auto = False
         self.tracking_running = False
         self.real_watching = False
         self.reset()
-        return rx.redirect("/login", replace=True)
+        return rx.call_script(
+            "fetch('/api/dashboard/logout', {method: 'POST', "
+            "headers: {'X-Dashboard-Request': '1'}, credentials: 'same-origin'})"
+            ".finally(() => window.location.replace('/login'));"
+        )
 
     def load_dashboard(self):
+        self.is_authenticated = _admin_session_for_router(self.router)
         if not self.is_authenticated:
             return rx.redirect("/login", replace=True)
         self.load_history()
 
     def redirect_authenticated_user(self):
+        self.is_authenticated = _admin_session_for_router(self.router)
         if self.is_authenticated:
             return rx.redirect("/", replace=True)
 
@@ -4453,7 +4629,6 @@ def orders_page():
             "Загрузите файл заказа, выберите режим обработки и запустите обработку.",
         ),
         order_panel(),
-        route_drivers_panel(),
     )
 
 
@@ -4494,9 +4669,10 @@ def processed_file_row(item):
 
 def history_page():
     return page_shell(
-        topbar("История", "Нажмите на заказ, чтобы открыть его накладные и дополнительные данные."),
+        topbar("История", "Обработанные заказы и файлы для скачивания."),
         panel_shell(
-            panel_title("history", "Обработанные заказы"),
+            panel_title("history", "История файлов"),
+            rx.text(State.processed_file_status, color=ui.PURPLE_DARK, font_size="13px"),
             rx.cond(
                 State.history_items.length() > 0,
                 rx.vstack(
@@ -4507,12 +4683,8 @@ def history_page():
                     spacing="2",
                     width="100%",
                 ),
-                rx.text("Обработанных заказов пока нет", color=muted(), font_size="13px"),
+                rx.fragment(),
             ),
-        ),
-        panel_shell(
-            panel_title("file_spreadsheet", "Файлы для скачивания"),
-            rx.text(State.processed_file_status, color=ui.PURPLE_DARK, font_size="13px"),
             rx.cond(
                 State.processed_file_items.length() > 0,
                 rx.vstack(
@@ -4520,7 +4692,12 @@ def history_page():
                     spacing="2",
                     width="100%",
                 ),
+                rx.fragment(),
+            ),
+            rx.cond(
+                (State.history_items.length() == 0) & (State.processed_file_items.length() == 0),
                 rx.text("Обработанных файлов пока нет", color=muted(), font_size="13px"),
+                rx.fragment(),
             ),
         ),
     )
@@ -7278,6 +7455,35 @@ def help_chat_widget():
     )
 
 
+DASHBOARD_LOGIN_JS = """
+(async () => {
+    const username = document.getElementById('dashboard-login-username');
+    const password = document.getElementById('dashboard-login-password');
+    const error = document.getElementById('dashboard-login-error');
+    if (!username || !password || !error) return;
+    error.textContent = '';
+    try {
+        const response = await fetch('/api/dashboard/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            credentials: 'same-origin',
+            body: JSON.stringify({username: username.value, password: password.value}),
+        });
+        password.value = '';
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+            error.textContent = payload.error || 'Не удалось выполнить вход.';
+            return;
+        }
+        window.location.replace('/');
+    } catch (_) {
+        password.value = '';
+        error.textContent = 'Не удалось подключиться к серверу.';
+    }
+})();
+"""
+
+
 def login_page():
     return rx.center(
         rx.vstack(
@@ -7304,26 +7510,30 @@ def login_page():
             rx.vstack(
                 rx.text("Логин", color=ui.INK_2, font_size="13px"),
                 rx.input(
-                    value=State.login_username,
-                    on_change=State.set_login_username,
+                    id="dashboard-login-username",
                     placeholder="Логин",
                     width="100%",
                     auto_focus=True,
                 ),
                 rx.text("Пароль", color=ui.INK_2, font_size="13px"),
                 rx.input(
-                    value=State.login_password,
-                    on_change=State.set_login_password,
+                    id="dashboard-login-password",
                     placeholder="Пароль",
                     type="password",
                     width="100%",
                 ),
-                rx.cond(
-                    State.login_error != "",
-                    rx.text(State.login_error, color=ui.STATUS_RED_TEXT, font_size="13px"),
-                    rx.box(),
+                rx.text(
+                    "",
+                    id="dashboard-login-error",
+                    color=ui.STATUS_RED_TEXT,
+                    font_size="13px",
+                    min_height="18px",
                 ),
-                primary_button("Войти", on_click=State.login, width="100%"),
+                primary_button(
+                    "Войти",
+                    on_click=rx.call_script(DASHBOARD_LOGIN_JS),
+                    width="100%",
+                ),
                 align="start",
                 spacing="2",
                 width="100%",
@@ -7683,9 +7893,6 @@ class DashboardAuthMiddleware(rx.Middleware):
 
     _PUBLIC_EVENTS = frozenset({
         "hydrate",
-        "set_login_username",
-        "set_login_password",
-        "login",
         "load_dashboard",
         "redirect_authenticated_user",
     })
@@ -7699,8 +7906,9 @@ class DashboardAuthMiddleware(rx.Middleware):
         if event_name in self._PUBLIC_EVENTS:
             return None
 
-        dashboard_state = await state.get_state(State)
-        if dashboard_state.is_authenticated:
+        if _admin_session_for_router(event.router_data):
+            dashboard_state = await state.get_state(State)
+            dashboard_state.is_authenticated = True
             return None
 
         return StateUpdate(

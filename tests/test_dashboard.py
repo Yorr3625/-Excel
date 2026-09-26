@@ -8,6 +8,23 @@ from modules.config import MAX_ROUTES
 from modules.weight_log import STAGE_LOADING, STAGE_STORE_SHIPMENT, STAGE_UNLOADING
 
 
+def test_orders_page_does_not_show_duplicate_route_drivers_panel(monkeypatch):
+    order_content = object()
+    monkeypatch.setattr(dashboard, "topbar", lambda *args: object())
+    monkeypatch.setattr(dashboard, "order_panel", lambda: order_content)
+    monkeypatch.setattr(dashboard, "page_shell", lambda *children: children)
+    monkeypatch.setattr(
+        dashboard,
+        "route_drivers_panel",
+        lambda: (_ for _ in ()).throw(AssertionError("Блок водителей не должен отображаться")),
+    )
+
+    page = dashboard.orders_page()
+
+    assert page[1:] == (order_content,)
+    assert dashboard.PAGE_GROUPS["Водители и транспорт"] == "Рейсы"
+
+
 def test_refresh_mail_config_is_registered_and_loads_state(monkeypatch):
     reload_calls = []
     config = {
@@ -765,76 +782,105 @@ def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
     assert len(published) == 1
 
 
-def test_login_authenticates_and_clears_credentials(monkeypatch):
-    state = SimpleNamespace(
-        login_username="admin",
-        login_password="admin",
-        login_error="старое сообщение",
-        is_authenticated=False,
+def test_dashboard_login_creates_http_only_server_session(monkeypatch):
+    dashboard.dashboard_sessions.reset_sessions()
+    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
+    client = TestClient(dashboard.custom_api)
+
+    response = client.post(
+        "/api/dashboard/login",
+        json={"username": "admin", "password": "admin"},
     )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    token = client.cookies.get(dashboard.dashboard_sessions.SESSION_COOKIE)
+    assert dashboard.dashboard_sessions.valid_session(token)
+    cookie = response.headers["set-cookie"].lower()
+    assert "httponly" in cookie
+    assert "samesite=strict" in cookie
+
+
+def test_dashboard_login_marks_cookie_secure_behind_https_proxy(monkeypatch):
+    dashboard.dashboard_sessions.reset_sessions()
     monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
 
-    redirect = dashboard.State.login.fn(state)
-
-    assert state.is_authenticated is True
-    assert state.login_username == ""
-    assert state.login_password == ""
-    assert state.login_error == ""
-    assert redirect is not None
-
-
-def test_login_rejects_invalid_credentials_and_clears_password(monkeypatch):
-    state = SimpleNamespace(
-        login_username="admin",
-        login_password="wrong",
-        login_error="",
-        is_authenticated=False,
+    response = TestClient(dashboard.custom_api).post(
+        "/api/dashboard/login",
+        headers={"x-forwarded-proto": "https"},
+        json={"username": "admin", "password": "admin"},
     )
+
+    assert "secure" in response.headers["set-cookie"].lower()
+
+
+def test_dashboard_login_rejects_invalid_credentials(monkeypatch):
+    dashboard.dashboard_sessions.reset_sessions()
     monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: False)
+    client = TestClient(dashboard.custom_api)
 
-    result = dashboard.State.login.fn(state)
-
-    assert result is None
-    assert state.is_authenticated is False
-    assert state.login_username == "admin"
-    assert state.login_password == ""
-    assert state.login_error == "Неверное имя пользователя или пароль."
-
-
-def test_login_hides_auth_configuration_errors(monkeypatch):
-    state = SimpleNamespace(
-        login_username="admin",
-        login_password="admin",
-        login_error="",
-        is_authenticated=False,
+    response = client.post(
+        "/api/dashboard/login",
+        json={"username": "admin", "password": "wrong"},
     )
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "Неверное имя пользователя или пароль."
+    assert client.cookies.get(dashboard.dashboard_sessions.SESSION_COOKIE) is None
+
+
+def test_dashboard_login_hides_auth_configuration_errors(monkeypatch):
+    dashboard.dashboard_sessions.reset_sessions()
 
     def unavailable(username, password):
         raise dashboard.AuthConfigurationError("повреждено")
 
     monkeypatch.setattr(dashboard, "verify_credentials", unavailable)
+    response = TestClient(dashboard.custom_api).post(
+        "/api/dashboard/login",
+        json={"username": "admin", "password": "admin"},
+    )
 
-    dashboard.State.login.fn(state)
-
-    assert state.is_authenticated is False
-    assert state.login_password == ""
-    assert state.login_error == "Вход временно недоступен."
+    assert response.status_code == 503
+    assert response.json()["error"] == "Вход временно недоступен."
 
 
-def test_load_dashboard_redirects_anonymous_user_before_loading_history():
-    state = SimpleNamespace(is_authenticated=False)
+def test_dashboard_logout_revokes_session_and_deletes_cookie(monkeypatch):
+    dashboard.dashboard_sessions.reset_sessions()
+    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
+    client = TestClient(dashboard.custom_api)
+    client.post("/api/dashboard/login", json={"username": "admin", "password": "admin"})
+    token = client.cookies.get(dashboard.dashboard_sessions.SESSION_COOKIE)
+
+    response = client.post("/api/dashboard/logout", headers={"x-dashboard-request": "1"})
+
+    assert response.status_code == 200
+    assert not dashboard.dashboard_sessions.valid_session(token)
+    assert "max-age=0" in response.headers["set-cookie"].lower()
+
+
+def test_load_dashboard_redirects_anonymous_user_before_loading_history(monkeypatch):
+    monkeypatch.setattr(dashboard, "_admin_session_for_router", lambda router: False)
+    state = SimpleNamespace(is_authenticated=True, router=object())
 
     redirect = dashboard.State.load_dashboard.fn(state)
 
+    assert state.is_authenticated is False
     assert redirect is not None
 
 
-def test_load_dashboard_loads_history_for_authenticated_user():
+def test_load_dashboard_restores_server_validated_session(monkeypatch):
     calls = []
-    state = SimpleNamespace(is_authenticated=True, load_history=lambda: calls.append(True))
+    monkeypatch.setattr(dashboard, "_admin_session_for_router", lambda router: True)
+    state = SimpleNamespace(
+        is_authenticated=False,
+        router=object(),
+        load_history=lambda: calls.append(True),
+    )
 
     result = dashboard.State.load_dashboard.fn(state)
 
+    assert state.is_authenticated is True
     assert result is None
     assert calls == [True]
 
@@ -848,13 +894,13 @@ def test_logout_stops_background_controls_and_resets_state():
         reset=lambda: resets.append(True),
     )
 
-    redirect = dashboard.State.logout.fn(state)
+    logout = dashboard.State.logout.fn(state)
 
     assert state.mail_auto is False
     assert state.tracking_running is False
     assert state.real_watching is False
     assert resets == [True]
-    assert redirect is not None
+    assert logout is not None
 
 
 def test_auth_middleware_allows_only_public_events_when_anonymous():
@@ -865,7 +911,7 @@ def test_auth_middleware_allows_only_public_events_when_anonymous():
 
     middleware = dashboard.DashboardAuthMiddleware()
     prefix = f"{dashboard.State.get_full_name()}."
-    public_event = SimpleNamespace(name=f"{prefix}login", router_data={})
+    public_event = SimpleNamespace(name=f"{prefix}load_dashboard", router_data={})
     protected_event = SimpleNamespace(name=f"{prefix}set_page", router_data={})
 
     assert asyncio.run(middleware.preprocess(None, StateStore(), public_event)) is None
@@ -876,16 +922,34 @@ def test_auth_middleware_allows_only_public_events_when_anonymous():
     assert update.events[0].name == "_redirect"
 
 
-def test_auth_middleware_allows_authenticated_and_driver_events():
+def test_auth_middleware_ignores_forged_client_authentication_state():
     class StateStore:
         async def get_state(self, state_class):
             assert state_class is dashboard.State
             return SimpleNamespace(is_authenticated=True)
 
     middleware = dashboard.DashboardAuthMiddleware()
-    dashboard_event = SimpleNamespace(
+    event = SimpleNamespace(
         name=f"{dashboard.State.get_full_name()}.set_page",
         router_data={},
+    )
+
+    assert asyncio.run(middleware.preprocess(None, StateStore(), event)) is not None
+
+
+def test_auth_middleware_allows_server_validated_session_and_driver_events():
+    dashboard.dashboard_sessions.reset_sessions()
+    token = dashboard.dashboard_sessions.create_session()
+
+    class StateStore:
+        async def get_state(self, state_class):
+            assert state_class is dashboard.State
+            return SimpleNamespace(is_authenticated=False)
+
+    middleware = dashboard.DashboardAuthMiddleware()
+    dashboard_event = SimpleNamespace(
+        name=f"{dashboard.State.get_full_name()}.set_page",
+        router_data={"headers": {"cookie": f"dashboard_session={token}"}},
     )
     driver_event = SimpleNamespace(name="DriverState.load_active_routes", router_data={})
 

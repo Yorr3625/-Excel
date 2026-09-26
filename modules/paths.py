@@ -46,6 +46,7 @@ ORDER_ROUTE_ASSIGNMENTS_FILE = DATA_DIR / "order_route_assignments.json"
 DRIVER_PHOTOS_FOLDER = DATA_DIR / "driver_photos"
 DRIVER_DOCUMENTS_FOLDER = DATA_DIR / "driver_documents"
 DRIVER_ORDERS_FOLDER = DATA_DIR / "driver_orders"
+DRIVER_MILEAGE_FILE = DATA_DIR / "driver_mileage.json"
 GDEMOI_FILE = CONFIG_DIR / "gdemoi.json"
 
 

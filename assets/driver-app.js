@@ -1,11 +1,13 @@
 const DB_NAME = "logistics-driver";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const ORDER_STORE = "orders";
 const SESSION_STORE = "session";
 const QUEUE_STORE = "queue";
+const MILEAGE_QUEUE_STORE = "mileage_queue";
 let csrfToken = "";
 let driverId = "";
 let assignment = null;
+let mileage = null;
 let selectedStoreId = "";
 let view = "login";
 let online = navigator.onLine;
@@ -41,6 +43,7 @@ function openDb() {
       if (!db.objectStoreNames.contains(ORDER_STORE)) db.createObjectStore(ORDER_STORE);
       if (!db.objectStoreNames.contains(SESSION_STORE)) db.createObjectStore(SESSION_STORE);
       if (!db.objectStoreNames.contains(QUEUE_STORE)) db.createObjectStore(QUEUE_STORE);
+      if (!db.objectStoreNames.contains(MILEAGE_QUEUE_STORE)) db.createObjectStore(MILEAGE_QUEUE_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -85,17 +88,23 @@ async function dbDelete(store, key) {
   });
 }
 
+async function saveSession() {
+  if (driverId) await dbPut(SESSION_STORE, "current", {driver_id: driverId, mileage});
+}
+
 async function clearOfflineData() {
   const db = await openDb();
   await new Promise((resolve, reject) => {
-    const tx = db.transaction([ORDER_STORE, SESSION_STORE, QUEUE_STORE], "readwrite");
+    const tx = db.transaction([ORDER_STORE, SESSION_STORE, QUEUE_STORE, MILEAGE_QUEUE_STORE], "readwrite");
     tx.objectStore(ORDER_STORE).clear();
     tx.objectStore(SESSION_STORE).clear();
     tx.objectStore(QUEUE_STORE).clear();
+    tx.objectStore(MILEAGE_QUEUE_STORE).clear();
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
   });
   assignment = null;
+  mileage = null;
   driverId = "";
   csrfToken = "";
   navigator.serviceWorker?.controller?.postMessage({type: "CLEAR_DRIVER_DATA"});
@@ -126,6 +135,7 @@ function setMessage(message, error = false) {
 function render() {
   if (!root()) return;
   if (view === "login") renderLogin();
+  else if (mileage?.required) renderMileage();
   else if (view === "store") renderStore();
   else renderOrder();
 }
@@ -163,13 +173,44 @@ function renderLogin() {
       if (!response.ok) throw new Error(data.error || "Не удалось войти");
       driverId = data.driver.id;
       csrfToken = data.csrf_token;
-      await dbPut(SESSION_STORE, "current", {driver_id: driverId});
-      await loadOrder();
+      mileage = data.mileage || null;
+      await saveSession();
+      if (mileage?.required) {
+        view = "order";
+        render();
+      } else {
+        await loadOrder();
+      }
     } catch (error) {
       setMessage(error.message || "Ошибка входа", true);
       button.disabled = false;
     }
   });
+}
+
+function renderMileage() {
+  const vehicle = mileage?.vehicle || {};
+  const isAvailable = mileage?.available;
+  const vehicleLabel = [vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Назначенный автомобиль";
+  root().innerHTML = `
+    <main class="driver-shell">
+      <div class="driver-modal-backdrop">
+        <section class="driver-modal" role="dialog" aria-modal="true" aria-labelledby="mileage-title">
+          <h1 id="mileage-title">Укажите пробег</h1>
+          <p class="driver-muted">Перед началом работы зафиксируйте показание одометра.</p>
+          <p class="driver-mileage-vehicle">${esc(vehicleLabel)}</p>
+          ${isAvailable ? `<form data-mileage-form class="driver-form">
+            <label>Пробег, км<input name="odometer_km" type="number" inputmode="numeric" min="0" max="9999999" step="1" required autofocus></label>
+            <button class="driver-primary" type="submit">Сохранить пробег</button>
+          </form>` : ""}
+          <p data-message class="${isAvailable ? "driver-message" : "driver-message driver-message-error"}">${esc(isAvailable ? (mileage?.pending ? "Показание ожидает отправки после восстановления связи." : "") : (mileage?.error || "Проверьте активное назначение."))}</p>
+          <button data-logout class="driver-secondary" type="button">Выйти</button>
+        </section>
+      </div>
+    </main>`;
+  root().querySelector("[data-logout]").addEventListener("click", logout);
+  const form = root().querySelector("[data-mileage-form]");
+  if (form) form.addEventListener("submit", submitMileage);
 }
 
 function summaryRows() {
@@ -237,9 +278,83 @@ async function api(path, options = {}) {
     try { data = await response.json(); } catch (_) {}
     const error = new Error(data.error || `HTTP ${response.status}`);
     error.status = response.status;
+    error.mileage = data.mileage;
     throw error;
   }
   return response.json();
+}
+
+function mileageQueueKey(payload) {
+  return `${driverId}:${payload.assignment_id}:${payload.vehicle_id}:${payload.date}`;
+}
+
+async function submitMileage(event) {
+  event.preventDefault();
+  if (!mileage?.available) return;
+  const form = new FormData(event.currentTarget);
+  const odometer = String(form.get("odometer_km") || "").trim();
+  if (!/^\d+$/.test(odometer)) {
+    setMessage("Пробег должен быть целым неотрицательным числом", true);
+    return;
+  }
+  const button = event.currentTarget.querySelector("button");
+  button.disabled = true;
+  const payload = {
+    odometer_km: odometer,
+    vehicle_id: mileage.vehicle.id,
+    date: mileage.date,
+    assignment_id: mileage.assignment_id
+  };
+  try {
+    const data = await api("/api/driver/mileage", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    mileage = data.mileage || null;
+    await saveSession();
+    await loadOrder();
+  } catch (error) {
+    button.disabled = false;
+    if (!error.status) {
+      mileage = {...mileage, pending: true};
+      await dbPut(MILEAGE_QUEUE_STORE, mileageQueueKey(payload), {driver_id: driverId, payload});
+      await saveSession();
+      setMessage("Показание сохранено на устройстве и будет отправлено после восстановления связи.", true);
+    } else if (error.status === 409 && error.mileage) {
+      mileage = error.mileage;
+      await saveSession();
+      if (mileage.required) render();
+      else await loadOrder();
+    } else {
+      setMessage(error.message || "Не удалось сохранить пробег", true);
+    }
+  }
+}
+
+async function flushMileageQueue() {
+  if (!csrfToken || !online) return false;
+  const queued = await dbAll(MILEAGE_QUEUE_STORE).catch(() => []);
+  for (const operation of queued.filter((item) => item.driver_id === driverId)) {
+    try {
+      const data = await api("/api/driver/mileage", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(operation.payload)
+      });
+      mileage = data.mileage || null;
+      await dbDelete(MILEAGE_QUEUE_STORE, mileageQueueKey(operation.payload));
+      await saveSession();
+    } catch (error) {
+      if (error.status === 409 && error.mileage) {
+        mileage = error.mileage;
+        await saveSession();
+        continue;
+      }
+      return false;
+    }
+  }
+  return !mileage?.required;
 }
 
 async function flushQueue() {
@@ -279,6 +394,13 @@ async function loadOrder() {
     view = "order";
     render();
   } catch (error) {
+    if (error.status === 409 && error.mileage) {
+      mileage = error.mileage;
+      await saveSession();
+      view = "order";
+      render();
+      return;
+    }
     const cached = driverId ? await dbGet(ORDER_STORE, driverId).catch(() => null) : null;
     if (cached) {
       assignment = cached;
@@ -353,13 +475,29 @@ function applyLocalCompletion(store, quantities) {
 
 async function syncOrder() {
   try {
+    if (!await flushMileageQueue()) {
+      if (mileage?.required) {
+        view = "order";
+        render();
+        setMessage("Показание ожидает отправки. Повторите синхронизацию после восстановления связи.", true);
+      }
+      return;
+    }
     await flushQueue();
     const data = await api("/api/driver/sync", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
     assignment = data.assignment;
     if (assignment) await dbPut(ORDER_STORE, driverId, assignment);
     render();
     setMessage("Данные синхронизированы");
-  } catch (error) { setMessage(error.message || "Синхронизация недоступна", true); }
+  } catch (error) {
+    if (error.status === 409 && error.mileage) {
+      mileage = error.mileage;
+      await saveSession();
+      view = "order";
+      render();
+    }
+    setMessage(error.message || "Синхронизация недоступна", true);
+  }
 }
 
 async function logout() {
@@ -376,17 +514,43 @@ async function restoreSession() {
     const data = await api("/api/driver/me");
     driverId = data.driver.id;
     csrfToken = data.csrf_token || "";
+    mileage = data.mileage || null;
     assignment = data.assignment;
+    await saveSession();
     if (assignment) await dbPut(ORDER_STORE, driverId, assignment);
-    if (assignment) { view = "order"; render(); } else { view = "login"; render(); setMessage("Для водителя нет активного назначения", true); }
+    if (mileage?.required) {
+      view = "order";
+      render();
+    } else if (assignment) {
+      view = "order";
+      render();
+    } else {
+      view = "login";
+      render();
+      setMessage("Для водителя нет активного назначения", true);
+    }
   } catch (_) {
     driverId = saved.driver_id;
+    mileage = saved.mileage || {required: true, available: false, error: "Подключитесь к серверу, чтобы проверить обязательный пробег."};
     assignment = await dbGet(ORDER_STORE, driverId).catch(() => null);
-    if (assignment) { view = "order"; render(); setMessage("Офлайн-копия заказа", true); } else render();
+    if (mileage.required) {
+      view = "order";
+      render();
+    } else if (assignment) {
+      view = "order";
+      render();
+      setMessage("Офлайн-копия заказа", true);
+    } else {
+      render();
+    }
   }
 }
 
-window.addEventListener("online", () => { online = true; if (assignment) syncOrder(); });
-window.addEventListener("offline", () => { online = false; if (view === "order") render(); });
+window.addEventListener("online", async () => {
+  online = true;
+  if (driverId && !csrfToken) await restoreSession();
+  if (driverId && csrfToken) syncOrder();
+});
+window.addEventListener("offline", () => { online = false; if (view !== "login") render(); });
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(() => {});
 restoreSession();
