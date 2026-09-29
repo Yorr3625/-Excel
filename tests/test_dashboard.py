@@ -665,7 +665,12 @@ def test_route_assignment_dialog_uses_only_active_fleet_entries(monkeypatch):
     monkeypatch.setattr(
         dashboard,
         "active_vehicles",
-        lambda: [{"id": "vehicle-1", "name": "Газель", "plate": "А123ВС71"}],
+        lambda: [{
+            "id": "vehicle-1",
+            "name": "Газель",
+            "plate": "А123ВС71",
+            "description": "Тентованный кузов",
+        }],
     )
 
     dashboard.State.open_route_assignment_dialog.fn(state)
@@ -680,6 +685,7 @@ def test_route_assignment_dialog_uses_only_active_fleet_entries(monkeypatch):
             "vehicle_id": "vehicle-1",
             "vehicle_name": "Газель",
             "vehicle_plate": "А123ВС71",
+            "vehicle_description": "Тентованный кузов",
         },
         {
             "route": "route_2",
@@ -689,8 +695,96 @@ def test_route_assignment_dialog_uses_only_active_fleet_entries(monkeypatch):
             "vehicle_id": "",
             "vehicle_name": "",
             "vehicle_plate": "",
+            "vehicle_description": "",
         },
     ]
+
+
+def test_route_assignment_vehicle_updates_display_details(monkeypatch):
+    state = SimpleNamespace(
+        route_assignments=[{
+            "route": "route_1",
+            "vehicle_id": "vehicle-1",
+            "vehicle_name": "Старая машина",
+            "vehicle_plate": "А111АА71",
+            "vehicle_description": "Старое описание",
+        }],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "active_vehicles",
+        lambda: [{
+            "id": "vehicle-2",
+            "name": "Газель Next",
+            "plate": "В222ВВ71",
+            "description": "Рефрижератор",
+        }],
+    )
+
+    dashboard.State.set_route_assignment_vehicle.fn(state, 0, "В222ВВ71")
+
+    assert state.route_assignments[0] == {
+        "route": "route_1",
+        "vehicle_id": "vehicle-2",
+        "vehicle_name": "Газель Next",
+        "vehicle_plate": "В222ВВ71",
+        "vehicle_description": "Рефрижератор",
+    }
+
+    dashboard.State.set_route_assignment_vehicle.fn(state, 0, "")
+
+    assert state.route_assignments[0] == {
+        "route": "route_1",
+        "vehicle_id": "",
+        "vehicle_name": "",
+        "vehicle_plate": "",
+        "vehicle_description": "",
+    }
+
+
+def test_route_assignment_driver_updates_default_vehicle_details(monkeypatch):
+    state = SimpleNamespace(
+        route_assignments=[{
+            "route": "route_1",
+            "driver_id": "",
+            "driver_name": "",
+            "vehicle_id": "",
+            "vehicle_name": "",
+            "vehicle_plate": "",
+            "vehicle_description": "",
+        }],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "active_drivers",
+        lambda: [{
+            "id": "driver-1",
+            "name": "Иван",
+            "default_vehicle_id": "vehicle-1",
+        }],
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "active_vehicles",
+        lambda: [{
+            "id": "vehicle-1",
+            "name": "Газель Next",
+            "plate": "В222ВВ71",
+            "description": "Рефрижератор",
+        }],
+    )
+
+    dashboard.State.set_route_assignment_driver.fn(state, 0, "Иван")
+
+    assert state.route_assignments[0] == {
+        "route": "route_1",
+        "driver_id": "driver-1",
+        "driver_name": "Иван",
+        "vehicle_id": "vehicle-1",
+        "vehicle_name": "Газель Next",
+        "vehicle_plate": "В222ВВ71",
+        "vehicle_description": "Рефрижератор",
+    }
 
 
 def test_cancel_route_assignments_does_not_process_or_persist():
@@ -955,3 +1049,30 @@ def test_auth_middleware_allows_server_validated_session_and_driver_events():
 
     assert asyncio.run(middleware.preprocess(None, StateStore(), dashboard_event)) is None
     assert asyncio.run(middleware.preprocess(None, StateStore(), driver_event)) is None
+
+
+def test_opening_delivery_page_loads_completed_delivery_report(monkeypatch):
+    report = {
+        "completed_stores": 2,
+        "line_count": 3,
+        "summary": [{"name": "Яблоки"}],
+        "deliveries": [{"store_name": "ФМ 10"}],
+    }
+    monkeypatch.setattr(dashboard.driver_orders, "completed_delivery_report", lambda: report)
+    state = SimpleNamespace(
+        current_page="Заказы",
+        delivery_completed_stores=0,
+        delivery_line_count=0,
+        delivery_summary=[],
+        delivery_items=[],
+    )
+    state.load_delivery_report = dashboard.State.load_delivery_report.fn.__get__(state)
+
+    dashboard.State.set_page.fn(state, "Сданный товар")
+
+    assert state.current_page == "Сданный товар"
+    assert state.delivery_completed_stores == 2
+    assert state.delivery_line_count == 3
+    assert state.delivery_summary == report["summary"]
+    assert state.delivery_items == report["deliveries"]
+    assert dashboard.PAGE_GROUPS["Сданный товар"] == "Рейсы"

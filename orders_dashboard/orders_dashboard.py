@@ -23,6 +23,7 @@ from modules import (
     driver_mileage,
     driver_orders,
     driver_sessions,
+    loader_sessions,
     gdemoi,
     paths,
 )
@@ -108,12 +109,16 @@ from modules.fleet import (
     delete_vehicle,
     driver_by_id,
     driver_by_login,
+    employee_role,
+    loader_by_id,
+    loader_by_login,
     load_fleet,
     record_order_route_assignments,
     set_driver_pin,
     update_driver,
     update_vehicle,
     verify_driver_pin,
+    verify_loader_pin,
 )
 from modules.order_preview import PreviewError, build_order_preview
 from modules.styles import conflict_fill, fills_for
@@ -262,6 +267,48 @@ def _set_driver_cookie(response: JSONResponse, request: Request, token: str) -> 
         max_age=driver_sessions.SESSION_TTL_SECONDS,
         httponly=True,
         secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+
+
+def _loader_session(request: Request, mutate: bool = False):
+    token = request.cookies.get(loader_sessions.SESSION_COOKIE)
+    session = loader_sessions.get_session(token)
+    if session is None or session.get("role") != "loader":
+        return None, JSONResponse({"ok": False, "error": "Требуется вход"}, status_code=401)
+    loader = loader_by_id(str(session.get("loader_id", "")))
+    if loader is None or not loader.get("active"):
+        loader_sessions.destroy_session(token)
+        return None, JSONResponse({"ok": False, "error": "Профиль недоступен"}, status_code=401)
+    if mutate and not loader_sessions.valid_csrf(session, request.headers.get("x-loader-csrf")):
+        return None, JSONResponse({"ok": False, "error": "Недействительный запрос"}, status_code=403)
+    return session, None
+
+
+def _loader_available_vehicles() -> list[dict]:
+    active = {str(vehicle.get("id", "")): vehicle for vehicle in active_vehicles()}
+    return [
+        {
+            "id": vehicle_id,
+            "name": str(snapshot.get("name") or active[vehicle_id].get("name", "")),
+            "plate": str(snapshot.get("plate") or active[vehicle_id].get("plate", "")),
+        }
+        for snapshot in driver_orders.assigned_vehicles()
+        if (vehicle_id := str(snapshot.get("id", ""))) in active
+    ]
+
+
+def _set_loader_cookie(response: JSONResponse, request: Request, token: str) -> None:
+    response.set_cookie(
+        loader_sessions.SESSION_COOKIE,
+        token,
+        max_age=loader_sessions.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=(
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto") == "https"
+        ),
         samesite="strict",
         path="/",
     )
@@ -493,6 +540,89 @@ async def driver_sync(request: Request):
     return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
 
 
+async def loader_login(request: Request):
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+    login = str(payload.get("loader_id", payload.get("login", ""))).strip()
+    pin = str(payload.get("pin", "")).strip()
+    loader = loader_by_login(login) or loader_by_id(login)
+    loader_id = str(loader.get("id", "")) if loader else ""
+    if not loader_id or not verify_loader_pin(loader_id, pin):
+        return JSONResponse({"ok": False, "error": "Неверный идентификатор или PIN"}, status_code=401)
+
+    previous = request.cookies.get(loader_sessions.SESSION_COOKIE)
+    loader_sessions.destroy_session(previous)
+    token, session = loader_sessions.create_session(loader_id)
+    response = JSONResponse({
+        "ok": True,
+        "loader": {"id": loader_id, "name": loader.get("name", "")},
+        "csrf_token": session["csrf_token"],
+    }, headers={"Cache-Control": "no-store"})
+    _set_loader_cookie(response, request, token)
+    return response
+
+
+async def loader_logout(request: Request):
+    session, error = _loader_session(request, mutate=True)
+    if error:
+        if error.status_code == 401:
+            error.delete_cookie(loader_sessions.SESSION_COOKIE, path="/")
+        return error
+    loader_sessions.destroy_session(request.cookies.get(loader_sessions.SESSION_COOKIE))
+    response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(loader_sessions.SESSION_COOKIE, path="/")
+    return response
+
+
+async def loader_me(request: Request):
+    session, error = _loader_session(request)
+    if error:
+        return error
+    loader = loader_by_id(str(session.get("loader_id", "")))
+    return JSONResponse({
+        "ok": True,
+        "loader": {"id": loader.get("id", ""), "name": loader.get("name", "")},
+        "csrf_token": session["csrf_token"],
+        "vehicle_id": session.get("vehicle_id", ""),
+    }, headers={"Cache-Control": "no-store"})
+
+
+async def loader_vehicles(request: Request):
+    _session, error = _loader_session(request)
+    if error:
+        return error
+    return JSONResponse({"ok": True, "vehicles": _loader_available_vehicles()}, headers={"Cache-Control": "no-store"})
+
+
+async def loader_select_vehicle(request: Request):
+    session, error = _loader_session(request, mutate=True)
+    if error:
+        return error
+    payload = await _json_payload(request)
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+    vehicle_id = str(payload.get("vehicle_id", "")).strip()
+    if vehicle_id not in {vehicle["id"] for vehicle in _loader_available_vehicles()}:
+        return JSONResponse({"ok": False, "error": "Автомобиль недоступен"}, status_code=404)
+    loader_sessions.select_vehicle(request.cookies.get(loader_sessions.SESSION_COOKIE), vehicle_id)
+    return JSONResponse({"ok": True, "vehicle_id": vehicle_id}, headers={"Cache-Control": "no-store"})
+
+
+async def loader_orders(request: Request):
+    session, error = _loader_session(request)
+    if error:
+        return error
+    vehicle_id = str(session.get("vehicle_id", ""))
+    if vehicle_id not in {vehicle["id"] for vehicle in _loader_available_vehicles()}:
+        return JSONResponse({"ok": True, "vehicle_id": "", "assignments": []}, headers={"Cache-Control": "no-store"})
+    return JSONResponse({
+        "ok": True,
+        "vehicle_id": vehicle_id,
+        "assignments": driver_orders.public_assignments_for_vehicle(vehicle_id),
+    }, headers={"Cache-Control": "no-store"})
+
+
 async def gps_ping(request: Request):
     session, error = _session(request, mutate=True)
     if error:
@@ -541,6 +671,12 @@ custom_api = Starlette(routes=[
     Route("/api/driver/order", driver_order, methods=["GET"]),
     Route("/api/driver/order/stores/{store_id}/complete", driver_complete_store, methods=["POST"]),
     Route("/api/driver/sync", driver_sync, methods=["POST"]),
+    Route("/api/loader/login", loader_login, methods=["POST"]),
+    Route("/api/loader/logout", loader_logout, methods=["POST"]),
+    Route("/api/loader/me", loader_me, methods=["GET"]),
+    Route("/api/loader/vehicles", loader_vehicles, methods=["GET"]),
+    Route("/api/loader/vehicle", loader_select_vehicle, methods=["POST"]),
+    Route("/api/loader/orders", loader_orders, methods=["GET"]),
     Route("/api/gps-ping", gps_ping, methods=["POST"]),
 ])
 
@@ -671,6 +807,7 @@ PAGE_GROUPS = {
     "Маршруты": "Рейсы",
     "Трекинг": "Рейсы",
     "Водители и транспорт": "Рейсы",
+    "Сданный товар": "Рейсы",
     "OCR накладных": "Накладные",
     "Вес": "Вес",
     "Настройки": "Настройки",
@@ -694,6 +831,7 @@ GROUP_TABS = {
         {"label": "Маршруты", "page": "Маршруты", "icon": "list"},
         {"label": "Трекинг", "page": "Трекинг", "icon": "map"},
         {"label": "Водители и транспорт", "page": "Водители и транспорт", "icon": "truck"},
+        {"label": "Сданный товар", "page": "Сданный товар", "icon": "list"},
     ],
     "Накладные": [
         {"label": "OCR накладных", "page": "OCR накладных", "icon": "camera"},
@@ -727,6 +865,31 @@ class RouteGroupView(TypedDict):
     stores: list[RouteStoreView]
     collapsed: bool
     adding: bool
+
+
+class DeliveryLineView(TypedDict):
+    name: str
+    unit: str
+    planned: int | float
+    delivered: int | float
+    difference: int | float
+
+
+class DeliverySummaryView(DeliveryLineView):
+    pass
+
+
+class DeliveryItemView(TypedDict):
+    assignment_id: str
+    publication_id: str
+    order_id: str
+    route_label: str
+    driver_name: str
+    vehicle_name: str
+    vehicle_plate: str
+    store_name: str
+    completed_at: str
+    lines: list[DeliveryLineView]
 
 
 SETTINGS_LABELS = {
@@ -1090,7 +1253,12 @@ class State(rx.State):
     fleet_driver_notes: str = ""
     fleet_driver_default_vehicle: str = ""
     fleet_driver_pin: str = ""
+    fleet_driver_role: str = "driver"
     fleet_driver_active: bool = True
+    delivery_completed_stores: int = 0
+    delivery_line_count: int = 0
+    delivery_summary: list[DeliverySummaryView] = []
+    delivery_items: list[DeliveryItemView] = []
     fleet_vehicle_id: str = ""
     fleet_vehicle_name: str = ""
     fleet_vehicle_plate: str = ""
@@ -1282,6 +1450,8 @@ class State(rx.State):
             self.init_tracking()
         elif page == "Водители и транспорт":
             self.load_fleet()
+        elif page == "Сданный товар":
+            self.load_delivery_report()
         elif page == "Вес":
             self.load_weight()
         elif page == "OCR накладных":
@@ -3214,18 +3384,30 @@ class State(rx.State):
         finally:
             self.is_previewing = False
 
+    def load_delivery_report(self):
+        report = driver_orders.completed_delivery_report()
+        self.delivery_completed_stores = report["completed_stores"]
+        self.delivery_line_count = report["line_count"]
+        self.delivery_summary = report["summary"]
+        self.delivery_items = report["deliveries"]
+
     def load_fleet(self):
         data = load_fleet()
         vehicles_by_id = {item.get("id", ""): item for item in data["vehicles"]}
         self.fleet_vehicles = [
             {"tracker_id": "", **item} for item in data["vehicles"]
         ]
-        self.fleet_driver_options = [""] + [item.get("name", "") for item in data["drivers"] if item.get("active")]
+        self.fleet_driver_options = [""] + [
+            item.get("name", "") for item in data["drivers"]
+            if item.get("active") and employee_role(item) == "driver"
+        ]
         self.fleet_vehicle_options = [""] + [item.get("plate", "") for item in data["vehicles"] if item.get("active")]
         self.fleet_drivers = [
             {
                 **driver,
                 "login": driver.get("login") or driver.get("id", ""),
+                "role": employee_role(driver),
+                "role_label": "Грузчик" if employee_role(driver) == "loader" else "Водитель",
                 "default_vehicle": vehicles_by_id.get(driver.get("default_vehicle_id", ""), {}).get("plate", "—"),
             }
             for driver in data["drivers"]
@@ -3236,7 +3418,7 @@ class State(rx.State):
         self.fleet_status = ""
 
     def set_fleet_driver_field(self, field: str, value: str):
-        if field in {"login", "name", "phone", "rating", "hired_on", "notes", "default_vehicle", "pin"}:
+        if field in {"login", "name", "phone", "rating", "hired_on", "notes", "default_vehicle", "pin", "role"}:
             setattr(self, f"fleet_driver_{field}", value)
 
     def set_fleet_driver_active(self, value: bool):
@@ -3252,6 +3434,7 @@ class State(rx.State):
         self.fleet_driver_notes = ""
         self.fleet_driver_default_vehicle = ""
         self.fleet_driver_pin = ""
+        self.fleet_driver_role = "driver"
         self.fleet_driver_active = True
 
     def edit_fleet_driver(self, driver_id: str):
@@ -3275,20 +3458,23 @@ class State(rx.State):
             "",
         )
         self.fleet_driver_pin = ""
+        self.fleet_driver_role = employee_role(driver)
         self.fleet_driver_active = bool(driver.get("active"))
 
     def save_fleet_driver(self):
         try:
-            default_vehicle_id = next(
-                (
-                    item.get("id", "")
-                    for item in load_fleet()["vehicles"]
-                    if item.get("plate") == self.fleet_driver_default_vehicle
-                ),
-                "",
-            )
-            if self.fleet_driver_default_vehicle and not default_vehicle_id:
-                raise FleetError("Выбранный транспорт не найден")
+            default_vehicle_id = ""
+            if self.fleet_driver_role == "driver":
+                default_vehicle_id = next(
+                    (
+                        item.get("id", "")
+                        for item in load_fleet()["vehicles"]
+                        if item.get("plate") == self.fleet_driver_default_vehicle
+                    ),
+                    "",
+                )
+                if self.fleet_driver_default_vehicle and not default_vehicle_id:
+                    raise FleetError("Выбранный транспорт не найден")
             if self.fleet_driver_id:
                 if self.fleet_driver_pin:
                     set_driver_pin(self.fleet_driver_id, self.fleet_driver_pin)
@@ -3296,17 +3482,18 @@ class State(rx.State):
                     self.fleet_driver_id, self.fleet_driver_name, self.fleet_driver_phone,
                     self.fleet_driver_rating, self.fleet_driver_active, self.fleet_driver_hired_on,
                     self.fleet_driver_notes, default_vehicle_id, self.fleet_driver_login,
+                    self.fleet_driver_role,
                 )
-                self.fleet_status = "Карточка водителя обновлена"
+                self.fleet_status = "Карточка сотрудника обновлена"
             else:
                 driver = add_driver(
                     self.fleet_driver_name, self.fleet_driver_phone, self.fleet_driver_rating,
                     self.fleet_driver_active, self.fleet_driver_hired_on, self.fleet_driver_notes,
-                    default_vehicle_id, self.fleet_driver_login,
+                    default_vehicle_id, self.fleet_driver_login, self.fleet_driver_role,
                 )
                 if self.fleet_driver_pin:
                     set_driver_pin(driver["id"], self.fleet_driver_pin)
-                self.fleet_status = "Водитель добавлен"
+                self.fleet_status = "Сотрудник добавлен"
             self.clear_fleet_driver_form()
             self.load_fleet()
         except FleetError as error:
@@ -3425,6 +3612,7 @@ class State(rx.State):
                 "vehicle_id": vehicle.get("id", ""),
                 "vehicle_name": vehicle.get("name", ""),
                 "vehicle_plate": vehicle.get("plate", ""),
+                "vehicle_description": vehicle.get("description", ""),
             })
         self.fleet_driver_options = [""] + [item.get("name", "") for item in drivers]
         self.fleet_driver_options += [
@@ -3453,6 +3641,7 @@ class State(rx.State):
             "vehicle_id": vehicle.get("id", ""),
             "vehicle_name": vehicle.get("name", ""),
             "vehicle_plate": vehicle.get("plate", ""),
+            "vehicle_description": vehicle.get("description", ""),
         }
         self.route_assignments = assignments
 
@@ -3466,6 +3655,7 @@ class State(rx.State):
             "vehicle_id": vehicle.get("id", ""),
             "vehicle_name": vehicle.get("name", ""),
             "vehicle_plate": vehicle.get("plate", ""),
+            "vehicle_description": vehicle.get("description", ""),
         }
         self.route_assignments = assignments
 
@@ -7140,8 +7330,13 @@ def fleet_driver_card(item):
             rx.text(item["name"], color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
             rx.text(item["login"], color=muted(), font_size="12px"),
             rx.text(item["phone"], color=muted(), font_size="12px"),
+            rx.text("Роль: ", item["role_label"], color=muted(), font_size="12px"),
             rx.text("Рейтинг: ", item["rating"], " / 5", color=muted(), font_size="12px"),
-            rx.text("Транспорт: ", item["default_vehicle"], color=muted(), font_size="12px"),
+            rx.cond(
+                item["role"] == "driver",
+                rx.text("Транспорт: ", item["default_vehicle"], color=muted(), font_size="12px"),
+                rx.box(),
+            ),
             rx.text(rx.cond(item["active"], "Активен", "Неактивен"), color=rx.cond(item["active"], ui.STATUS_GREEN_TEXT, ui.STATUS_AMBER_TEXT), font_size="12px"),
             align="start", spacing="1",
         ),
@@ -7185,21 +7380,35 @@ def fleet_drivers_tab():
             fleet_text_field("Код входа", State.fleet_driver_login, lambda value: State.set_fleet_driver_field("login", value)),
             fleet_text_field("ФИО", State.fleet_driver_name, lambda value: State.set_fleet_driver_field("name", value)),
             fleet_text_field("Телефон", State.fleet_driver_phone, lambda value: State.set_fleet_driver_field("phone", value)),
+            rx.vstack(
+                rx.text("Роль", color=muted(), font_size="12px"),
+                rx.select(
+                    ["driver", "loader"],
+                    value=State.fleet_driver_role,
+                    on_change=lambda value: State.set_fleet_driver_field("role", value),
+                    width="100%",
+                ),
+                spacing="1", align="start", width="100%",
+            ),
             width="100%", spacing="3",
         ),
         rx.hstack(
             fleet_text_field("Дата приёма", State.fleet_driver_hired_on, lambda value: State.set_fleet_driver_field("hired_on", value), "date"),
-            fleet_text_field("PIN водителя", State.fleet_driver_pin, lambda value: State.set_fleet_driver_field("pin", value), "password"),
-            rx.vstack(
-                rx.text("Транспорт по умолчанию", color=muted(), font_size="12px"),
-                rx.select(
-                    State.fleet_vehicle_options,
-                    value=State.fleet_driver_default_vehicle,
-                    on_change=lambda value: State.set_fleet_driver_field("default_vehicle", value),
-                    placeholder="Не назначен",
-                    width="100%",
+            fleet_text_field("PIN-код", State.fleet_driver_pin, lambda value: State.set_fleet_driver_field("pin", value), "password"),
+            rx.cond(
+                State.fleet_driver_role == "driver",
+                rx.vstack(
+                    rx.text("Транспорт по умолчанию", color=muted(), font_size="12px"),
+                    rx.select(
+                        State.fleet_vehicle_options,
+                        value=State.fleet_driver_default_vehicle,
+                        on_change=lambda value: State.set_fleet_driver_field("default_vehicle", value),
+                        placeholder="Не назначен",
+                        width="100%",
+                    ),
+                    spacing="1", align="start", width="100%",
                 ),
-                spacing="1", align="start", width="100%",
+                rx.box(),
             ),
             rx.vstack(
                 rx.text("Активность", color=muted(), font_size="12px"),
@@ -7211,11 +7420,11 @@ def fleet_drivers_tab():
         rx.text("Оставьте PIN пустым при редактировании, чтобы сохранить прежний PIN.", color=muted(), font_size="11px"),
         fleet_text_field("Заметка", State.fleet_driver_notes, lambda value: State.set_fleet_driver_field("notes", value)),
         rx.hstack(
-            primary_button("Сохранить водителя", on_click=State.save_fleet_driver),
+            primary_button("Сохранить сотрудника", on_click=State.save_fleet_driver),
             secondary_button("Очистить", on_click=State.clear_fleet_driver_form),
             spacing="3",
         ),
-        rx.cond(State.fleet_drivers.length() > 0, rx.vstack(rx.foreach(State.fleet_drivers, fleet_driver_card), width="100%", spacing="2"), rx.text("Водителей пока нет", color=muted())),
+        rx.cond(State.fleet_drivers.length() > 0, rx.vstack(rx.foreach(State.fleet_drivers, fleet_driver_card), width="100%", spacing="2"), rx.text("Сотрудников пока нет", color=muted())),
         spacing="3", width="100%", align="start",
     )
 
@@ -7274,6 +7483,122 @@ def fleet_page():
     )
 
 
+def delivery_summary_row(item):
+    return rx.hstack(
+        rx.text(item["name"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, width="100%"),
+        rx.text(item["unit"], color=muted(), width="80px"),
+        rx.text(item["planned"], color=text(), width="100px", text_align="right"),
+        rx.text(item["delivered"], color=text(), width="100px", text_align="right"),
+        rx.text(
+            item["difference"],
+            color=rx.cond(item["difference"] == 0, ui.STATUS_GREEN_TEXT, ui.STATUS_RED_TEXT),
+            width="100px",
+            text_align="right",
+        ),
+        width="100%",
+        padding="10px 0",
+        border_bottom=f"1px solid {border()}",
+        align="center",
+    )
+
+
+def delivery_line_row(line):
+    return rx.hstack(
+        rx.text(line["name"], color=text(), width="100%"),
+        rx.text(line["unit"], color=muted(), width="70px"),
+        rx.text("План: ", line["planned"], color=muted(), width="120px", text_align="right"),
+        rx.text("Сдано: ", line["delivered"], color=text(), width="130px", text_align="right"),
+        rx.text(
+            "Разница: ", line["difference"],
+            color=rx.cond(line["difference"] == 0, ui.STATUS_GREEN_TEXT, ui.STATUS_RED_TEXT),
+            width="140px",
+            text_align="right",
+        ),
+        width="100%",
+        padding="8px 0",
+        border_bottom=f"1px solid {border()}",
+        align="center",
+        wrap="wrap",
+    )
+
+
+def delivery_item_card(item):
+    return rx.el.details(
+        rx.el.summary(
+            rx.hstack(
+                rx.vstack(
+                    rx.text(item["store_name"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+                    rx.text(item["route_label"], " · ", item["driver_name"], color=muted(), font_size="12px"),
+                    align="start",
+                    spacing="1",
+                ),
+                rx.spacer(),
+                rx.text(item["completed_at"], color=muted(), font_size="12px"),
+                width="100%",
+                align="center",
+            ),
+            cursor="pointer",
+        ),
+        rx.vstack(
+            rx.text(
+                "Машина: ", item["vehicle_name"], " · ", item["vehicle_plate"],
+                color=muted(), font_size="12px",
+            ),
+            rx.vstack(rx.foreach(item["lines"], delivery_line_row), width="100%", spacing="0"),
+            width="100%",
+            padding_top="12px",
+            spacing="2",
+            align="start",
+        ),
+        width="100%",
+        padding="14px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+    )
+
+
+def delivery_page():
+    return page_shell(
+        topbar(
+            "Сданный товар",
+            "Фактические количества из завершённых магазинов. План, сдано и разница считаются отдельно для каждого товара и единицы измерения.",
+        ),
+        rx.hstack(
+            stat_card("circle_check", "green", "Завершено магазинов", State.delivery_completed_stores, rx.box()),
+            stat_card("list", "violet", "Товарных строк", State.delivery_line_count, rx.box()),
+            width="100%",
+            spacing="3",
+            wrap="wrap",
+        ),
+        panel_shell(
+            panel_title("list", "Свод по товарам"),
+            rx.hstack(
+                rx.text("Товар", color=muted(), font_size="12px", width="100%"),
+                rx.text("Ед.", color=muted(), font_size="12px", width="80px"),
+                rx.text("План", color=muted(), font_size="12px", width="100px", text_align="right"),
+                rx.text("Сдано", color=muted(), font_size="12px", width="100px", text_align="right"),
+                rx.text("Разница", color=muted(), font_size="12px", width="100px", text_align="right"),
+                width="100%",
+                align="center",
+            ),
+            rx.cond(
+                State.delivery_summary.length() > 0,
+                rx.vstack(rx.foreach(State.delivery_summary, delivery_summary_row), width="100%", spacing="0"),
+                muted_text("Завершённых магазинов пока нет."),
+            ),
+        ),
+        panel_shell(
+            panel_title("package", "Завершённые магазины"),
+            rx.cond(
+                State.delivery_items.length() > 0,
+                rx.vstack(rx.foreach(State.delivery_items, delivery_item_card), width="100%", spacing="2"),
+                muted_text("Завершённых магазинов пока нет."),
+            ),
+        ),
+    )
+
+
 def route_assignment_row(item, index):
     return rx.hstack(
         rx.text(item["label"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, min_width="130px"),
@@ -7284,11 +7609,31 @@ def route_assignment_row(item, index):
             placeholder="Водитель не назначен",
             width="100%",
         ),
-        rx.select(
-            State.fleet_vehicle_options,
-            value=item["vehicle_plate"],
-            on_change=lambda value: State.set_route_assignment_vehicle(index, value),
-            placeholder="Транспорт не назначен",
+        rx.vstack(
+            rx.select(
+                State.fleet_vehicle_options,
+                value=item["vehicle_plate"],
+                on_change=lambda value: State.set_route_assignment_vehicle(index, value),
+                placeholder="Транспорт не назначен",
+                width="100%",
+            ),
+            rx.cond(
+                item["vehicle_id"] != "",
+                rx.vstack(
+                    rx.text("Марка / модель: ", item["vehicle_name"], color=muted(), font_size="12px"),
+                    rx.text("Госномер: ", item["vehicle_plate"], color=muted(), font_size="12px"),
+                    rx.text(
+                        "Краткое описание: ",
+                        rx.cond(item["vehicle_description"] != "", item["vehicle_description"], "Не указано"),
+                        color=muted(),
+                        font_size="12px",
+                    ),
+                    spacing="1",
+                    width="100%",
+                ),
+                rx.box(),
+            ),
+            spacing="1",
             width="100%",
         ),
         width="100%", spacing="3", align="center", wrap="wrap",
@@ -7326,6 +7671,7 @@ def main_content():
         ("Почта", mail_page()),
         ("Маршруты", routes_page()),
         ("Водители и транспорт", fleet_page()),
+        ("Сданный товар", delivery_page()),
         ("Вес", weight_page()),
         ("OCR накладных", invoice_ocr_page()),
         ("Трекинг", tracking_page()),
@@ -7888,6 +8234,17 @@ def driver_page():
     )
 
 
+def loader_page():
+    return rx.center(
+        rx.box(id="loader-app", width="100%"),
+        rx.script(src="/loader-app.js"),
+        width="100%",
+        min_height="100vh",
+        background=page_bg(),
+        class_name="driver-page",
+    )
+
+
 class DashboardAuthMiddleware(rx.Middleware):
     """Не даёт анонимному клиенту вызвать обработчики административного state."""
 
@@ -7965,5 +8322,11 @@ app.add_page(
     route="/driver",
     title="Водитель",
     on_load=DriverState.load_active_routes,
+    meta=PWA_META,
+)
+app.add_page(
+    loader_page,
+    route="/loader",
+    title="Грузчик",
     meta=PWA_META,
 )

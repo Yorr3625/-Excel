@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import uuid
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -18,6 +19,7 @@ from modules import paths
 
 
 SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 1
 MAX_OPERATION_ID_LENGTH = 128
 MAX_QUANTITY_DIGITS = 18
 
@@ -111,6 +113,60 @@ def _read(path: Path) -> dict:
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
         raise DriverOrderError("Неподдерживаемая версия заказа водителя")
     return payload
+
+
+def _empty_index() -> dict:
+    return {"schema_version": INDEX_SCHEMA_VERSION, "active": {}, "publications": []}
+
+
+def index_path() -> Path:
+    return paths.DRIVER_ORDERS_FOLDER / "index.json"
+
+
+def _read_index() -> dict | None:
+    path = index_path()
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _empty_index()
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != INDEX_SCHEMA_VERSION
+        or not isinstance(payload.get("active"), dict)
+        or not isinstance(payload.get("publications"), list)
+    ):
+        return _empty_index()
+    return payload
+
+
+def _active_assignment_ids() -> set[str] | None:
+    index = _read_index()
+    if index is None:
+        return None
+    return {
+        str(assignment_id)
+        for assignment_id in index["active"].values()
+        if isinstance(assignment_id, str)
+    }
+
+
+def _snapshots(active_only: bool = False) -> list[dict]:
+    folder = paths.DRIVER_ORDERS_FOLDER
+    if not folder.exists():
+        return []
+    active_ids = _active_assignment_ids() if active_only else None
+    candidates = active_ids if active_ids is not None else [
+        path.stem for path in folder.glob("*.json") if path.name != "index.json"
+    ]
+    snapshots = []
+    for assignment_id in candidates:
+        try:
+            snapshots.append(_read(sidecar_path(str(assignment_id))))
+        except DriverOrderError:
+            continue
+    return snapshots
 
 
 def _file_digest(path: Path) -> str:
@@ -260,11 +316,57 @@ def publish_assignments(
     assignments: list[dict],
 ) -> list[Path]:
     order_id = _file_digest(Path(output_file))
-    paths_written = []
+    publication_id = uuid.uuid4().hex
+    created_at = _now()
+    prepared = []
     for assignment in assignments:
         enriched = {**assignment, "order_file": source_file}
         snapshot = build_assignment_snapshot(output_file, mode, enriched, order_id)
-        paths_written.append(save_snapshot(snapshot))
+        logical_assignment_id = _stable_id(str(source_file), str(mode or ""), snapshot["route_key"])
+        assignment_id = _stable_id(logical_assignment_id, publication_id)
+        snapshot.update({
+            "assignment_id": assignment_id,
+            "logical_assignment_id": logical_assignment_id,
+            "publication_id": publication_id,
+            "created_at": created_at,
+        })
+        prepared.append(snapshot)
+
+    with _LOCK:
+        index = _read_index() or _empty_index()
+        active = dict(index["active"])
+        paths_written = []
+        publication_assignment_ids = []
+        for snapshot in prepared:
+            logical_assignment_id = snapshot["logical_assignment_id"]
+            existing_id = active.get(logical_assignment_id)
+            try:
+                existing = _read(sidecar_path(str(existing_id))) if existing_id else None
+            except DriverOrderError:
+                existing = None
+            if existing and any(store.get("status") == "completed" for store in existing.get("stores", [])):
+                paths_written.append(sidecar_path(str(existing_id)))
+                publication_assignment_ids.append(str(existing_id))
+                continue
+
+            path = sidecar_path(snapshot["assignment_id"])
+            _atomic_write(path, snapshot)
+            active[logical_assignment_id] = snapshot["assignment_id"]
+            paths_written.append(path)
+            publication_assignment_ids.append(snapshot["assignment_id"])
+
+        publications = list(index["publications"])
+        publications.append({
+            "publication_id": publication_id,
+            "created_at": created_at,
+            "assignment_ids": publication_assignment_ids,
+            "logical_assignment_ids": [snapshot["logical_assignment_id"] for snapshot in prepared],
+        })
+        _atomic_write(index_path(), {
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "active": active,
+            "publications": publications,
+        })
     return paths_written
 
 
@@ -277,18 +379,33 @@ def load_snapshot(path_or_id: str | Path) -> dict:
 def find_assignment_for_driver(driver_id: str) -> dict | None:
     if not driver_id:
         return None
-    folder = paths.DRIVER_ORDERS_FOLDER
-    if not folder.exists():
-        return None
-    candidates = []
-    for path in folder.glob("*.json"):
-        try:
-            snapshot = _read(path)
-        except DriverOrderError:
-            continue
-        if snapshot.get("driver_id") == driver_id:
-            candidates.append(snapshot)
+    candidates = [
+        snapshot for snapshot in _snapshots(active_only=True)
+        if snapshot.get("driver_id") == driver_id
+    ]
     return max(candidates, key=lambda item: item.get("created_at", ""), default=None)
+
+
+def assignments_for_vehicle(vehicle_id: str) -> list[dict]:
+    if not vehicle_id:
+        return []
+    return [
+        snapshot for snapshot in _snapshots(active_only=True)
+        if snapshot.get("vehicle_id") == vehicle_id
+    ]
+
+
+def assigned_vehicles() -> list[dict]:
+    vehicles: dict[str, dict] = {}
+    for snapshot in _snapshots(active_only=True):
+        vehicle_id = str(snapshot.get("vehicle_id", ""))
+        if vehicle_id:
+            vehicles[vehicle_id] = {
+                "id": vehicle_id,
+                "name": str(snapshot.get("vehicle_name", "")),
+                "plate": str(snapshot.get("vehicle_plate", "")),
+            }
+    return sorted(vehicles.values(), key=lambda item: (item["plate"], item["name"]))
 
 
 def _find_store(snapshot: dict, store_id: str) -> dict:
@@ -299,13 +416,15 @@ def _find_store(snapshot: dict, store_id: str) -> dict:
 
 
 def _summary(snapshot: dict) -> list[dict]:
-    summary: dict[str, dict] = {}
+    summary: dict[tuple[str, str], dict] = {}
     for store in snapshot.get("stores", []):
         completed = store.get("status") == "completed"
         for line in store.get("lines", []):
-            item = summary.setdefault(line["name"], {
-                "name": line["name"],
-                "unit": line.get("unit", ""),
+            name = str(line.get("name", ""))
+            unit = str(line.get("unit", ""))
+            item = summary.setdefault((name, unit), {
+                "name": name,
+                "unit": unit,
                 "planned": Decimal("0"),
                 "necessary": Decimal("0"),
                 "completed": Decimal("0"),
@@ -324,8 +443,75 @@ def _summary(snapshot: dict) -> list[dict]:
             "necessary": _public_number(item["necessary"]),
             "completed": _public_number(item["completed"]),
         }
-        for item in summary.values()
+        for item in sorted(summary.values(), key=lambda item: (item["name"], item["unit"]))
     ]
+
+
+def completed_delivery_report() -> dict:
+    deliveries = []
+    summary: dict[tuple[str, str], dict] = {}
+    line_count = 0
+    for snapshot in _snapshots(active_only=False):
+        for store in snapshot.get("stores", []):
+            if store.get("status") != "completed":
+                continue
+            lines = []
+            for line in store.get("lines", []):
+                try:
+                    planned = _decimal(line.get("required_qty", "0"))
+                    delivered = _decimal(line.get("actual_qty", "0"))
+                except DriverOrderError:
+                    continue
+                name = str(line.get("name", ""))
+                unit = str(line.get("unit", ""))
+                item = summary.setdefault((name, unit), {
+                    "name": name,
+                    "unit": unit,
+                    "planned": Decimal("0"),
+                    "delivered": Decimal("0"),
+                })
+                item["planned"] += planned
+                item["delivered"] += delivered
+                lines.append({
+                    "name": name,
+                    "unit": unit,
+                    "planned": _public_number(planned),
+                    "delivered": _public_number(delivered),
+                    "difference": _public_number(delivered - planned),
+                })
+                line_count += 1
+            deliveries.append({
+                "assignment_id": str(snapshot.get("assignment_id", "")),
+                "publication_id": str(snapshot.get("publication_id", "")),
+                "order_id": str(snapshot.get("order_id", "")),
+                "route_label": str(snapshot.get("route_label", "")),
+                "driver_name": str(snapshot.get("driver_name", "")),
+                "vehicle_name": str(snapshot.get("vehicle_name", "")),
+                "vehicle_plate": str(snapshot.get("vehicle_plate", "")),
+                "store_name": str(store.get("name", "")),
+                "completed_at": str(store.get("completed_at", "")),
+                "lines": lines,
+            })
+    report_summary = [
+        {
+            "name": item["name"],
+            "unit": item["unit"],
+            "planned": _public_number(item["planned"]),
+            "delivered": _public_number(item["delivered"]),
+            "difference": _public_number(item["delivered"] - item["planned"]),
+        }
+        for item in sorted(summary.values(), key=lambda item: (item["name"], item["unit"]))
+    ]
+    return {
+        "completed_stores": len(deliveries),
+        "line_count": line_count,
+        "summary": report_summary,
+        "deliveries": sorted(deliveries, key=lambda item: item["completed_at"], reverse=True),
+    }
+
+
+def public_assignments_for_vehicle(vehicle_id: str) -> list[dict]:
+    return [public_snapshot(snapshot) for snapshot in assignments_for_vehicle(vehicle_id)]
 
 
 def public_snapshot(snapshot: dict) -> dict:

@@ -153,6 +153,21 @@ def update_vehicle(
     raise FleetError("Транспорт не найден")
 
 
+ROLES = {"driver", "loader"}
+
+
+def employee_role(employee: dict) -> str:
+    role = str(employee.get("role") or "driver")
+    return role if role in ROLES else "driver"
+
+
+def _employee_role(value: str) -> str:
+    role = _text(value) or "driver"
+    if role not in ROLES:
+        raise FleetError("Выберите роль сотрудника")
+    return role
+
+
 def _driver_login(value: str) -> str:
     login = _text(value)
     if login and not re.fullmatch(r"[A-Za-z0-9_-]{3,32}", login):
@@ -179,6 +194,7 @@ def _driver_payload(
     photo: str = "",
     documents: list[dict] | None = None,
     login: str = "",
+    role: str = "driver",
 ) -> dict:
     name = _text(name)
     if not name:
@@ -191,6 +207,7 @@ def _driver_payload(
     if not 1 <= rating_number <= 5:
         raise FleetError("Рейтинг должен быть от 1 до 5")
 
+    role = _employee_role(role)
     return {
         "name": name,
         "phone": _text(phone),
@@ -198,10 +215,11 @@ def _driver_payload(
         "active": bool(active),
         "hired_on": _text(hired_on),
         "notes": _text(notes),
-        "default_vehicle_id": _text(default_vehicle_id),
+        "default_vehicle_id": _text(default_vehicle_id) if role == "driver" else "",
         "photo": photo,
         "documents": documents or [],
         "login": _driver_login(login),
+        "role": role,
     }
 
 
@@ -219,10 +237,12 @@ def add_driver(
     notes: str = "",
     default_vehicle_id: str = "",
     login: str = "",
+    role: str = "driver",
 ) -> dict:
     data = load_fleet()
+    role = _employee_role(role)
     _assert_vehicle_exists(data["vehicles"], default_vehicle_id)
-    driver = _driver_payload(name, phone, rating, active, hired_on, notes, default_vehicle_id, login=login)
+    driver = _driver_payload(name, phone, rating, active, hired_on, notes, default_vehicle_id, login=login, role=role)
     driver["id"] = str(uuid.uuid4())
     if not driver["login"]:
         driver["login"] = f"drv-{driver['id'].replace('-', '')[:8]}"
@@ -242,6 +262,7 @@ def update_driver(
     notes: str,
     default_vehicle_id: str,
     login: str = "",
+    role: str | None = None,
 ) -> dict:
     data = load_fleet()
     _assert_vehicle_exists(data["vehicles"], default_vehicle_id)
@@ -259,6 +280,7 @@ def update_driver(
                 item.get("photo", ""),
                 item.get("documents") if isinstance(item.get("documents"), list) else [],
                 login or item.get("login", ""),
+                role if role is not None else employee_role(item),
             )
             driver["id"] = driver_id
             _assert_unique_driver_login(data["drivers"], driver["login"], driver_id)
@@ -300,7 +322,17 @@ def delete_driver(driver_id: str) -> None:
 
 
 def active_drivers() -> list[dict]:
-    return [item for item in load_fleet()["drivers"] if item.get("active")]
+    return [
+        item for item in load_fleet()["drivers"]
+        if item.get("active") and employee_role(item) == "driver"
+    ]
+
+
+def active_loaders() -> list[dict]:
+    return [
+        item for item in load_fleet()["drivers"]
+        if item.get("active") and employee_role(item) == "loader"
+    ]
 
 
 PIN_ALGORITHM = "pbkdf2_sha256"
@@ -337,19 +369,25 @@ def set_driver_pin(driver_id: str, pin: str) -> None:
     raise FleetError("Водитель не найден")
 
 
-def verify_driver_pin(driver_id: str, pin: str) -> bool:
+def _verify_employee_pin(employee_id: str, pin: str, role: str) -> bool:
     pin = str(pin or "").strip()
     if not pin.isdigit() or not 4 <= len(pin) <= 12:
         return False
-    driver = next((item for item in load_fleet()["drivers"] if item.get("id") == driver_id), None)
-    if not driver or not driver.get("active"):
+    employee = next(
+        (
+            item for item in load_fleet()["drivers"]
+            if item.get("id") == employee_id and employee_role(item) == role
+        ),
+        None,
+    )
+    if not employee or not employee.get("active"):
         return False
-    if driver.get("pin_algorithm") != PIN_ALGORITHM:
+    if employee.get("pin_algorithm") != PIN_ALGORITHM:
         return False
     try:
-        salt = base64.b64decode(driver["pin_salt"], validate=True)
-        expected = base64.b64decode(driver["pin_hash"], validate=True)
-        iterations = int(driver["pin_iterations"])
+        salt = base64.b64decode(employee["pin_salt"], validate=True)
+        expected = base64.b64decode(employee["pin_hash"], validate=True)
+        iterations = int(employee["pin_iterations"])
     except (KeyError, TypeError, ValueError):
         return False
     if not 100_000 <= iterations <= 1_000_000 or len(salt) < _PIN_SALT_BYTES:
@@ -360,21 +398,51 @@ def verify_driver_pin(driver_id: str, pin: str) -> bool:
     return hmac.compare_digest(candidate, expected)
 
 
-def driver_by_id(driver_id: str) -> dict | None:
-    return next((item for item in load_fleet()["drivers"] if item.get("id") == driver_id), None)
+def verify_driver_pin(driver_id: str, pin: str) -> bool:
+    return _verify_employee_pin(driver_id, pin, "driver")
 
 
-def driver_by_login(login: str) -> dict | None:
+def verify_loader_pin(loader_id: str, pin: str) -> bool:
+    return _verify_employee_pin(loader_id, pin, "loader")
+
+
+def _employee_by_id(employee_id: str, role: str) -> dict | None:
+    return next(
+        (
+            item for item in load_fleet()["drivers"]
+            if item.get("id") == employee_id and employee_role(item) == role
+        ),
+        None,
+    )
+
+
+def _employee_by_login(login: str, role: str) -> dict | None:
     normalized = _text(login).casefold()
     if not normalized:
         return None
     return next(
         (
             item for item in load_fleet()["drivers"]
-            if str(item.get("login", "")).casefold() == normalized
+            if employee_role(item) == role and str(item.get("login", "")).casefold() == normalized
         ),
         None,
     )
+
+
+def driver_by_id(driver_id: str) -> dict | None:
+    return _employee_by_id(driver_id, "driver")
+
+
+def driver_by_login(login: str) -> dict | None:
+    return _employee_by_login(login, "driver")
+
+
+def loader_by_id(loader_id: str) -> dict | None:
+    return _employee_by_id(loader_id, "loader")
+
+
+def loader_by_login(login: str) -> dict | None:
+    return _employee_by_login(login, "loader")
 
 
 def active_vehicles() -> list[dict]:

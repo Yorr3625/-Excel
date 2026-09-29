@@ -127,3 +127,42 @@ def test_quantity_validation_rejects_negative_values(order_fixture):
         driver_orders.complete_store(path, store["store_id"], quantities, "operation-1", 0)
 
     assert Path(path).exists()
+
+
+def test_completed_delivery_report_aggregates_only_completed_stores_and_skips_broken_snapshots(order_fixture):
+    snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
+    path = driver_orders.save_snapshot(snapshot)
+    store = snapshot["stores"][0]
+    quantities = {line["line_id"]: value for line, value in zip(store["lines"], ["8.25", "2.25"])}
+    driver_orders.complete_store(path, store["store_id"], quantities, "operation-1", 0)
+    broken = path.parent / ("f" * 32 + ".json")
+    broken.write_text("{broken", encoding="utf-8")
+
+    report = driver_orders.completed_delivery_report()
+    summary = {item["name"]: item for item in report["summary"]}
+
+    assert report["completed_stores"] == 1
+    assert report["line_count"] == 2
+    assert report["deliveries"][0]["store_name"] == "фм 10"
+    assert summary["Яблоки"] == {
+        "name": "Яблоки", "unit": "", "planned": 10, "delivered": 8.25, "difference": -1.75
+    }
+    assert summary["Бананы"] == {
+        "name": "Бананы", "unit": "", "planned": 2.5, "delivered": 2.25, "difference": -0.25
+    }
+
+
+def test_republishing_assignments_preserves_completed_store_without_double_counting(order_fixture):
+    first_paths = driver_orders.publish_assignments(order_fixture, "Город", "order.xlsx", [assignment()])
+    snapshot = driver_orders.load_snapshot(first_paths[0])
+    store = snapshot["stores"][0]
+    quantities = {line["line_id"]: "1" for line in store["lines"]}
+    driver_orders.complete_store(first_paths[0], store["store_id"], quantities, "operation-1", 0)
+
+    republished_paths = driver_orders.publish_assignments(order_fixture, "Город", "order.xlsx", [assignment()])
+    report = driver_orders.completed_delivery_report()
+
+    assert republished_paths == first_paths
+    assert driver_orders.assignments_for_vehicle("vehicle-1")[0]["assignment_id"] == snapshot["assignment_id"]
+    assert report["completed_stores"] == 1
+    assert report["line_count"] == 2

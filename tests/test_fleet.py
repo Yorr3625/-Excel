@@ -156,3 +156,47 @@ def test_driver_pin_validation_and_update_preserve_credentials():
 
     fleet.update_driver(driver["id"], "Иванов", "", 5, True, "", "", "")
     assert fleet.verify_driver_pin(driver["id"], "123456") is True
+
+
+def test_legacy_employees_without_role_remain_drivers():
+    fleet.FLEET_FILE.parent.mkdir(parents=True)
+    fleet.FLEET_FILE.write_text(json.dumps({
+        "version": 1,
+        "drivers": [{"id": "legacy", "name": "Иван", "active": True}],
+        "vehicles": [],
+    }), encoding="utf-8")
+
+    employee = fleet.load_fleet()["drivers"][0]
+
+    assert fleet.employee_role(employee) == "driver"
+    assert fleet.active_drivers() == [employee]
+    assert fleet.active_loaders() == []
+
+
+def test_loader_has_separate_credentials_and_cannot_be_assigned_as_driver():
+    vehicle = fleet.add_vehicle("Газель", "А123ВС71")
+    loader = fleet.add_driver(
+        "Пётр", default_vehicle_id=vehicle["id"], login="loader-1", role="loader"
+    )
+    fleet.set_driver_pin(loader["id"], "1234")
+
+    assert loader["default_vehicle_id"] == ""
+    assert fleet.active_drivers() == []
+    assert [item["id"] for item in fleet.active_loaders()] == [loader["id"]]
+    assert fleet.loader_by_login("LOADER-1")["id"] == loader["id"]
+    assert fleet.verify_loader_pin(loader["id"], "1234") is True
+    assert fleet.verify_driver_pin(loader["id"], "1234") is False
+
+
+def test_updating_employee_to_loader_clears_default_vehicle():
+    vehicle = fleet.add_vehicle("Газель", "А123ВС71")
+    employee = fleet.add_driver("Иван", default_vehicle_id=vehicle["id"])
+
+    updated = fleet.update_driver(
+        employee["id"], "Иван", "", 5, True, "", "", vehicle["id"], role="loader"
+    )
+
+    assert updated["role"] == "loader"
+    assert updated["default_vehicle_id"] == ""
+    assert fleet.active_drivers() == []
+    assert fleet.active_loaders() == [updated]
