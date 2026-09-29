@@ -1,0 +1,11 @@
+map "" $active_backend {
+    default blue;
+}
+
+map "" $draining_backend {
+    default none;
+}
+
+map "" $draining_cookie_expires {
+    default "Thu, 01 Jan 1970 00:00:00 GMT";
+}
