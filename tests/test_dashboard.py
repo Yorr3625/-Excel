@@ -997,6 +997,24 @@ def test_logout_stops_background_controls_and_resets_state():
     assert logout is not None
 
 
+def test_dashboard_auth_scripts_target_backend_and_include_credentials(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(dashboard.rx, "call_script", scripts.append)
+    state = SimpleNamespace(
+        mail_auto=False,
+        tracking_running=False,
+        real_watching=False,
+        reset=lambda: None,
+    )
+
+    dashboard.State.logout.fn(state)
+
+    for script in (dashboard.DASHBOARD_LOGIN_JS, scripts[0]):
+        assert "new URL(" in script
+        assert "credentials: 'include'" in script
+        assert "fetch('/api/dashboard" not in script
+
+
 def test_auth_middleware_allows_only_public_events_when_anonymous():
     class StateStore:
         async def get_state(self, state_class):
@@ -1076,3 +1094,45 @@ def test_opening_delivery_page_loads_completed_delivery_report(monkeypatch):
     assert state.delivery_summary == report["summary"]
     assert state.delivery_items == report["deliveries"]
     assert dashboard.PAGE_GROUPS["Сданный товар"] == "Рейсы"
+
+
+def test_delivery_difference_color_uses_one_unit_tolerance(monkeypatch):
+    def fake_cond(condition, when_true, when_false):
+        return condition, when_true, when_false
+
+    monkeypatch.setattr(dashboard.rx, "cond", fake_cond)
+
+    assert dashboard._delivery_difference_color(-1.01) == (
+        True,
+        dashboard.ui.STATUS_RED_TEXT,
+        (False, dashboard.ui.STATUS_GREEN_TEXT, dashboard.ui.INK),
+    )
+    for difference in (-1, 0, 1):
+        assert dashboard._delivery_difference_color(difference) == (
+            False,
+            dashboard.ui.STATUS_RED_TEXT,
+            (False, dashboard.ui.STATUS_GREEN_TEXT, dashboard.ui.INK),
+        )
+    assert dashboard._delivery_difference_color(1.01) == (
+        False,
+        dashboard.ui.STATUS_RED_TEXT,
+        (True, dashboard.ui.STATUS_GREEN_TEXT, dashboard.ui.INK),
+    )
+
+
+def test_delivery_rows_use_shared_difference_color(monkeypatch):
+    differences = []
+    monkeypatch.setattr(
+        dashboard,
+        "_delivery_difference_color",
+        lambda difference: differences.append(difference) or dashboard.ui.INK,
+    )
+
+    dashboard.delivery_summary_row({
+        "name": "Яблоки", "unit": "", "planned": 10, "delivered": 8.5, "difference": -1.5,
+    })
+    dashboard.delivery_line_row({
+        "name": "Яблоки", "unit": "", "planned": 10, "delivered": 11.5, "difference": 1.5,
+    })
+
+    assert differences == [-1.5, 1.5]

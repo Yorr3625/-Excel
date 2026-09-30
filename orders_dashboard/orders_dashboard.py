@@ -10,6 +10,7 @@ import traceback
 import uuid
 
 import reflex as rx
+from reflex.config import get_config
 from reflex.state import StateUpdate
 from reflex_base.event import Event
 from starlette.applications import Starlette
@@ -164,6 +165,21 @@ from modules.invoice_ocr import (
 )
 from modules.help_chat import HelpChatError, send_chat_message
 from orders_dashboard import theme as ui
+
+
+DASHBOARD_API_ORIGIN_JS = f"""
+(() => {{
+    const apiUrl = new URL({json.dumps(get_config().api_url.rstrip('/'))});
+    if (['localhost', '127.0.0.1', '0.0.0.0', '[::1]'].includes(apiUrl.hostname)) {{
+        apiUrl.hostname = window.location.hostname;
+    }}
+    if (window.location.protocol === 'https:' && apiUrl.protocol === 'http:') {{
+        apiUrl.protocol = 'https:';
+        apiUrl.port = '';
+    }}
+    return apiUrl.origin;
+}})()
+"""
 
 
 def _admin_token(cookie_header: str) -> str | None:
@@ -1141,8 +1157,8 @@ class State(rx.State):
         self.real_watching = False
         self.reset()
         return rx.call_script(
-            "fetch('/api/dashboard/logout', {method: 'POST', "
-            "headers: {'X-Dashboard-Request': '1'}, credentials: 'same-origin'})"
+            "fetch(" + DASHBOARD_API_ORIGIN_JS + " + '/api/dashboard/logout', {method: 'POST', "
+            "headers: {'X-Dashboard-Request': '1'}, credentials: 'include'})"
             ".finally(() => window.location.replace('/login'));"
         )
 
@@ -7483,6 +7499,14 @@ def fleet_page():
     )
 
 
+def _delivery_difference_color(difference):
+    return rx.cond(
+        difference < -1,
+        ui.STATUS_RED_TEXT,
+        rx.cond(difference > 1, ui.STATUS_GREEN_TEXT, text()),
+    )
+
+
 def delivery_summary_row(item):
     return rx.hstack(
         rx.text(item["name"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, width="100%"),
@@ -7491,7 +7515,7 @@ def delivery_summary_row(item):
         rx.text(item["delivered"], color=text(), width="100px", text_align="right"),
         rx.text(
             item["difference"],
-            color=rx.cond(item["difference"] == 0, ui.STATUS_GREEN_TEXT, ui.STATUS_RED_TEXT),
+            color=_delivery_difference_color(item["difference"]),
             width="100px",
             text_align="right",
         ),
@@ -7510,7 +7534,7 @@ def delivery_line_row(line):
         rx.text("Сдано: ", line["delivered"], color=text(), width="130px", text_align="right"),
         rx.text(
             "Разница: ", line["difference"],
-            color=rx.cond(line["difference"] == 0, ui.STATUS_GREEN_TEXT, ui.STATUS_RED_TEXT),
+            color=_delivery_difference_color(line["difference"]),
             width="140px",
             text_align="right",
         ),
@@ -7809,10 +7833,10 @@ DASHBOARD_LOGIN_JS = """
     if (!username || !password || !error) return;
     error.textContent = '';
     try {
-        const response = await fetch('/api/dashboard/login', {
+        const response = await fetch(""" + DASHBOARD_API_ORIGIN_JS + """ + '/api/dashboard/login', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            credentials: 'same-origin',
+            credentials: 'include',
             body: JSON.stringify({username: username.value, password: password.value}),
         });
         password.value = '';
