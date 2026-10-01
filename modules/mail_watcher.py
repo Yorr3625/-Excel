@@ -41,7 +41,6 @@ PDF_SUFFIXES = (".pdf",)
 KIND_ORDERS = "orders"
 KIND_INVOICES = "invoices"
 KIND_MESSAGE = "message"
-DEFAULT_ORDER_SUBJECT = "Заказ ТС МОЛОКО"
 DEFAULT_MILK_ORDER_EMAIL = "fyodorova.ekaterina@moloko.com.ru"
 
 CITY_INVOICE_MODE = "Город"
@@ -76,7 +75,6 @@ OLGA_ORDER_SOURCE = {
     "email": "o_solenkova@mail.ru",
     "person": "Ольга Соленкова",
     "kind": KIND_ORDERS,
-    "subject": "Заказ.xlsx",
     "categories": [],
 }
 REGION_INVOICE_GROUPS = {
@@ -189,9 +187,6 @@ def sources(config: dict | None = None) -> list[dict]:
             "email": email_addr,
             "person": source.get("person", ""),
             "kind": kind,
-            "subject": source.get("subject") or (
-                DEFAULT_ORDER_SUBJECT if kind == KIND_ORDERS else ""
-            ),
             "categories": categories,
         })
 
@@ -204,7 +199,6 @@ def sources(config: dict | None = None) -> list[dict]:
                 "email": email_addr,
                 "person": "",
                 "kind": KIND_ORDERS,
-                "subject": DEFAULT_ORDER_SUBJECT,
                 "categories": [],
             })
 
@@ -455,48 +449,10 @@ def invoice_category(
     return ""
 
 
-def _normalise_subject(value: str) -> str:
-    return " ".join(str(value or "").split()).casefold()
-
-
-def _subject_rejection(expected_subject: str, verdict: dict | None = None) -> dict:
-    result = dict(verdict or {})
-    result.update({
-        "ok": False,
-        "reason": f"Тема письма должна быть «{expected_subject}»",
-    })
-    result.setdefault("mode", "")
-    result.setdefault("matches", 0)
-    result.setdefault("scores", {})
-    return result
-
-
-def _enforce_order_subject(item: dict) -> None:
-    if item.get("kind") != KIND_ORDERS:
-        return
-
-    expected_subject = item.get("expected_subject") or DEFAULT_ORDER_SUBJECT
-
-    if _normalise_subject(item.get("subject", "")) != _normalise_subject(
-        expected_subject
-    ):
-        item["verdict"] = _subject_rejection(
-            expected_subject,
-            item.get("verdict"),
-        )
-
-
 def load_mail_items() -> list[dict]:
     """Возвращает сохранённые письма и вложения, новые сверху."""
 
-    items = _read_json(MAIL_ITEMS_FILE, [])
-
-    # Старый кеш мог считать заказом любой подходящий Excel. Применяем новое
-    # правило темы и к уже сохранённым письмам, не заставляя скачивать их снова.
-    for item in items:
-        _enforce_order_subject(item)
-
-    return items
+    return _read_json(MAIL_ITEMS_FILE, [])
 
 
 def _item_received_date(item: dict) -> date | None:
@@ -798,7 +754,6 @@ def _base_item(message, source: dict, message_id: str) -> dict:
         "source_name": source["name"],
         "source_email": source["email"],
         "source_person": source.get("person", ""),
-        "expected_subject": source.get("subject", ""),
         "order_file": "",
     }
 
@@ -921,14 +876,7 @@ def _check_mail_unlocked(config: dict | None = None) -> dict:
                     }
 
                     if kind == KIND_ORDERS:
-                        expected_subject = source.get("subject") or DEFAULT_ORDER_SUBJECT
-
-                        if _normalise_subject(base["subject"]) != _normalise_subject(
-                            expected_subject
-                        ):
-                            item["verdict"] = _subject_rejection(expected_subject)
-                        else:
-                            item["verdict"] = validate_order_file(path)
+                        item["verdict"] = validate_order_file(path)
 
                     letter_items.append(item)
 

@@ -335,7 +335,7 @@ def _letter_with_attachment(
     filename: str,
     payload: bytes,
     sender="boss@example.com",
-    subject=mail_watcher.DEFAULT_ORDER_SUBJECT,
+    subject="Заказ ТС МОЛОКО",
 ):
     """Собирает настоящее письмо MIME с вложением.
 
@@ -574,37 +574,11 @@ def test_order_from_letter_is_saved_and_accepted(monkeypatch, _stores_for_valida
     assert fake.readonly_used is True
 
 
-def test_valid_excel_with_wrong_subject_is_not_order(monkeypatch, _stores_for_validation):
+def test_valid_order_with_short_subject_is_accepted(monkeypatch, _stores_for_validation):
     letter = _letter_with_attachment(
         "заказ.xlsx",
         _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
-        subject="Заказ на завтра",
-    )
-    monkeypatch.setattr(
-        mail_watcher.imaplib,
-        "IMAP4_SSL",
-        lambda *a, **kw: _FakeIMAP([letter]),
-    )
-
-    result = mail_watcher.check_mail(_config())
-
-    assert result["ok"]
-    item = result["items"][0]
-    assert not item["verdict"]["ok"]
-    assert item["verdict"]["reason"] == (
-        "Тема письма должна быть «Заказ ТС МОЛОКО»"
-    )
-    assert (mail_watcher.ORDERS_FOLDER / "заказ.xlsx").exists()
-
-
-def test_order_subject_ignores_case_and_repeated_spaces(
-    monkeypatch,
-    _stores_for_validation,
-):
-    letter = _letter_with_attachment(
-        "заказ.xlsx",
-        _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
-        subject="заказ   тс молоко",
+        subject="заказ",
     )
     monkeypatch.setattr(
         mail_watcher.imaplib,
