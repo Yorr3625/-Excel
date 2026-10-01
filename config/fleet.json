@@ -1,16 +1,88 @@
 {
   "version": 1,
-  "drivers": [],
+  "drivers": [
+    {
+      "name": "Алиев Азар Рамиз Оглы",
+      "phone": "",
+      "rating": 5,
+      "active": true,
+      "hired_on": "2026-01-23",
+      "notes": "",
+      "default_vehicle_id": "6d8560fd-3bff-41bc-8722-adce5972e39c",
+      "photo": "",
+      "documents": [],
+      "login": "Azer",
+      "id": "689a3179-c140-43e2-bd75-d5ccaac8a6f1",
+      "pin_algorithm": "pbkdf2_sha256",
+      "pin_iterations": 300000,
+      "pin_salt": "zuhjrSuvUrzsFCWk0P9uiw==",
+      "pin_hash": "S816lZnqCHTVyEFMRnLNje2FdJyqRaWAIS5+NOTPOaw="
+    },
+    {
+      "name": "Байрамов Раван",
+      "phone": "",
+      "rating": 5,
+      "active": true,
+      "hired_on": "2026-09-23",
+      "notes": "",
+      "default_vehicle_id": "4fcca5c3-1741-4120-9a1c-039a8f18efef",
+      "photo": "",
+      "documents": [],
+      "login": "Ravan",
+      "id": "d745c10a-4d01-49cf-a8b9-9daf91f8402c",
+      "pin_algorithm": "pbkdf2_sha256",
+      "pin_iterations": 300000,
+      "pin_salt": "g3kgNnF6HcfN/TIBqlLw6w==",
+      "pin_hash": "pwB5XUIgh+sIT6pd0ibiD8ABbXJcV6l9tc2xqEH30T0="
+    },
+    {
+      "name": "Ищенко Артем Владимирович",
+      "phone": "",
+      "rating": 5,
+      "active": true,
+      "hired_on": "2026-09-23",
+      "notes": "",
+      "default_vehicle_id": "7b151e26-d35b-43b6-bf28-316bbcf0fbe8",
+      "photo": "",
+      "documents": [],
+      "login": "Artem",
+      "id": "27cb6e79-8f12-442e-a6d4-4eb3e7be9f0a",
+      "pin_algorithm": "pbkdf2_sha256",
+      "pin_iterations": 300000,
+      "pin_salt": "nsgcCACheH1tMLvVvCAzLQ==",
+      "pin_hash": "et8MZSs7rYy22clNijbYmU4IrFR3wyhmCIaXkYVZMBw="
+    }
+  ],
   "vehicles": [
     {
-      "name": "Газель",
-      "plate": "СИНЯЯ",
+      "name": "Ford",
+      "plate": "У403ОМ193",
       "odometer_km": 0,
-      "description": "",
+      "description": "Белый Форд транзит",
       "notes": "",
       "active": true,
-      "tracker_id": "1698528",
-      "id": "34c30aa9-3539-4ef7-ac81-4e85c10363a1"
+      "tracker_id": "",
+      "id": "7b151e26-d35b-43b6-bf28-316bbcf0fbe8"
+    },
+    {
+      "name": "Газ Газель",
+      "plate": "М404ХЕ",
+      "odometer_km": 0,
+      "description": "Синяя Газель",
+      "notes": "",
+      "active": true,
+      "tracker_id": "",
+      "id": "6d8560fd-3bff-41bc-8722-adce5972e39c"
+    },
+    {
+      "name": "Mercedes Sprinter",
+      "plate": "Р492МА180",
+      "odometer_km": 0,
+      "description": "Белый Спринтер",
+      "notes": "",
+      "active": true,
+      "tracker_id": "",
+      "id": "4fcca5c3-1741-4120-9a1c-039a8f18efef"
     }
   ]
 }

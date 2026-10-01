@@ -4,7 +4,7 @@ x-app: &app
   build:
     context: .
     dockerfile: Dockerfile
-  image: dostavo-app:1.0.15
+  image: dostavo-app:1.1.0
   command:
     - python
     - -m
@@ -44,7 +44,7 @@ services:
     <<: *app
 
   mail-worker:
-    image: dostavo-app:1.0.15
+    image: dostavo-app:1.1.0
     command:
       - python
       - -m
