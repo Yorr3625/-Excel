@@ -11,6 +11,9 @@ let mileage = null;
 let selectedStoreId = "";
 let view = "login";
 let online = navigator.onLine;
+let theme = (() => {
+  try { return localStorage.getItem("driver-theme") === "dark" ? "dark" : "light"; } catch (_) { return "light"; }
+})();
 
 const apiBasePromise = (async () => {
   try {
@@ -114,6 +117,43 @@ function root() {
   return document.getElementById("driver-app");
 }
 
+function logoMark() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h11v9H3zM14 10h3.5l2.5 2.5v3H14zM7 18.5a1.75 1.75 0 1 0 0-3.5 1.75 1.75 0 0 0 0 3.5Zm10 0a1.75 1.75 0 1 0 0-3.5 1.75 1.75 0 0 0 0 3.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`;
+}
+
+function themeIcon() {
+  return theme === "dark"
+    ? `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2M12 19.5v2M21.5 12h-2M4.5 12h-2M18.72 5.28l-1.42 1.42M6.7 17.3l-1.42 1.42M18.72 18.72 17.3 17.3M6.7 6.7 5.28 5.28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`
+    : `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`;
+}
+
+function appHeader(showLogout = false) {
+  return `<header class="driver-app-header">
+    <a class="driver-brand" href="/driver" aria-label="Dostavo.online">
+      <span class="driver-brand-mark">${logoMark()}</span><strong>dostavo.online</strong><span class="driver-brand-subtitle">Кабинет водителя</span>
+    </a>
+    <div class="driver-header-actions">
+      <button class="driver-icon-button" data-theme-toggle type="button" aria-label="${theme === "dark" ? "Включить светлую тему" : "Включить тёмную тему"}">${themeIcon()}</button>
+      ${showLogout ? '<button class="driver-logout" data-logout type="button">Выйти</button>' : ""}
+    </div>
+  </header>`;
+}
+
+function applyTheme() {
+  root()?.querySelector(".driver-app-frame")?.setAttribute("data-theme", theme);
+  try { localStorage.setItem("driver-theme", theme); } catch (_) {}
+}
+
+function bindFrameActions() {
+  applyTheme();
+  root().querySelector("[data-theme-toggle]")?.addEventListener("click", () => {
+    theme = theme === "dark" ? "light" : "dark";
+    applyTheme();
+    render();
+  });
+  root().querySelector("[data-logout]")?.addEventListener("click", logout);
+}
+
 function esc(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
@@ -142,20 +182,23 @@ function render() {
 
 function renderLogin() {
   root().innerHTML = `
-    <main class="driver-shell driver-login-shell">
-      <section class="driver-panel driver-login-panel">
-        <img class="driver-logo" src="/icon-192.svg" alt="Логистика">
-        <h1>Рабочее место водителя</h1>
-        <p class="driver-muted">Войдите по коду водителя и PIN-коду</p>
-        <form data-login-form class="driver-form">
-          <label>Код водителя<input name="driver_id" autocomplete="username" required maxlength="128"></label>
-          <label>PIN-код<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required minlength="4" maxlength="12"></label>
-          <button class="driver-primary" type="submit">Войти</button>
-        </form>
-        <p data-message class="driver-message"></p>
-        <p class="driver-offline-note">${online ? "Подключение к серверу доступно" : "Нет подключения к серверу"}</p>
-      </section>
-    </main>`;
+    <div class="driver-app-frame">
+      ${appHeader()}
+      <main class="driver-login-shell">
+        <section class="driver-panel driver-login-panel">
+          <h1>Рабочее место водителя</h1>
+          <p class="driver-muted">Войдите по коду водителя и PIN-коду</p>
+          <form data-login-form class="driver-form">
+            <label>Код водителя<input name="driver_id" autocomplete="username" required maxlength="128"></label>
+            <label>PIN-код<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required minlength="4" maxlength="12"></label>
+            <button class="driver-primary" type="submit">Войти</button>
+          </form>
+          <p data-message class="driver-message"></p>
+        </section>
+        <p class="driver-offline-note ${online ? "driver-online" : "driver-offline"}"><span aria-hidden="true"></span>${online ? "Подключение к серверу доступно" : "Нет подключения к серверу"}</p>
+      </main>
+    </div>`;
+  bindFrameActions();
   root().querySelector("[data-login-form]").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -193,22 +236,24 @@ function renderMileage() {
   const isAvailable = mileage?.available;
   const vehicleLabel = [vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Назначенный автомобиль";
   root().innerHTML = `
-    <main class="driver-shell">
-      <div class="driver-modal-backdrop">
-        <section class="driver-modal" role="dialog" aria-modal="true" aria-labelledby="mileage-title">
-          <h1 id="mileage-title">Укажите пробег</h1>
-          <p class="driver-muted">Перед началом работы зафиксируйте показание одометра.</p>
-          <p class="driver-mileage-vehicle">${esc(vehicleLabel)}</p>
-          ${isAvailable ? `<form data-mileage-form class="driver-form">
-            <label>Пробег, км<input name="odometer_km" type="number" inputmode="numeric" min="0" max="9999999" step="1" required autofocus></label>
-            <button class="driver-primary" type="submit">Сохранить пробег</button>
-          </form>` : ""}
-          <p data-message class="${isAvailable ? "driver-message" : "driver-message driver-message-error"}">${esc(isAvailable ? (mileage?.pending ? "Показание ожидает отправки после восстановления связи." : "") : (mileage?.error || "Проверьте активное назначение."))}</p>
-          <button data-logout class="driver-secondary" type="button">Выйти</button>
-        </section>
-      </div>
-    </main>`;
-  root().querySelector("[data-logout]").addEventListener("click", logout);
+    <div class="driver-app-frame">
+      ${appHeader(true)}
+      <main class="driver-shell">
+        <div class="driver-modal-backdrop">
+          <section class="driver-modal" role="dialog" aria-modal="true" aria-labelledby="mileage-title">
+            <h1 id="mileage-title">Укажите пробег</h1>
+            <p class="driver-muted">Перед началом работы зафиксируйте показание одометра.</p>
+            <p class="driver-mileage-vehicle">${esc(vehicleLabel)}</p>
+            ${isAvailable ? `<form data-mileage-form class="driver-form">
+              <label>Пробег, км<input name="odometer_km" type="number" inputmode="numeric" min="0" max="9999999" step="1" required autofocus></label>
+              <button class="driver-primary" type="submit">Сохранить пробег</button>
+            </form>` : ""}
+            <p data-message class="${isAvailable ? "driver-message" : "driver-message driver-message-error"}">${esc(isAvailable ? (mileage?.pending ? "Показание ожидает отправки после восстановления связи." : "") : (mileage?.error || "Проверьте активное назначение."))}</p>
+          </section>
+        </div>
+      </main>
+    </div>`;
+  bindFrameActions();
   const form = root().querySelector("[data-mileage-form]");
   if (form) form.addEventListener("submit", submitMileage);
 }
@@ -219,32 +264,61 @@ function summaryRows() {
   `).join("");
 }
 
-function storeCards() {
-  return (assignment?.stores || []).map((store) => {
+function driverInitials() {
+  return esc((assignment?.driver_name || "Водитель").split(/\s+/).filter(Boolean).map((part) => part[0]).join("").slice(0, 2).toUpperCase());
+}
+
+function storeCards(stores, offset = 0) {
+  return stores.map((store, index) => {
     const completed = store.status === "completed";
     return `<button class="driver-store ${completed ? "driver-store-done" : ""}" data-store-id="${esc(store.store_id)}" ${completed ? "disabled" : ""}>
-      <span>${esc(store.name)}</span><strong>${completed ? "Выполнено" : "Открыть"}</strong>
+      <span class="driver-store-index">${offset + index + 1}</span>
+      <span class="driver-store-name">${esc(store.name)}</span>
+      <strong>${completed ? "Выполнено" : "Открыть"}</strong>
     </button>`;
   }).join("");
+}
+
+function storesPanel(stores, offset = 0, className = "") {
+  return `<section class="driver-panel driver-stores-panel ${className}">
+    <div class="driver-panel-heading"><div><h2>Магазины</h2><p class="driver-muted">Откройте магазин, чтобы начать работу с заказом</p></div><span class="driver-count">${assignment?.store_count || 0}</span></div>
+    <div class="driver-store-list">${stores.length ? storeCards(stores, offset) : '<p class="driver-muted">Магазины не назначены</p>'}</div>
+  </section>`;
 }
 
 function renderOrder() {
   const completed = assignment?.completed_stores || 0;
   const total = assignment?.store_count || 0;
+  const stores = assignment?.stores || [];
+  const progress = total ? Math.round((completed / total) * 100) : 0;
   root().innerHTML = `
-    <main class="driver-shell">
-      <header class="driver-header"><div><h1>${esc(assignment?.route_label || "Назначенный заказ")}</h1><p class="driver-muted">${esc(assignment?.driver_name || "")} · ${completed} из ${total} магазинов</p></div><button data-logout class="driver-secondary">Выйти</button></header>
-      <p data-message class="driver-message"></p>
-      <section class="driver-panel"><h2>Весь заказ</h2><div class="driver-table-wrap"><table class="driver-table"><thead><tr><th>Товар</th><th>Ед.</th><th>План</th><th>Необходимо</th><th>Выполнено</th></tr></thead><tbody>${summaryRows()}</tbody></table></div></section>
-      <section class="driver-panel"><h2>Магазины</h2><div class="driver-store-list">${storeCards() || "<p class=\"driver-muted\">Магазины не назначены</p>"}</div></section>
-      <footer class="driver-footer"><span>${online ? "Онлайн" : "Офлайн"}</span><button data-sync class="driver-secondary">Синхронизировать</button></footer>
-    </main>`;
+    <div class="driver-app-frame">
+      ${appHeader(true)}
+      <main class="driver-shell driver-order-shell">
+        <p class="driver-breadcrumb">Назначенный заказ</p>
+        <div class="driver-route-title"><h1>${esc(assignment?.route_label || "Назначенный заказ")}</h1><span>${online ? "Онлайн" : "Офлайн"}</span></div>
+        <section class="driver-overview">
+          <div class="driver-overview-card"><span class="driver-avatar">${driverInitials()}</span><div><small>Водитель</small><strong>${esc(assignment?.driver_name || "Не назначен")}</strong></div></div>
+          <div class="driver-overview-card driver-progress-card"><div><small>${completed} из ${total} магазинов</small><strong>${progress}%</strong></div><div class="driver-progress"><span style="width:${progress}%"></span></div></div>
+        </section>
+        <p data-message class="driver-message"></p>
+        <div class="driver-workspace">
+          <section class="driver-panel driver-order-panel">
+            <div class="driver-panel-heading"><div><h2>Весь заказ</h2><p class="driver-muted">Общий объём товаров по маршруту. Данные обновляются при синхронизации.</p></div><span class="driver-products-count">${(assignment?.summary || []).length} товаров</span></div>
+            <div class="driver-table-wrap"><table class="driver-table"><thead><tr><th>Товар</th><th>Ед.</th><th>Заказ на маршрут</th><th>Необходимо на маршрут</th><th>Выполнено</th></tr></thead><tbody>${summaryRows()}</tbody></table></div>
+            <p class="driver-table-note">Для подтверждения магазина заполните фактическое количество каждой позиции.</p>
+          </section>
+          ${storesPanel(stores)}
+        </div>
+        <footer class="driver-footer"><span class="${online ? "driver-online" : "driver-offline"}"><i aria-hidden="true"></i>${online ? "Онлайн" : "Офлайн"}<small>${online ? "Данные синхронизированы с сервером" : "Изменения будут отправлены после восстановления связи"}</small></span><button data-sync class="driver-primary driver-sync" type="button">Синхронизировать</button></footer>
+      </main>
+    </div>`;
+  bindFrameActions();
   root().querySelectorAll("[data-store-id]").forEach((button) => button.addEventListener("click", () => {
     selectedStoreId = button.dataset.storeId;
     view = "store";
     render();
   }));
-  root().querySelector("[data-logout]").addEventListener("click", logout);
   root().querySelector("[data-sync]").addEventListener("click", syncOrder);
 }
 
@@ -261,9 +335,15 @@ function renderStore() {
     <input data-line-id="${esc(line.line_id)}" type="number" inputmode="decimal" min="0" step="any" value="${completed ? numberText(line.actual_qty) : ""}" ${completed ? "disabled" : "required"}>
     </label>`).join("");
   root().innerHTML = `
-    <main class="driver-shell"><header class="driver-header"><button data-back class="driver-secondary">Назад</button><div><h1>${esc(store.name)}</h1><p class="driver-muted">${completed ? "Магазин выполнен" : "Введите фактическое количество"}</p></div></header>
-      <section class="driver-panel"><div class="driver-lines">${lines}</div>${completed ? "" : "<button data-complete class=\"driver-primary\">Подтвердить магазин</button>"}<p data-message class="driver-message"></p></section>
-    </main>`;
+    <div class="driver-app-frame">
+      ${appHeader(true)}
+      <main class="driver-shell driver-store-shell">
+        <p class="driver-breadcrumb">${esc(assignment?.route_label || "Назначенный заказ")}</p>
+        <header class="driver-header"><button data-back class="driver-secondary" type="button">Назад</button><div><h1>${esc(store.name)}</h1><p class="driver-muted">${completed ? "Магазин выполнен" : "Введите фактическое количество"}</p></div></header>
+        <section class="driver-panel driver-store-detail"><div class="driver-lines">${lines}</div>${completed ? "" : '<button data-complete class="driver-primary" type="button">Подтвердить магазин</button>'}<p data-message class="driver-message"></p></section>
+      </main>
+    </div>`;
+  bindFrameActions();
   root().querySelector("[data-back]").addEventListener("click", () => { view = "order"; render(); });
   const complete = root().querySelector("[data-complete]");
   if (complete) complete.addEventListener("click", completeStore);
@@ -553,4 +633,5 @@ window.addEventListener("online", async () => {
 });
 window.addEventListener("offline", () => { online = false; if (view !== "login") render(); });
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+applyTheme();
 restoreSession();
