@@ -13,6 +13,7 @@ def test_loader_pwa_uses_its_own_authenticated_read_only_api():
     assert '"/api/loader/orders"' in source
     assert 'credentials: "include"' in source
     assert '"X-Loader-CSRF"' in source
+    assert 'window.location.assign("/loading")' in source
     assert "/api/driver/" not in source
 
 

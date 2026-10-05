@@ -449,10 +449,67 @@ def invoice_category(
     return ""
 
 
+class MailDownloadError(ValueError):
+    """Запрошенное почтовое вложение недоступно для скачивания."""
+
+
 def load_mail_items() -> list[dict]:
     """Возвращает сохранённые письма и вложения, новые сверху."""
 
     return _read_json(MAIL_ITEMS_FILE, [])
+
+
+def _resolve_stored_attachment(item: dict, folder: Path, suffixes: tuple[str, ...]) -> Path:
+    filename = str(item.get("file", ""))
+    if not filename or Path(filename).name != filename:
+        raise MailDownloadError("Файл недоступен.")
+
+    root = folder.resolve(strict=False)
+    candidate = Path(str(item.get("path", "")))
+    resolved = candidate.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as error:
+        raise MailDownloadError("Файл недоступен.") from error
+
+    if (
+        len(relative.parts) != 1
+        or any((root / Path(*relative.parts[:index])).is_symlink() for index in range(1, len(relative.parts) + 1))
+        or resolved.name != filename
+        or resolved.suffix.casefold() not in suffixes
+        or not resolved.is_file()
+    ):
+        raise MailDownloadError("Файл недоступен.")
+    return resolved
+
+
+def resolve_order_for_download(order_file: str) -> Path:
+    if not order_file or Path(order_file).name != order_file:
+        raise MailDownloadError("Файл недоступен.")
+
+    for item in load_mail_items():
+        if item.get("kind") == KIND_ORDERS and item.get("file") == order_file:
+            return _resolve_stored_attachment(item, ORDERS_FOLDER, ALLOWED_SUFFIXES)
+    raise MailDownloadError("Файл недоступен.")
+
+
+def resolve_linked_invoice_for_download(order_file: str, invoice_file: str) -> Path:
+    if (
+        not order_file
+        or Path(order_file).name != order_file
+        or not invoice_file
+        or Path(invoice_file).name != invoice_file
+    ):
+        raise MailDownloadError("Файл недоступен.")
+
+    for item in load_mail_items():
+        if (
+            item.get("kind") == KIND_INVOICES
+            and item.get("order_file") == order_file
+            and item.get("file") == invoice_file
+        ):
+            return _resolve_stored_attachment(item, INVOICES_FOLDER, PDF_SUFFIXES)
+    raise MailDownloadError("Файл недоступен.")
 
 
 def _item_received_date(item: dict) -> date | None:

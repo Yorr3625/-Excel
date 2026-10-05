@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 from starlette.testclient import TestClient
@@ -46,6 +47,7 @@ def test_list_processed_files_returns_newest_xlsx_with_metadata(processed_folder
     assert entries[0]["folder"] == "24.09.26"
     assert entries[0]["size"] == 8
     assert entries[0]["size_label"] == "8 Б"
+    assert re.fullmatch(r"\d{2}\.\d{2}\.\d{2} \d{2}:\d{2}", entries[0]["modified_at"])
 
 
 def test_list_processed_files_returns_empty_when_folder_is_missing(processed_folder):

@@ -815,3 +815,91 @@ body {
   .driver-sync { min-width: 120px; }
   .driver-line { grid-template-columns: minmax(0, 1fr) 96px; }
 }
+
+.loading-page {
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+.loading-page-content {
+  margin: 0 auto;
+}
+
+.loading-select,
+.loading-amount-input {
+  min-height: 44px !important;
+}
+
+.loading-primary-button,
+.loading-secondary-button {
+  min-height: 44px !important;
+  border-radius: 9px !important;
+  padding: 0 16px !important;
+  cursor: pointer;
+}
+
+.loading-primary-button {
+  background: var(--purple) !important;
+  color: #fff !important;
+  border: 1px solid var(--purple) !important;
+}
+
+.loading-secondary-button {
+  background: var(--panel) !important;
+  color: var(--ink) !important;
+  border: 1px solid var(--line) !important;
+}
+
+.loading-table {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.loading-table-row {
+  display: grid !important;
+  grid-template-columns: minmax(170px, 1fr) 130px 150px;
+  gap: 12px;
+  min-width: 480px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.loading-table-header {
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--page);
+}
+
+.loading-table-title { color: var(--ink-2); }
+
+.loading-table-total {
+  min-width: 480px;
+  padding: 14px 16px;
+}
+
+@media (max-width: 560px) {
+  .app-rail {
+    position: fixed !important;
+    z-index: 70;
+    top: auto !important;
+    bottom: 0;
+    left: 0;
+    width: 100% !important;
+    min-width: 100% !important;
+    height: max(62px, calc(62px + env(safe-area-inset-bottom))) !important;
+    padding: 5px 4px env(safe-area-inset-bottom) !important;
+    flex-direction: row !important;
+    justify-content: space-around !important;
+    overflow-x: auto !important;
+    border-right: 0 !important;
+    border-top: 1px solid var(--line) !important;
+  }
+
+  .app-rail > div:first-child { display: none !important; }
+  .app-rail-item { min-width: 44px !important; width: 44px !important; height: 48px !important; }
+  .app-main-view { padding-bottom: 84px !important; }
+  .loading-page-content { padding: 16px 12px max(88px, env(safe-area-inset-bottom)) !important; }
+}

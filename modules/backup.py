@@ -31,6 +31,7 @@ BACKUP_SUFFIX = ".zip"
 _BACKUP_RELATIVE_FILES = (
     "data/volume_history.json",
     "data/processed_files.json",
+    "data/order_records.json",
     "data/mail_items.json",
     "data/mail_seen.json",
     "data/mail_uid_cache.json",

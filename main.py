@@ -12,6 +12,7 @@ from modules.styles import (
 )
 from modules.file_selector import select_order_file
 from modules.order_preview import PreviewError, build_order_preview
+from modules.order_records import OrderRecordError, create_processed_order_record
 from modules.pipeline import process_order
 from modules.reporter import format_preview, print_summary
 
@@ -51,6 +52,11 @@ def main():
         mode_name = "Область"
     else:
         print("Неверный выбор!")
+        return
+
+    client_name = input("\nКлиент: ").strip()
+    if not client_name:
+        print("Клиент обязателен для обработки заказа.")
         return
 
     stores_file = paths.stores_file_for(mode_name)
@@ -94,6 +100,10 @@ def main():
 
     print_summary(output_file, stats, log_file)
     record_processing(filename, stats)
+    try:
+        create_processed_order_record(output_file, filename, client_name, mode_name)
+    except OrderRecordError as error:
+        print(f"⚠ Реестр загрузки не обновлён: {error}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+from datetime import datetime
 from types import SimpleNamespace
 import asyncio
 
@@ -219,6 +220,21 @@ def test_accountant_category_filter_separates_uncategorized_items(monkeypatch):
     ]
 
 
+def test_format_history_timestamp_uses_short_date_and_relative_label():
+    now = datetime(2026, 10, 5, 12, 0)
+
+    assert dashboard.format_history_timestamp("2026-10-05 09:15:48", now) == (
+        "05.10.26 09:15",
+        "Сегодня",
+    )
+    assert dashboard.format_history_timestamp("2026-10-04 23:30", now) == (
+        "04.10.26 23:30",
+        "Вчера",
+    )
+    assert dashboard.format_history_timestamp("2026-10-03", now) == ("03.10.26", "")
+    assert dashboard.format_history_timestamp("неверная дата", now) == ("неверная дата", "")
+
+
 def test_history_order_details_keep_processed_time_label():
     refreshes = []
     state = SimpleNamespace(
@@ -232,12 +248,14 @@ def test_history_order_details_keep_processed_time_label():
     dashboard.State.open_order_details.fn(
         state,
         "заказ.xlsx",
-        "10.11.2026 19:00",
+        "10.11.26 19:00",
+        "Вчера",
     )
 
     assert state.selected_order == "заказ.xlsx"
-    assert state.selected_order_time == "10.11.2026 19:00"
+    assert state.selected_order_time == "10.11.26 19:00"
     assert state.selected_order_time_label == "Обработан"
+    assert state.selected_order_date_relation == "Вчера"
     assert state.order_detail_tab == "Накладные"
     assert state.invoice_search == ""
     assert state.order_detail_status == ""
@@ -255,17 +273,32 @@ def test_opening_history_refreshes_processed_files():
     assert calls == ["loaded"]
 
 
-def test_load_history_includes_downloadable_files_without_changing_order_history(monkeypatch):
+def test_load_history_formats_dates_without_changing_sorting_or_counts(monkeypatch):
+    class FakeDatetime:
+        @staticmethod
+        def now():
+            return datetime(2026, 10, 5, 12, 0)
+
+        @staticmethod
+        def fromisoformat(value):
+            return datetime.fromisoformat(value)
+
     entries = [{
         "relative_path": "24.09.26/заказ_обработан.xlsx",
         "filename": "заказ_обработан.xlsx",
         "folder": "24.09.26",
-        "modified_at": "24.09.2026 12:30",
+        "modified_at": "24.09.26 12:30",
         "size_label": "8 Б",
     }]
+    monkeypatch.setattr(dashboard, "datetime", FakeDatetime)
     monkeypatch.setattr(dashboard, "list_processed_files", lambda: entries)
     monkeypatch.setattr(
-        dashboard, "load_processed_files", lambda: {"исходный.xlsx": "2026-09-24 12:30"}
+        dashboard,
+        "load_processed_files",
+        lambda: {
+            "вчера.xlsx": "2026-10-04 12:30",
+            "сегодня.xlsx": "2026-10-05 08:15:30",
+        },
     )
     monkeypatch.setattr(dashboard, "load_route_count", lambda: 4)
     monkeypatch.setattr(dashboard, "build_volume_chart_data", lambda: [])
@@ -276,10 +309,28 @@ def test_load_history_includes_downloadable_files_without_changing_order_history
 
     dashboard.State.load_history.fn(state)
 
-    assert state.history_items == [{"file": "исходный.xlsx", "time": "2026-09-24 12:30"}]
+    assert state.history_items == [
+        {
+            "file": "сегодня.xlsx",
+            "time": "05.10.26 08:15",
+            "date_relation": "Сегодня",
+            "loading_href": "",
+            "loading_label": "Загрузить",
+        },
+        {
+            "file": "вчера.xlsx",
+            "time": "04.10.26 12:30",
+            "date_relation": "Вчера",
+            "loading_href": "",
+            "loading_label": "Загрузить",
+        },
+    ]
+    assert state.history_1_file == "сегодня.xlsx"
+    assert state.history_1_date_relation == "Сегодня"
     assert state.processed_file_items == entries
     assert state.processed_file_status == ""
-    assert state.orders_total_count == 1
+    assert state.orders_total_count == 2
+    assert state.orders_today_count == 1
 
 
 def test_history_download_issues_ticket_for_existing_file(tmp_path, monkeypatch):
@@ -321,6 +372,59 @@ def test_history_download_rejects_unavailable_file(monkeypatch):
     assert result is None
     assert issued == []
     assert "недоступен" in state.processed_file_status
+
+
+def test_order_drawer_downloads_linked_invoice_and_source_file(tmp_path, monkeypatch):
+    source = tmp_path / "заказ.xlsx"
+    invoice = tmp_path / "накладная.pdf"
+    source.write_bytes(b"xlsx")
+    invoice.write_bytes(b"pdf")
+    captured = []
+    monkeypatch.setattr(dashboard.rx, "download", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(dashboard, "resolve_order_for_download", lambda filename: source)
+    monkeypatch.setattr(
+        dashboard,
+        "resolve_linked_invoice_for_download",
+        lambda order_file, filename: invoice,
+    )
+    state = SimpleNamespace(selected_order="заказ.xlsx", order_detail_status="")
+
+    dashboard.State.download_order_source_file.fn(state)
+    dashboard.State.download_linked_invoice_file.fn(state, invoice.name)
+
+    assert captured[0]["url"].startswith("/api/order-files/orders/")
+    assert captured[0]["filename"] == source.name
+    assert captured[1]["url"].startswith("/api/order-files/invoices/")
+    assert captured[1]["filename"] == invoice.name
+
+
+def test_order_file_download_routes_require_dashboard_session(tmp_path, monkeypatch):
+    source = tmp_path / "заказ.xlsx"
+    invoice = tmp_path / "накладная.pdf"
+    source.write_bytes(b"xlsx")
+    invoice.write_bytes(b"pdf")
+    monkeypatch.setattr(dashboard, "resolve_order_for_download", lambda filename: source)
+    monkeypatch.setattr(
+        dashboard,
+        "resolve_linked_invoice_for_download",
+        lambda order_file, filename: invoice,
+    )
+    dashboard.dashboard_sessions.reset_sessions()
+    client = TestClient(dashboard.custom_api)
+
+    assert client.get("/api/order-files/orders/заказ.xlsx").status_code == 401
+    token = dashboard.dashboard_sessions.create_session()
+    client.cookies.set(dashboard.dashboard_sessions.SESSION_COOKIE, token)
+
+    order_response = client.get("/api/order-files/orders/заказ.xlsx")
+    invoice_response = client.get("/api/order-files/invoices/заказ.xlsx/накладная.pdf")
+
+    assert order_response.status_code == 200
+    assert order_response.content == b"xlsx"
+    assert order_response.headers["cache-control"] == "no-store"
+    assert invoice_response.status_code == 200
+    assert invoice_response.content == b"pdf"
+    assert invoice_response.headers["content-type"].startswith("application/pdf")
 
 
 def test_load_invoice_ocr_uses_processed_orders_and_journal(monkeypatch):
@@ -835,10 +939,29 @@ def test_confirm_route_assignments_starts_processing_for_current_preview():
     assert calls == [True]
 
 
+def test_web_order_processing_requires_client_before_pipeline(monkeypatch):
+    called = []
+    monkeypatch.setattr(dashboard, "run_pipeline", lambda *args: called.append(args))
+    state = SimpleNamespace(
+        uploaded_file_path="upload.xlsx",
+        order_client_name=" ",
+        preview_ready=True,
+        preview_source="upload.xlsx",
+        preview_mode="Город",
+        mode="Город",
+    )
+
+    dashboard.State.process_order.fn(state)
+
+    assert "клиента" in state.status
+    assert called == []
+
+
 def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
     settings = {"open_file_after_processing": True, "open_folder_after_processing": True}
     passed_settings = []
     published = []
+    created_records = []
     monkeypatch.setattr(dashboard, "load_settings", lambda: settings)
     monkeypatch.setattr(dashboard, "load_stores", lambda path: {})
     monkeypatch.setattr(dashboard, "run_pipeline", lambda source, options, *args: (
@@ -850,6 +973,7 @@ def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
         lambda *args: published.append(args),
     )
     monkeypatch.setattr(dashboard, "record_processing", lambda *args: None)
+    monkeypatch.setattr(dashboard, "create_processed_order_record", lambda *args: created_records.append(args))
     monkeypatch.setattr(dashboard, "was_processed", lambda filename: "сегодня")
     state = SimpleNamespace(
         uploaded_file_path="upload.xlsx",
@@ -860,6 +984,9 @@ def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
         active_route_count=1,
         route_assignments=[{"route": "route_1", "driver_id": "driver-1", "driver_name": "Иван"}],
         selected_file="upload.xlsx",
+        order_client_name="ООО Ромашка",
+        order_mail_metadata=None,
+        order_record_warning="",
         load_history=lambda: None,
         _reset_preview=lambda: None,
     )
@@ -874,6 +1001,7 @@ def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
     }]
     assert settings["open_file_after_processing"] is True
     assert len(published) == 1
+    assert created_records == [("result.xlsx", "upload.xlsx", "ООО Ромашка", "Город", None)]
 
 
 def test_dashboard_login_creates_http_only_server_session(monkeypatch):

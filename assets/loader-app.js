@@ -117,10 +117,11 @@ function renderOrders() {
   const vehicle = vehicles.find((item) => item.id === selectedVehicleId) || {};
   root().innerHTML = `
     <main class="driver-shell">
-      <header class="driver-header"><div><h1>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Выбранная машина")}</h1><p class="driver-muted">Заказы доступны только для этой машины</p></div><div><button data-change class="driver-secondary">Сменить</button> <button data-logout class="driver-secondary">Выйти</button></div></header>
+      <header class="driver-header"><div><h1>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Выбранная машина")}</h1><p class="driver-muted">Заказы доступны только для этой машины</p></div><div><button data-loading class="driver-secondary">Загрузка</button> <button data-change class="driver-secondary">Сменить</button> <button data-logout class="driver-secondary">Выйти</button></div></header>
       <p data-message class="driver-message"></p>
       <div class="driver-store-list">${assignments.map(assignmentCard).join("") || "<p class=\"driver-muted\">Для машины нет текущих назначений</p>"}</div>
     </main>`;
+  root().querySelector("[data-loading]").addEventListener("click", () => window.location.assign("/loading"));
   root().querySelector("[data-change]").addEventListener("click", () => { view = "vehicles"; render(); });
   root().querySelector("[data-logout]").addEventListener("click", logout);
 }

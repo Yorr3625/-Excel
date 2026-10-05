@@ -4,6 +4,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from modules import paths
 from modules.backup import (
     BackupError,
     create_backup,
@@ -32,6 +33,7 @@ from modules.file_selector import ORDERS_FOLDER
 from modules.output_writer import PROCESSED_FOLDER
 from modules.logger import LOGS_FOLDER
 from modules.order_preview import PreviewError, build_order_preview
+from modules.order_records import OrderRecordError, create_processed_order_record
 from modules.pipeline import process_order
 from modules.reporter import format_preview, format_summary
 from modules.weight_log import (
@@ -81,6 +83,8 @@ class App:
 
         self.result_queue = queue.Queue()
         self.selected_file = tk.StringVar()
+        self.client_name = tk.StringVar()
+        self.order_mode = tk.StringVar(value="Область")
 
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -124,6 +128,21 @@ class App:
             text="Обзор...",
             command=self.choose_file,
         ).pack(side="left")
+
+        client_row = ttk.Frame(self.process_tab)
+        client_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(client_row, text="Клиент:").pack(side="left")
+        ttk.Entry(client_row, textvariable=self.client_name).pack(
+            side="left", fill="x", expand=True, padx=8
+        )
+        ttk.Label(client_row, text="Режим:").pack(side="left")
+        ttk.Combobox(
+            client_row,
+            textvariable=self.order_mode,
+            values=("Город", "Область"),
+            state="readonly",
+            width=12,
+        ).pack(side="left", padx=(8, 0))
 
         action_bar = ttk.Frame(self.process_tab)
         action_bar.pack(fill="x", padx=10)
@@ -214,6 +233,12 @@ class App:
                 "Сначала выберите файл заказа.",
             )
             return
+        if not self.client_name.get().strip():
+            messagebox.showwarning(
+                "Клиент не указан",
+                "Укажите клиента перед обработкой заказа.",
+            )
+            return
 
         self.process_button.configure(state="disabled")
         self.progress.start(12)
@@ -221,23 +246,23 @@ class App:
 
         thread = threading.Thread(
             target=self._run_preview,
-            args=(input_file,),
+            args=(input_file, self.order_mode.get()),
             daemon=True,
         )
         thread.start()
 
         self.root.after(100, self._poll_result)
 
-    def _build_groups(self):
+    def _build_groups(self, mode: str):
         settings = load_settings()
-        stores = load_stores()
+        stores = load_stores(paths.stores_file_for(mode))
         fills = [green_fill, yellow_fill, blue_fill, purple_fill]
         return settings, build_groups(stores, fills)
 
-    def _run_preview(self, input_file):
+    def _run_preview(self, input_file, mode: str):
 
         try:
-            settings, groups = self._build_groups()
+            settings, groups = self._build_groups(mode)
             preview = build_order_preview(input_file, groups, conflict_fill)
             processed_at = was_processed(os.path.basename(input_file))
 
@@ -247,18 +272,18 @@ class App:
                     f"{processed_at}. Повторная обработка обновит статистику."
                 )
 
-            self.result_queue.put(("preview", (input_file, settings, groups, preview)))
+            self.result_queue.put(("preview", (input_file, settings, groups, preview, mode)))
 
         except PreviewError as error:
             self.result_queue.put(("error", str(error)))
         except Exception as error:
             self.result_queue.put(("error", str(error)))
 
-    def _run_processing(self, input_file, settings=None, groups=None):
+    def _run_processing(self, input_file, settings=None, groups=None, client_name="", mode="Область"):
 
         try:
             if settings is None or groups is None:
-                settings, groups = self._build_groups()
+                settings, groups = self._build_groups(mode)
 
             output_file, log_file, stats = process_order(
                 input_file,
@@ -267,9 +292,15 @@ class App:
                 conflict_fill,
             )
 
-            record_processing(os.path.basename(input_file), stats)
+            filename = os.path.basename(input_file)
+            record_processing(filename, stats)
+            warning = ""
+            try:
+                create_processed_order_record(output_file, filename, client_name, mode)
+            except OrderRecordError as error:
+                warning = f"\n\nРеестр загрузки не обновлён: {error}"
 
-            summary = format_summary(output_file, stats, log_file)
+            summary = format_summary(output_file, stats, log_file) + warning
             self.result_queue.put(("ok", summary))
 
         except Exception as error:
@@ -288,7 +319,7 @@ class App:
         self.process_button.configure(state="normal")
 
         if status == "preview":
-            input_file, settings, groups, preview = message
+            input_file, settings, groups, preview, mode = message
 
             if input_file != self.selected_file.get():
                 self._set_log_text(
@@ -307,7 +338,7 @@ class App:
                 self._set_log_text("Обработка...")
                 thread = threading.Thread(
                     target=self._run_processing,
-                    args=(input_file, settings, groups),
+                    args=(input_file, settings, groups, self.client_name.get().strip(), mode),
                     daemon=True,
                 )
                 thread.start()

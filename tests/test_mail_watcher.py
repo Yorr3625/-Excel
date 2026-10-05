@@ -919,3 +919,61 @@ def test_invoice_can_be_linked_and_unlinked(monkeypatch):
     assert mail_watcher.load_mail_items()[0]["order_file"] == "заказ.xlsx"
     assert mail_watcher.unlink_invoice(item["path"])
     assert mail_watcher.load_mail_items()[0]["order_file"] == ""
+
+
+def test_download_resolvers_only_return_linked_files_in_mail_folders(tmp_path):
+    order = mail_watcher.ORDERS_FOLDER / "заказ.xlsx"
+    invoice = mail_watcher.INVOICES_FOLDER / "накладная.pdf"
+    order.parent.mkdir()
+    invoice.parent.mkdir()
+    order.write_bytes(b"xlsx")
+    invoice.write_bytes(b"pdf")
+    mail_watcher.MAIL_ITEMS_FILE.write_text(
+        json.dumps([
+            {
+                "kind": mail_watcher.KIND_ORDERS,
+                "file": order.name,
+                "path": str(order),
+            },
+            {
+                "kind": mail_watcher.KIND_INVOICES,
+                "file": invoice.name,
+                "path": str(invoice),
+                "order_file": order.name,
+            },
+        ]),
+        encoding="utf-8",
+    )
+
+    assert mail_watcher.resolve_order_for_download(order.name) == order
+    assert mail_watcher.resolve_linked_invoice_for_download(order.name, invoice.name) == invoice
+
+
+def test_download_resolvers_reject_unlinked_or_outside_files(tmp_path):
+    invoice = mail_watcher.INVOICES_FOLDER / "накладная.pdf"
+    outside = tmp_path / "секрет.pdf"
+    invoice.parent.mkdir()
+    invoice.write_bytes(b"pdf")
+    outside.write_bytes(b"secret")
+    mail_watcher.MAIL_ITEMS_FILE.write_text(
+        json.dumps([
+            {
+                "kind": mail_watcher.KIND_INVOICES,
+                "file": invoice.name,
+                "path": str(invoice),
+                "order_file": "другой.xlsx",
+            },
+            {
+                "kind": mail_watcher.KIND_INVOICES,
+                "file": outside.name,
+                "path": str(outside),
+                "order_file": "заказ.xlsx",
+            },
+        ]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(mail_watcher.MailDownloadError):
+        mail_watcher.resolve_linked_invoice_for_download("заказ.xlsx", invoice.name)
+    with pytest.raises(mail_watcher.MailDownloadError):
+        mail_watcher.resolve_linked_invoice_for_download("заказ.xlsx", outside.name)

@@ -26,7 +26,7 @@ def test_console_cancellation_after_preview_does_not_process(monkeypatch):
         "record_processing",
         lambda *args: calls.append("history"),
     )
-    answers = iter(["2", "n"])
+    answers = iter(["2", "ООО Ромашка", "n"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
 
     console_app.main()

@@ -79,7 +79,7 @@ def resolve_processed_file(relative_path: str) -> Path:
 def _file_entry(path: Path, root: Path) -> dict:
     stat = path.stat()
     relative_path = path.relative_to(root).as_posix()
-    modified_at = datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m.%Y %H:%M")
+    modified_at = datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m.%y %H:%M")
     return {
         "relative_path": relative_path,
         "filename": path.name,

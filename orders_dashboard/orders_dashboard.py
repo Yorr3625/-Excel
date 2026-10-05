@@ -3,6 +3,7 @@ from typing import TypedDict
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from http.cookies import CookieError, SimpleCookie
+from urllib.parse import quote
 import asyncio
 import json
 import os
@@ -58,6 +59,12 @@ from modules.history import (
     was_processed,
 )
 from modules.order_positions import order_position_names
+from modules.order_records import (
+    OrderRecordError,
+    create_processed_order_record,
+    latest_record_ids_by_source_filename,
+    list_order_record_summaries,
+)
 from modules.processed_files import (
     ProcessedFileError,
     consume_download_ticket,
@@ -82,6 +89,7 @@ from modules.mail_watcher import (
     KIND_INVOICES,
     KIND_MESSAGE,
     KIND_ORDERS,
+    MailDownloadError,
     MailErrorEntry,
     append_mail_error,
     check_mail,
@@ -94,6 +102,8 @@ from modules.mail_watcher import (
     load_mail_config,
     load_mail_error_log,
     load_mail_items,
+    resolve_linked_invoice_for_download,
+    resolve_order_for_download,
     save_mail_credentials as save_mail_credentials_config,
     sources as mail_sources_config,
     split_invoice_candidates,
@@ -165,6 +175,7 @@ from modules.invoice_ocr import (
 )
 from modules.help_chat import HelpChatError, send_chat_message
 from orders_dashboard import theme as ui
+from orders_dashboard.loading_page import LoadingAuthMiddleware, LoadingState, loading_page
 
 
 DASHBOARD_API_ORIGIN_JS = f"""
@@ -201,6 +212,17 @@ def _admin_session_for_router(router) -> bool:
     else:
         cookie_header = getattr(headers, "cookie", "")
     return dashboard_sessions.valid_session(_admin_token(cookie_header))
+
+
+def _router_query_param(router, name: str) -> str:
+    page = getattr(router, "page", None)
+    params = getattr(page, "params", None)
+    if params is None and isinstance(router, dict):
+        params = router.get("params", {})
+    if not isinstance(params, dict):
+        return ""
+    value = params.get(name, "")
+    return str(value[0] if isinstance(value, list) and value else value)
 
 
 async def admin_login(request: Request):
@@ -676,10 +698,67 @@ async def download_processed_file(request: Request):
     )
 
 
+def _dashboard_download_authorized(request: Request) -> bool:
+    return dashboard_sessions.valid_session(
+        request.cookies.get(dashboard_sessions.SESSION_COOKIE)
+    )
+
+
+def _excel_media_type(path: Path) -> str:
+    suffix = path.suffix.casefold()
+    return next(
+        (
+            media_type
+            for media_type, suffixes in EXCEL_MIME_TYPES.items()
+            if suffix in suffixes
+        ),
+        "application/octet-stream",
+    )
+
+
+async def download_order_source_file(request: Request):
+    if not _dashboard_download_authorized(request):
+        return JSONResponse({"ok": False, "error": "Требуется вход"}, status_code=401)
+    try:
+        path = resolve_order_for_download(request.path_params["filename"])
+    except MailDownloadError:
+        return JSONResponse({"ok": False, "error": "Файл недоступен"}, status_code=404)
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type=_excel_media_type(path),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def download_linked_invoice_file(request: Request):
+    if not _dashboard_download_authorized(request):
+        return JSONResponse({"ok": False, "error": "Требуется вход"}, status_code=401)
+    try:
+        path = resolve_linked_invoice_for_download(
+            request.path_params["order_file"],
+            request.path_params["filename"],
+        )
+    except MailDownloadError:
+        return JSONResponse({"ok": False, "error": "Файл недоступен"}, status_code=404)
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="application/pdf",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 custom_api = Starlette(routes=[
     Route("/api/dashboard/login", admin_login, methods=["POST"]),
     Route("/api/dashboard/logout", admin_logout, methods=["POST"]),
     Route("/api/processed-files/download/{ticket}", download_processed_file, methods=["GET"]),
+    Route("/api/order-files/orders/{filename}", download_order_source_file, methods=["GET"]),
+    Route(
+        "/api/order-files/invoices/{order_file}/{filename}",
+        download_linked_invoice_file,
+        methods=["GET"],
+    ),
     Route("/api/driver/login", driver_login, methods=["POST"]),
     Route("/api/driver/logout", driver_logout, methods=["POST"]),
     Route("/api/driver/me", driver_me, methods=["GET"]),
@@ -1009,6 +1088,26 @@ def format_number(value):
     return f"{float(value):,.0f}".replace(",", " ")
 
 
+def format_history_timestamp(processed_at: str, now: datetime | None = None) -> tuple[str, str]:
+    raw_timestamp = str(processed_at or "").strip()
+    try:
+        timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError:
+        return raw_timestamp, ""
+
+    relation = ""
+    current_date = (now or datetime.now()).date()
+    if timestamp.date() == current_date:
+        relation = "Сегодня"
+    elif timestamp.date() == current_date - timedelta(days=1):
+        relation = "Вчера"
+
+    display = timestamp.strftime("%d.%m.%y")
+    if "T" in raw_timestamp or " " in raw_timestamp:
+        display += timestamp.strftime(" %H:%M")
+    return display, relation
+
+
 def format_decimal(value: Decimal) -> str:
     rendered = format(value.normalize(), "f")
     return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
@@ -1096,6 +1195,9 @@ def format_invoice_journal_entry(entry: dict) -> dict:
 class State(rx.State):
     selected_file: str = "Файл не выбран"
     uploaded_file_path: str = ""
+    order_client_name: str = ""
+    order_mail_metadata: dict | None = None
+    order_record_warning: str = ""
     mode: str = "Область"
     mode_auto_note: str = ""
     mode_detection_warning: str = ""
@@ -1127,10 +1229,13 @@ class State(rx.State):
     error_text: str = ""
     history_1_file: str = "Нет обработок"
     history_1_time: str = ""
+    history_1_date_relation: str = ""
     history_2_file: str = "Нет обработок"
     history_2_time: str = ""
+    history_2_date_relation: str = ""
     history_3_file: str = "Нет обработок"
     history_3_time: str = ""
+    history_3_date_relation: str = ""
 
     orders_today_count: int = 0
     orders_total_count: int = 0
@@ -1167,6 +1272,8 @@ class State(rx.State):
         if not self.is_authenticated:
             return rx.redirect("/login", replace=True)
         self.load_history()
+        if _router_query_param(self.router, "page") == "history":
+            self.current_page = "История"
 
     def redirect_authenticated_user(self):
         self.is_authenticated = _admin_session_for_router(self.router)
@@ -1228,6 +1335,7 @@ class State(rx.State):
     selected_order: str = ""
     selected_order_time: str = ""
     selected_order_time_label: str = "Обработан"
+    selected_order_date_relation: str = ""
     order_detail_tab: str = "Накладные"
     order_invoices: list[dict] = []
     available_invoices: list[dict] = []
@@ -1960,8 +2068,30 @@ class State(rx.State):
     def take_mail_order(self, path: str, filename: str, received: str):
         """Берёт найденный файл в обработку на странице «Заказы»."""
 
+        mail_item = next(
+            (
+                item
+                for item in load_mail_items()
+                if item.get("kind") == KIND_ORDERS and item.get("path") == path
+            ),
+            {},
+        )
         self.selected_file = filename
         self.uploaded_file_path = path
+        self.order_mail_metadata = {
+            key: str(mail_item.get(key, ""))
+            for key in (
+                "message_id",
+                "sender",
+                "subject",
+                "received_at",
+                "received_display",
+                "source_name",
+                "source_email",
+                "source_person",
+            )
+        }
+        self.order_record_warning = ""
         self.output_file = ""
         self.log_file = ""
         self.error_text = ""
@@ -1991,26 +2121,53 @@ class State(rx.State):
         except OSError as error:
             self.mail_error = f"Не удалось открыть файл: {error}"
 
+    def download_order_source_file(self):
+        try:
+            path = resolve_order_for_download(self.selected_order)
+        except MailDownloadError:
+            self.order_detail_status = "Файл заказа больше недоступен"
+            return
+        return rx.download(
+            url=f"/api/order-files/orders/{quote(path.name, safe='')}",
+            filename=path.name,
+        )
+
+    def download_linked_invoice_file(self, filename: str):
+        try:
+            path = resolve_linked_invoice_for_download(self.selected_order, filename)
+        except MailDownloadError:
+            self.order_detail_status = "Накладная больше недоступна"
+            return
+        return rx.download(
+            url=(
+                f"/api/order-files/invoices/{quote(self.selected_order, safe='')}"
+                f"/{quote(path.name, safe='')}"
+            ),
+            filename=path.name,
+        )
+
     def _show_order_details(
         self,
         filename: str,
         displayed_at: str,
         time_label: str,
+        date_relation: str = "",
     ):
         self.selected_order = filename
         self.selected_order_time = displayed_at
         self.selected_order_time_label = time_label
+        self.selected_order_date_relation = date_relation
         self.order_detail_tab = "Накладные"
         self.order_detail_status = ""
         self.invoice_search = ""
         self.order_details_open = True
         self._refresh_order_invoices()
 
-    def open_order_details(self, filename: str, processed_at: str):
+    def open_order_details(self, filename: str, processed_at: str, date_relation: str = ""):
         if filename == "Нет обработок":
             return
 
-        self._show_order_details(filename, processed_at, "Обработан")
+        self._show_order_details(filename, processed_at, "Обработан", date_relation)
 
     def close_order_details(self):
         self.order_details_open = False
@@ -2522,20 +2679,46 @@ class State(rx.State):
         self.processed_file_status = ""
         data = load_processed_files()
         all_items = sorted(data.items(), key=lambda item: item[1], reverse=True)
-        self.history_items = [
-            {"file": filename, "time": processed_at}
-            for filename, processed_at in all_items
-        ]
-        items = all_items[:3]
-        placeholders = [("Нет обработок", "")] * 3
+        try:
+            loading_record_ids = latest_record_ids_by_source_filename()
+            loading_statuses = {
+                item["id"]: item["status"] for item in list_order_record_summaries()
+            }
+        except OrderRecordError:
+            loading_record_ids = {}
+            loading_statuses = {}
+        now = datetime.now()
+        history_items = []
+        for filename, processed_at in all_items:
+            displayed_at, date_relation = format_history_timestamp(processed_at, now)
+            loading_order_id = loading_record_ids.get(filename, "")
+            loading_status = loading_statuses.get(loading_order_id, "")
+            history_items.append(
+                {
+                    "file": filename,
+                    "time": displayed_at,
+                    "date_relation": date_relation,
+                    "loading_href": f"/loading?order={loading_order_id}&from=history" if loading_order_id else "",
+                    "loading_label": "Посмотреть загрузку" if loading_status == "loaded" else "Загрузить",
+                }
+            )
+        self.history_items = history_items
+        items = history_items[:3]
+        placeholders = [{"file": "Нет обработок", "time": "", "date_relation": ""}] * 3
         items = items + placeholders[len(items):]
 
-        self.history_1_file, self.history_1_time = items[0]
-        self.history_2_file, self.history_2_time = items[1]
-        self.history_3_file, self.history_3_time = items[2]
+        self.history_1_file = items[0]["file"]
+        self.history_1_time = items[0]["time"]
+        self.history_1_date_relation = items[0]["date_relation"]
+        self.history_2_file = items[1]["file"]
+        self.history_2_time = items[1]["time"]
+        self.history_2_date_relation = items[1]["date_relation"]
+        self.history_3_file = items[2]["file"]
+        self.history_3_time = items[2]["time"]
+        self.history_3_date_relation = items[2]["date_relation"]
 
         self.orders_total_count = len(data)
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = now.strftime("%Y-%m-%d")
         self.orders_today_count = sum(1 for ts in data.values() if ts.startswith(today))
 
         self.active_route_count = load_route_count()
@@ -3237,6 +3420,8 @@ class State(rx.State):
             self._reset_preview()
             self.selected_file = output_path.name
             self.uploaded_file_path = str(output_path)
+            self.order_mail_metadata = None
+            self.order_record_warning = ""
             self.status = f"Файл загружен: {output_path.name}"
             self.output_file = ""
             self.log_file = ""
@@ -3289,6 +3474,9 @@ class State(rx.State):
                 "Не удалось определить режим автоматически. Проверьте выбранный режим вручную."
             )
             self.mode_auto_note = self.mode_detection_warning
+
+    def set_order_client_name(self, value: str):
+        self.order_client_name = value
 
     def set_mode(self, mode: str):
         self.mode = mode
@@ -3691,6 +3879,9 @@ class State(rx.State):
         if not self.uploaded_file_path:
             self.status = "Сначала загрузите Excel-файл"
             return
+        if not self.order_client_name.strip():
+            self.status = "Укажите клиента перед обработкой заказа"
+            return
 
         if (
             not self.preview_ready
@@ -3739,6 +3930,17 @@ class State(rx.State):
             self.unknown_count = len(stats.get("unknown_stores", []))
             self.output_file = str(output_file)
             self.log_file = str(log_file)
+            self.order_record_warning = ""
+            try:
+                create_processed_order_record(
+                    self.output_file,
+                    self.selected_file,
+                    self.order_client_name,
+                    self.mode,
+                    self.order_mail_metadata,
+                )
+            except OrderRecordError as error:
+                self.order_record_warning = f"Реестр загрузки не обновлён: {error}"
             if self.route_assignments:
                 record_order_route_assignments(
                     self.selected_file,
@@ -3759,6 +3961,8 @@ class State(rx.State):
                     )
             self.route_assignments = []
             self.status = "Обработка завершена"
+            if self.order_record_warning:
+                self.status += f" · {self.order_record_warning}"
 
             record_processing(self.selected_file, stats)
             processed_at = was_processed(self.selected_file)
@@ -4098,10 +4302,36 @@ def rail_item(item):
     )
 
 
+def loading_rail_item():
+    return rx.button(
+        navigation_icon("package", 20),
+        rx.text("Загрузка", class_name="app-rail-label", font_size="10px", line_height="1.1"),
+        on_click=rx.redirect("/loading"),
+        aria_label="Загрузка",
+        width="52px",
+        min_width="52px",
+        height="52px",
+        padding="6px 2px",
+        display="flex",
+        flex_direction="column",
+        align_items="center",
+        justify_content="center",
+        gap="3px",
+        color=ui.INK_2,
+        background=ui.TRANSPARENT,
+        border="1px solid transparent",
+        border_radius=ui.RADIUS_CONTROL,
+        font_weight=ui.FONT_WEIGHT_REGULAR,
+        _hover={"background": ui.STATUS_GRAY_BG},
+        class_name="app-rail-item prototype-interactive",
+    )
+
+
 def sidebar():
     return rx.vstack(
         sidebar_logo(),
         rx.foreach(State.nav_groups, rail_item),
+        loading_rail_item(),
         align="center",
         spacing="1",
         width="64px",
@@ -4325,9 +4555,27 @@ def order_panel():
             ),
             rx.box(),
         ),
+        rx.vstack(
+            rx.text("3. Клиент", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            rx.input(
+                value=State.order_client_name,
+                on_change=State.set_order_client_name,
+                placeholder="Укажите клиента",
+                width="100%",
+                height="40px",
+            ),
+            rx.text("Клиент обязателен для последующей загрузки заказа.", color=muted(), font_size="12px"),
+            align="start",
+            spacing="2",
+            width="100%",
+            padding="14px 16px",
+            border=f"1px solid {border()}",
+            border_radius="10px",
+            background=surface_alt(),
+        ),
         rx.hstack(
             rx.vstack(
-                rx.text("3. Режим обработки", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+                rx.text("4. Режим обработки", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                 segmented_control(["Город", "Область"], State.mode, State.set_mode),
                 rx.cond(
                     State.mode_auto_note != "",
@@ -4594,9 +4842,21 @@ def history_panel():
             align="center",
         ),
         rx.vstack(
-            history_row(State.history_1_file, State.history_1_time),
-            history_row(State.history_2_file, State.history_2_time),
-            history_row(State.history_3_file, State.history_3_time),
+            history_row(
+                State.history_1_file,
+                State.history_1_time,
+                State.history_1_date_relation,
+            ),
+            history_row(
+                State.history_2_file,
+                State.history_2_time,
+                State.history_2_date_relation,
+            ),
+            history_row(
+                State.history_3_file,
+                State.history_3_time,
+                State.history_3_date_relation,
+            ),
             spacing="2",
             width="100%",
         ),
@@ -4610,7 +4870,7 @@ def history_panel():
     )
 
 
-def history_row(filename, time):
+def history_row(filename, time, date_relation="", loading_href="", loading_label="Загрузить"):
     return rx.hstack(
         rx.box(
             fa_icon(tag="file_spreadsheet", size=16, color=muted()),
@@ -4631,6 +4891,29 @@ def history_row(filename, time):
         ),
         rx.spacer(),
         rx.text(time, color=muted(), font_size="13px"),
+        rx.cond(
+            date_relation != "",
+            rx.badge(date_relation, color_scheme="green", variant="soft"),
+            rx.box(),
+        ),
+        rx.cond(
+            loading_href != "",
+            rx.link(
+                rx.button(
+                    loading_label,
+                    height="32px",
+                    padding="0 10px",
+                    color=ui.PURPLE_DARK,
+                    background=ui.PURPLE_BG,
+                    border="1px solid transparent",
+                    border_radius=ui.RADIUS_CONTROL,
+                    font_size="12px",
+                    cursor="pointer",
+                ),
+                href=loading_href,
+            ),
+            rx.box(),
+        ),
         spacing="3",
         align="center",
         width="100%",
@@ -4638,7 +4921,7 @@ def history_row(filename, time):
         border_radius="10px",
         background=surface_alt(),
         cursor="pointer",
-        on_click=State.open_order_details(filename, time),
+        on_click=State.open_order_details(filename, time, date_relation),
         _hover={"background": ui.STATUS_GRAY_BG},
     )
 
@@ -4884,7 +5167,13 @@ def history_page():
                 rx.vstack(
                     rx.foreach(
                         State.history_items,
-                        lambda item: history_row(item["file"], item["time"]),
+                        lambda item: history_row(
+                            item["file"],
+                            item["time"],
+                            item["date_relation"],
+                            item["loading_href"],
+                            item["loading_label"],
+                        ),
                     ),
                     spacing="2",
                     width="100%",
@@ -5598,7 +5887,37 @@ def order_invoice_row(item, linked: bool):
                 ),
                 width="120px",
             ),
+            secondary_button(
+                "Скачать",
+                on_click=State.download_linked_invoice_file(item["file"]),
+                width="120px",
+            ),
             spacing="2",
+            wrap="wrap",
+        ),
+        align="start",
+        spacing="2",
+        width="100%",
+        padding="14px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+    )
+
+
+def order_source_file_row():
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="file_spreadsheet", size=16, color=ui.STATUS_BLUE_TEXT),
+            rx.text(State.selected_order, color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            width="100%",
+            align="center",
+        ),
+        rx.text("Исходный файл заказа", color=muted(), font_size="12px"),
+        secondary_button(
+            "Скачать",
+            on_click=State.download_order_source_file,
+            width="120px",
         ),
         align="start",
         spacing="2",
@@ -5626,12 +5945,25 @@ def order_details_drawer():
                     rx.vstack(
                         rx.text("ЗАКАЗ", color=muted(), font_size="11px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
                         rx.heading(State.selected_order, color=text(), size="5"),
-                        rx.text(
-                            State.selected_order_time_label,
-                            ": ",
-                            State.selected_order_time,
-                            color=muted(),
-                            font_size="12px",
+                        rx.hstack(
+                            rx.text(
+                                State.selected_order_time_label,
+                                ": ",
+                                State.selected_order_time,
+                                color=muted(),
+                                font_size="12px",
+                            ),
+                            rx.cond(
+                                State.selected_order_date_relation != "",
+                                rx.badge(
+                                    State.selected_order_date_relation,
+                                    color_scheme="green",
+                                    variant="soft",
+                                ),
+                                rx.box(),
+                            ),
+                            spacing="2",
+                            align="center",
                         ),
                         align="start",
                         spacing="1",
@@ -5655,6 +5987,9 @@ def order_details_drawer():
                 rx.cond(
                     State.order_detail_tab == "Накладные",
                     rx.vstack(
+                        rx.heading("Файл заказа", color=text(), size="4"),
+                        order_source_file_row(),
+                        rx.divider(),
                         rx.heading("Привязанные накладные", color=text(), size="4"),
                         rx.cond(
                             State.order_invoices.length() > 0,
@@ -8327,6 +8662,7 @@ app = rx.App(
     },
 )
 app.add_middleware(DashboardAuthMiddleware())
+app.add_middleware(LoadingAuthMiddleware())
 app.add_page(
     dashboard,
     route="/",
@@ -8352,5 +8688,12 @@ app.add_page(
     loader_page,
     route="/loader",
     title="Грузчик",
+    meta=PWA_META,
+)
+app.add_page(
+    loading_page,
+    route="/loading",
+    title="Загрузка",
+    on_load=LoadingState.load_loading_page,
     meta=PWA_META,
 )
