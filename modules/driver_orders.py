@@ -71,6 +71,40 @@ def _optional_quantity(value: Any) -> str:
     return _quantity(value)
 
 
+def _measurement(value: Any) -> dict:
+    if not isinstance(value, dict):
+        raise DriverOrderError("Некорректные данные отгрузки")
+    try:
+        box_count = _quantity(value.get("box_count", ""))
+        boxes = _decimal(box_count, "количество ящиков")
+        if boxes != boxes.to_integral_value():
+            raise DriverOrderError("Количество ящиков должно быть целым числом")
+        tare = _quantity(value.get("tare_weight_per_box_kg", ""))
+        gross = _quantity(value.get("gross_weight_kg", ""))
+    except DriverOrderError:
+        raise
+    net = _decimal(gross, "грязный вес") - boxes * _decimal(tare, "вес тары")
+    if net < 0:
+        raise DriverOrderError("Грязный вес не может быть меньше веса тары")
+    return {
+        "box_count": str(int(boxes)),
+        "tare_weight_per_box_kg": tare,
+        "gross_weight_kg": gross,
+        "net_weight_kg": _quantity(net),
+    }
+
+
+def _legacy_measurement(value: Any) -> dict:
+    net_weight = _quantity(value)
+    return {
+        "box_count": "",
+        "tare_weight_per_box_kg": "",
+        "gross_weight_kg": "",
+        "net_weight_kg": net_weight,
+        "legacy_net_weight_kg": net_weight,
+    }
+
+
 def _sum(values: list[str]) -> Decimal:
     return sum((_decimal(value) for value in values), Decimal("0"))
 
@@ -225,6 +259,7 @@ def build_assignment_snapshot(
     mode: str,
     assignment: dict,
     order_id: str | None = None,
+    order_record: dict | None = None,
 ) -> dict:
     """Build one driver's route snapshot from a processed route workbook."""
     output_path = Path(output_file)
@@ -259,7 +294,7 @@ def build_assignment_snapshot(
             lines.append({
                 "line_id": _stable_id(order_id, route_key, store_name, str(row), product_name),
                 "name": product_name,
-                "unit": "",
+                "unit": "kg",
                 "required_qty": _quantity(value),
                 "actual_qty": "",
             })
@@ -274,9 +309,34 @@ def build_assignment_snapshot(
             "lines": lines,
         })
 
+    record_routes = {
+        str(route.get("route_key", "")): route
+        for route in (order_record or {}).get("routes", [])
+        if isinstance(route, dict)
+    }
+    record_route = record_routes.get(route_key, {})
+    record_destinations = {
+        str(destination.get("name", "")).casefold(): destination
+        for destination in record_route.get("destinations", [])
+        if isinstance(destination, dict)
+    }
+    for store in stores:
+        destination = record_destinations.get(str(store["name"]).casefold(), {})
+        positions = {
+            str(position.get("name", "")).casefold(): position
+            for position in destination.get("positions", [])
+            if isinstance(position, dict)
+        }
+        store["order_record_destination_id"] = str(destination.get("id", ""))
+        for line in store["lines"]:
+            position = positions.get(str(line["name"]).casefold(), {})
+            line["order_record_position_id"] = str(position.get("id", ""))
+            line["loading_line_id"] = str(position.get("loading_line_id", ""))
+
     return {
         "schema_version": SCHEMA_VERSION,
         "order_id": order_id,
+        "order_record_id": str((order_record or {}).get("id", "")),
         "assignment_id": assignment_id,
         "source_file": str(assignment.get("order_file", "")),
         "output_file": str(output_path),
@@ -314,6 +374,7 @@ def publish_assignments(
     mode: str,
     source_file: str,
     assignments: list[dict],
+    order_record: dict | None = None,
 ) -> list[Path]:
     order_id = _file_digest(Path(output_file))
     publication_id = uuid.uuid4().hex
@@ -321,7 +382,7 @@ def publish_assignments(
     prepared = []
     for assignment in assignments:
         enriched = {**assignment, "order_file": source_file}
-        snapshot = build_assignment_snapshot(output_file, mode, enriched, order_id)
+        snapshot = build_assignment_snapshot(output_file, mode, enriched, order_id, order_record)
         logical_assignment_id = _stable_id(str(source_file), str(mode or ""), snapshot["route_key"])
         assignment_id = _stable_id(logical_assignment_id, publication_id)
         snapshot.update({
@@ -384,6 +445,34 @@ def find_assignment_for_driver(driver_id: str) -> dict | None:
         if snapshot.get("driver_id") == driver_id
     ]
     return max(candidates, key=lambda item: item.get("created_at", ""), default=None)
+
+
+def completed_assignments_for_driver(driver_id: str) -> list[dict]:
+    if not driver_id:
+        return []
+    return [
+        snapshot for snapshot in _snapshots(active_only=False)
+        if snapshot.get("driver_id") == driver_id
+        and snapshot.get("order_record_id")
+        and snapshot.get("stores")
+        and all(store.get("status") == "completed" for store in snapshot["stores"])
+    ]
+
+
+def route_assignment_summaries(route_pairs: set[tuple[str, str]]) -> list[dict]:
+    with _LOCK:
+        active_ids = _active_assignment_ids()
+        snapshots = _snapshots()
+    result = []
+    for snapshot in snapshots:
+        pair = (str(snapshot.get("order_record_id", "")), str(snapshot.get("route_key", "")))
+        if pair not in route_pairs:
+            continue
+        result.append({
+            key: str(snapshot.get(key, ""))
+            for key in ("order_record_id", "route_key", "assignment_id", "driver_name", "driver_id", "vehicle_name", "vehicle_plate", "created_at")
+        } | {"active": active_ids is None or snapshot["assignment_id"] in active_ids})
+    return sorted(result, key=lambda item: (not item["active"], item["created_at"], item["assignment_id"]))
 
 
 def assignments_for_vehicle(vehicle_id: str) -> list[dict]:
@@ -528,15 +617,16 @@ def public_snapshot(snapshot: dict) -> dict:
 def complete_store(
     path_or_id: str | Path,
     store_id: str,
-    quantities: dict[str, Any],
+    measurements: dict[str, Any],
     operation_id: str,
     base_revision: int,
     photo: str = "",
+    legacy_quantities: bool = False,
 ) -> dict:
     if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
         raise DriverOrderError("Некорректный идентификатор операции")
-    if not isinstance(quantities, dict):
-        raise DriverOrderError("Некорректные количества")
+    if not isinstance(measurements, dict):
+        raise DriverOrderError("Некорректные данные отгрузки")
     if not isinstance(base_revision, int) or base_revision < 0:
         raise DriverOrderError("Некорректная ревизия")
 
@@ -554,10 +644,16 @@ def complete_store(
             raise DriverOrderConflict("Магазин уже подтверждён")
         lines = store.get("lines", [])
         expected_ids = {line.get("line_id") for line in lines}
-        if set(quantities) != expected_ids:
-            raise DriverOrderError("Укажите фактическое количество по каждой строке")
+        if set(measurements) != expected_ids:
+            raise DriverOrderError("Заполните отгрузку для каждой позиции")
         for line in lines:
-            line["actual_qty"] = _quantity(quantities[line["line_id"]])
+            measurement = (
+                _legacy_measurement(measurements[line["line_id"]])
+                if legacy_quantities
+                else _measurement(measurements[line["line_id"]])
+            )
+            line["shipment_measurement"] = measurement
+            line["actual_qty"] = measurement["net_weight_kg"]
         store["status"] = "completed"
         store["completed_at"] = _now()
         store["photo"] = str(photo or "")

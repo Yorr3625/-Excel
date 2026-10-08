@@ -33,6 +33,7 @@ TRACKING_FOLDER = DATA_DIR / "tracking_data"
 # --- data/: файлы, которые накапливает дашборд ---
 PROCESSED_FILES_FILE = DATA_DIR / "processed_files.json"
 ORDER_RECORDS_FILE = DATA_DIR / "order_records.json"
+GOODS_RETURNS_FILE = DATA_DIR / "goods_returns.json"
 VOLUME_HISTORY_FILE = DATA_DIR / "volume_history.json"
 ROUTE_BACKUPS_FILE = DATA_DIR / "route_backups.json"
 BACKUP_SETTINGS_FILE = CONFIG_DIR / "backup.json"

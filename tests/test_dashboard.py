@@ -23,7 +23,7 @@ def test_orders_page_does_not_show_duplicate_route_drivers_panel(monkeypatch):
     page = dashboard.orders_page()
 
     assert page[1:] == (order_content,)
-    assert dashboard.PAGE_GROUPS["Водители и транспорт"] == "Рейсы"
+    assert dashboard.PAGE_GROUPS["Водители и транспорт"] == "Справочники"
 
 
 def test_refresh_mail_config_is_registered_and_loads_state(monkeypatch):
@@ -546,7 +546,7 @@ def test_add_store_and_remove_store_operate_on_selected_route():
     assert state.route_stores == [["фм 1"], ["Новый магазин"]]
 
 
-def test_route_groups_use_real_driver_statuses_and_filter():
+def test_route_templates_ignore_delivery_statuses_and_filter():
     state = SimpleNamespace(
         active_route_count=2,
         route_stores=[["фм 10", "фм 14"], ["магазин 21"]],
@@ -573,8 +573,9 @@ def test_route_groups_use_real_driver_statuses_and_filter():
         for index in range(2)
     ]
     assert groups[0]["driver_initials"] == "АЗ"
-    assert groups[0]["stores"][0]["status"] == "Отгружен"
-    assert groups[0]["stores"][1]["status"] == "Ожидает"
+    assert groups[0]["stores"][0]["status"] == "Шаблон"
+    assert groups[0]["stores"][1]["status"] == "Шаблон"
+    assert not any(store["done"] for group in groups for store in group["stores"])
     assert groups[0]["adding"] is True
     assert groups[1]["driver"] == "Водитель не назначен"
     assert groups[1]["collapsed"] is True
@@ -1098,6 +1099,7 @@ def test_load_dashboard_restores_server_validated_session(monkeypatch):
         is_authenticated=False,
         router=object(),
         load_history=lambda: calls.append(True),
+        load_today_overview=lambda: None,
     )
 
     result = dashboard.State.load_dashboard.fn(state)
@@ -1191,10 +1193,12 @@ def test_auth_middleware_allows_server_validated_session_and_driver_events():
         name=f"{dashboard.State.get_full_name()}.set_page",
         router_data={"headers": {"cookie": f"dashboard_session={token}"}},
     )
-    driver_event = SimpleNamespace(name="DriverState.load_active_routes", router_data={})
+    loading_event = SimpleNamespace(
+        name=f"{dashboard.LoadingState.get_full_name()}.load_loading_page", router_data={},
+    )
 
     assert asyncio.run(middleware.preprocess(None, StateStore(), dashboard_event)) is None
-    assert asyncio.run(middleware.preprocess(None, StateStore(), driver_event)) is None
+    assert asyncio.run(middleware.preprocess(None, StateStore(), loading_event)) is None
 
 
 def test_opening_delivery_page_loads_completed_delivery_report(monkeypatch):
@@ -1221,7 +1225,7 @@ def test_opening_delivery_page_loads_completed_delivery_report(monkeypatch):
     assert state.delivery_line_count == 3
     assert state.delivery_summary == report["summary"]
     assert state.delivery_items == report["deliveries"]
-    assert dashboard.PAGE_GROUPS["Сданный товар"] == "Рейсы"
+    assert dashboard.PAGE_GROUPS["Сданный товар"] == "Дополнительно"
 
 
 def test_delivery_difference_color_uses_one_unit_tolerance(monkeypatch):

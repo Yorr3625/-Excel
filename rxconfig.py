@@ -37,7 +37,7 @@ os.environ.setdefault("REFLEX_UPLOADED_FILES_DIR", str(paths.UPLOADS_FOLDER))
 config = rx.Config(
     app_name="orders_dashboard",
     plugins=[
-        rx.plugins.RadixThemesPlugin(),
+        rx.plugins.RadixThemesPlugin(theme=rx.theme(appearance="inherit", accent_color="green", radius="medium")),
     ],
     disable_plugins=[
         rx.plugins.SitemapPlugin,

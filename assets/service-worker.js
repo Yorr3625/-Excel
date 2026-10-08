@@ -1,4 +1,4 @@
-const CACHE_NAME = "logistics-static-v2";
+const CACHE_NAME = "logistics-static-v5";
 const STATIC_ASSETS = [
   "/driver",
   "/manifest.webmanifest",
@@ -6,7 +6,9 @@ const STATIC_ASSETS = [
   "/icon-512.svg",
   "/theme.css",
   "/scrollbar.css",
-  "/driver-app.js"
+  "/driver-app.js",
+  "/theme-preference.js",
+  "/workspace-bootstrap.js"
 ];
 
 self.addEventListener("install", (event) => {
@@ -40,11 +42,20 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
-  event.respondWith(caches.match(request).then((cached) => cached || fetch(request).then((response) => {
-    if (response.ok && ["script", "style", "image", "font"].includes(request.destination)) {
+  if (url.pathname.startsWith("/api/")) return;
+  const cacheable = url.pathname === "/driver" || url.pathname === "/env.json"
+    || STATIC_ASSETS.includes(url.pathname)
+    || ["script", "style", "image", "font"].includes(request.destination);
+  if (!cacheable) return;
+  event.respondWith(fetch(request).then((response) => {
+    if (response.ok) {
       const copy = response.clone();
-      caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+      event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.put(request, copy)));
     }
     return response;
-  })));
+  }).catch(async (error) => {
+    const cached = await caches.match(request);
+    if (cached) return cached;
+    throw error;
+  }));
 });

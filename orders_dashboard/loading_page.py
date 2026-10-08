@@ -1,4 +1,4 @@
-"""Warehouse loading workspace."""
+"""Warehouse loading workspace and trip reconciliation."""
 
 from __future__ import annotations
 
@@ -10,20 +10,24 @@ import reflex as rx
 from reflex.state import StateUpdate
 from reflex_base.event import Event
 
-from modules import dashboard_sessions, loader_sessions
+from modules import dashboard_sessions, goods_returns, loader_sessions
 from modules.fleet import loader_by_id
 from modules.order_records import (
     OrderRecordConflict,
     OrderRecordError,
     OrderRecordNotFound,
+    ZERO_REASON_OPTIONS,
+    calculate_net_weight,
+    confirm_route_loading,
     list_order_record_summaries,
     load_order_record,
-    save_loading_update,
+    is_zero_measurement,
+    loading_route_summaries,
+    logistics_summary,
+    route_loading_ready,
+    save_loading_draft,
 )
 from orders_dashboard import theme as ui
-
-
-ENABLE_WEIGHT_MODE = False
 
 
 def _cookie(router, name: str) -> str:
@@ -59,11 +63,13 @@ def loading_principal_for_router(router) -> dict | None:
 
 
 def _query_param(router, name: str) -> str:
-    page = getattr(router, "page", None)
-    params = getattr(page, "params", None)
+    url = getattr(router, "url", None)
+    params = getattr(url, "query_parameters", None)
     if params is None and isinstance(router, dict):
-        params = router.get("params", {})
-    if not isinstance(params, dict):
+        url = router.get("url", {})
+        params = url.get("query_parameters") if isinstance(url, dict) else None
+        params = params if params is not None else router.get("params", {})
+    if not hasattr(params, "get"):
         return ""
     value = params.get(name, "")
     return str(value[0] if isinstance(value, list) and value else value)
@@ -74,10 +80,6 @@ def _format_date(value: str) -> str:
         return datetime.fromisoformat(value).strftime("%d.%m.%y %H:%M")
     except ValueError:
         return value
-
-
-def _number(value: str) -> Decimal:
-    return Decimal(value or "0")
 
 
 def _format_number(value: Decimal) -> str:
@@ -95,27 +97,127 @@ def _route_summary(record: dict) -> str:
     return " · ".join(item for item in routes if item)
 
 
-def _loading_rows(record: dict, box_counts: dict[str, str]) -> list[dict]:
-    return [
-        {
-            "id": str(line.get("id", "")),
-            "name": str(line.get("name", "")),
-            "planned_kg": str(line.get("planned_amount", "0")),
-            "loaded_box_count": str(box_counts.get(str(line.get("id", "")), "")),
-        }
-        for line in record.get("loading_lines", [])
-    ]
+def _measurement(measurement: object) -> dict[str, str]:
+    measurement = measurement if isinstance(measurement, dict) else {}
+    return {
+        key: str(measurement.get(key, ""))
+        for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason")
+    }
+
+
+def _preview_net(measurement: dict[str, str]) -> str:
+    if any(measurement[key].strip() == "" for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg")):
+        return ""
+    try:
+        return _format_number(
+            calculate_net_weight(
+                measurement["gross_weight_kg"],
+                measurement["tare_weight_per_box_kg"],
+                measurement["box_count"],
+            )
+        )
+    except (OrderRecordError, InvalidOperation, ValueError):
+        return ""
+
+
+def _loading_rows(
+    record: dict,
+    route_key: str,
+    measurements: dict[str, dict[str, str]],
+) -> list[dict]:
+    rows = []
+    for line in record.get("loading_lines", []):
+        if str(line.get("route_key", "")) != route_key:
+            continue
+        line_id = str(line.get("id", ""))
+        measurement = _measurement(measurements.get(line_id, line.get("measurement")))
+        rows.append(
+            {
+                "id": line_id,
+                "name": str(line.get("name", "")),
+                "planned_kg": str(line.get("planned_amount", "0")),
+                **measurement,
+                "needs_zero_reason": is_zero_measurement(measurement),
+                "preview_net_weight_kg": _preview_net(measurement),
+            }
+        )
+    return rows
 
 
 def _loading_totals(rows: list[dict]) -> tuple[str, str]:
-    ordered_kg = sum((_number(row["planned_kg"]) for row in rows), Decimal("0"))
-    if any(row["loaded_box_count"] == "" for row in rows):
-        return _format_number(ordered_kg), ""
-    try:
-        loaded_boxes = sum((_number(row["loaded_box_count"]) for row in rows), Decimal("0"))
-    except (InvalidOperation, ValueError):
-        return _format_number(ordered_kg), ""
-    return _format_number(ordered_kg), _format_number(loaded_boxes)
+    ordered = Decimal("0")
+    loaded = Decimal("0")
+    has_missing = False
+    for row in rows:
+        try:
+            ordered += Decimal(row["planned_kg"] or "0")
+            preview = row["preview_net_weight_kg"]
+            if preview == "":
+                has_missing = True
+            else:
+                loaded += Decimal(preview)
+        except (InvalidOperation, ValueError):
+            has_missing = True
+    return _format_number(ordered), "" if has_missing else _format_number(loaded)
+
+
+def _shipment_rows(record: dict) -> tuple[list[dict], int, int]:
+    rows = []
+    completed_count = 0
+    total_count = 0
+    for route in record.get("routes", []):
+        for destination in route.get("destinations", []):
+            total_count += 1
+            positions = destination.get("positions", [])
+            completed = bool(positions) and all(
+                (position.get("shipment") or {}).get("status") == "completed"
+                for position in positions
+            )
+            completed_count += int(completed)
+            rows.append(
+                {
+                    "route": str(route.get("route_label", "")),
+                    "store": str(destination.get("name", "")),
+                    "status": "Отгружено" if completed else "Ожидает водителя",
+                    "completed": completed,
+                }
+            )
+    return rows, completed_count, total_count
+
+
+def _return_reconciliation(record: dict) -> dict:
+    summary = logistics_summary(record)
+    accepted = goods_returns.accepted_by_loading_line(str(record["id"]))
+    totals = {"returned": Decimal(0), "unexplained": Decimal(0), "excess": Decimal(0)}
+    by_product = {}
+    for line in record.get("loading_lines", []):
+        key = (str(line.get("name", "")).strip().casefold(), str(line.get("unit", "kg")).strip().casefold())
+        values = by_product.setdefault(key, {"returned": Decimal(0), "unexplained": Decimal(0), "excess": Decimal(0)})
+        returned = Decimal(accepted.get(str(line["id"]), "0"))
+        measurement = line.get("measurement") or {}
+        loaded = Decimal(measurement.get("net_weight_kg") or "0") if route_loading_ready(record, str(line.get("route_key", ""))) else Decimal(0)
+        shipped = sum((
+            Decimal((position["shipment"].get("measurement") or {}).get("net_weight_kg") or "0")
+            for route in record.get("routes", [])
+            for destination in route.get("destinations", [])
+            for position in destination.get("positions", [])
+            if position.get("loading_line_id") == line["id"]
+            and (position.get("shipment") or {}).get("status") == "completed"
+        ), Decimal(0))
+        balance = loaded - shipped - returned
+        values["returned"] += returned
+        values["unexplained"] += max(balance, Decimal(0))
+        values["excess"] += max(-balance, Decimal(0))
+    for row in summary["items"]:
+        source = next(line for line in record["loading_lines"] if str(line["id"]) == row["id"])
+        key = (str(source.get("name", "")).strip().casefold(), str(source.get("unit", "kg")).strip().casefold())
+        values = by_product[key]
+        for field, amount in values.items():
+            row[f"{field}_kg"] = _format_number(amount)
+            totals[field] += amount
+    for field, amount in totals.items():
+        summary[f"total_{field}_kg"] = _format_number(amount)
+    return summary
 
 
 class LoadingState(rx.State):
@@ -125,6 +227,12 @@ class LoadingState(rx.State):
     order_option_labels: list[str] = []
     selected_order_label: str = ""
     selected_order_id: str = ""
+    route_options: list[dict] = []
+    route_option_labels: list[str] = []
+    selected_route_label: str = ""
+    selected_route_key: str = ""
+    route_loaded_count: int = 0
+    route_total_count: int = 0
     back_target: str = "/"
     selected_record: dict = {}
     summary_order_number: str = ""
@@ -135,15 +243,17 @@ class LoadingState(rx.State):
     summary_received_at: str = ""
     summary_position_count: int = 0
     total_ordered_kg: str = "0"
-    total_loaded_boxes: str = ""
+    total_loaded_net_kg: str = ""
     loading_rows: list[dict] = []
-    draft_box_counts: dict[str, str] = {}
-    summary_expanded: bool = True
+    draft_measurements: dict[str, dict[str, str]] = {}
+    shipment_rows: list[dict] = []
+    shipment_completed_count: int = 0
+    shipment_total_count: int = 0
+    shipment_status: str = "waiting_loading"
+    reconciliation_rows: list[dict] = []
+    reconciliation: dict = {}
+    summary_expanded: bool = False
     is_read_only: bool = False
-    is_dirty: bool = False
-    pending_order_id: str = ""
-    pending_exit: bool = False
-    discard_confirmation_open: bool = False
     status: str = ""
     order_not_found: bool = False
     save_completed: bool = False
@@ -158,51 +268,74 @@ class LoadingState(rx.State):
         ]
         self.order_option_labels = [item["label"] for item in self.order_options]
 
-    def _apply_record(self, order_record_id: str) -> bool:
+    def _clear_record(self):
+        self.selected_order_id = ""
+        self.selected_order_label = ""
+        self.route_options = []
+        self.route_option_labels = []
+        self.selected_route_label = ""
+        self.selected_route_key = ""
+        self.route_loaded_count = 0
+        self.route_total_count = 0
+        self.selected_record = {}
+        self.summary_order_number = ""
+        self.summary_client_name = ""
+        self.summary_processed_at = ""
+        self.summary_mode = ""
+        self.summary_routes = ""
+        self.summary_received_at = ""
+        self.summary_position_count = 0
+        self.total_ordered_kg = "0"
+        self.total_loaded_net_kg = ""
+        self.loading_rows = []
+        self.draft_measurements = {}
+        self.shipment_rows = []
+        self.shipment_completed_count = 0
+        self.shipment_total_count = 0
+        self.shipment_status = "waiting_loading"
+        self.reconciliation_rows = []
+        self.reconciliation = {}
+        self.is_read_only = False
+
+    def _apply_record(self, order_record_id: str, route_key: str = "") -> bool:
         if not order_record_id:
-            self.selected_order_id = ""
-            self.selected_order_label = ""
-            self.selected_record = {}
-            self.summary_order_number = ""
-            self.summary_client_name = ""
-            self.summary_processed_at = ""
-            self.summary_mode = ""
-            self.summary_routes = ""
-            self.summary_received_at = ""
-            self.summary_position_count = 0
-            self.total_ordered_kg = "0"
-            self.total_loaded_boxes = ""
-            self.loading_rows = []
-            self.draft_box_counts = {}
-            self.is_read_only = False
+            self._clear_record()
             return True
         try:
             record = load_order_record(order_record_id)
         except OrderRecordNotFound:
-            self.selected_order_id = ""
-            self.selected_order_label = ""
-            self.selected_record = {}
-            self.summary_order_number = ""
-            self.summary_client_name = ""
-            self.summary_processed_at = ""
-            self.summary_mode = ""
-            self.summary_routes = ""
-            self.summary_received_at = ""
-            self.summary_position_count = 0
-            self.total_ordered_kg = "0"
-            self.total_loaded_boxes = ""
-            self.loading_rows = []
-            self.draft_box_counts = {}
-            self.is_read_only = False
+            self._clear_record()
             self.order_not_found = True
             self.status = "Заказ не найден"
             return False
+
+        route_options = loading_route_summaries(record)
+        if not route_options:
+            route_options = [{
+                "route_key": "",
+                "route_label": "Все маршруты",
+                "status": str((record.get("loading") or {}).get("status", "new")),
+                "ready": bool(logistics_summary(record)["loading_ready"]),
+            }]
+        selected_route_key = route_key or self.selected_route_key
+        if selected_route_key not in {item["route_key"] for item in route_options}:
+            selected_route_key = route_options[0]["route_key"]
+        selected_route = next(item for item in route_options if item["route_key"] == selected_route_key)
 
         self.selected_order_id = order_record_id
         self.selected_order_label = next(
             (item["label"] for item in self.order_options if item["id"] == order_record_id),
             "",
         )
+        self.route_options = [
+            {**item, "label": item["route_label"]}
+            for item in route_options
+        ]
+        self.route_option_labels = [item["label"] for item in self.route_options]
+        self.selected_route_key = selected_route_key
+        self.selected_route_label = str(selected_route["route_label"])
+        self.route_total_count = len(route_options)
+        self.route_loaded_count = sum(item["status"] == "loaded" for item in route_options)
         self.selected_record = record
         self.summary_order_number = str(record.get("order_number", ""))
         self.summary_client_name = str(record.get("client_name", ""))
@@ -210,15 +343,19 @@ class LoadingState(rx.State):
         self.summary_mode = str(record.get("mode", ""))
         self.summary_routes = _route_summary(record)
         self.summary_received_at = str((record.get("mail_metadata") or {}).get("received_display", ""))
-        self.summary_position_count = len(record.get("loading_lines", []))
-        self.draft_box_counts = {
-            str(line["id"]): str(line.get("loaded_box_count", ""))
+        self.draft_measurements = {
+            str(line["id"]): _measurement(line.get("measurement"))
             for line in record.get("loading_lines", [])
+            if str(line.get("route_key", "")) == selected_route_key
         }
-        self.loading_rows = _loading_rows(record, self.draft_box_counts)
-        self.total_ordered_kg, self.total_loaded_boxes = _loading_totals(self.loading_rows)
-        self.is_read_only = (record.get("loading") or {}).get("status") == "loaded"
-        self.is_dirty = False
+        self.loading_rows = _loading_rows(record, selected_route_key, self.draft_measurements)
+        self.summary_position_count = len(self.loading_rows)
+        self.total_ordered_kg, self.total_loaded_net_kg = _loading_totals(self.loading_rows)
+        self.reconciliation = _return_reconciliation(record)
+        self.reconciliation_rows = self.reconciliation["items"]
+        self.shipment_status = self.reconciliation["shipment_status"]
+        self.shipment_rows, self.shipment_completed_count, self.shipment_total_count = _shipment_rows(record)
+        self.is_read_only = bool(selected_route["ready"])
         self.order_not_found = False
         self.save_completed = False
         self.status = ""
@@ -232,8 +369,10 @@ class LoadingState(rx.State):
         self.principal = principal
         self.back_target = "/?page=history" if _query_param(self.router, "from") == "history" else "/"
         self._refresh_options()
-        requested_order_id = _query_param(self.router, "order")
-        self._apply_record(requested_order_id)
+        self._apply_record(
+            _query_param(self.router, "order"),
+            _query_param(self.router, "route"),
+        )
 
     def request_order_label(self, label: str):
         order_record_id = next(
@@ -245,81 +384,87 @@ class LoadingState(rx.State):
     def request_order(self, order_record_id: str):
         if order_record_id == self.selected_order_id:
             return
-        if self.is_dirty:
-            self.pending_order_id = order_record_id
-            self.discard_confirmation_open = True
-            return
         return self.select_order(order_record_id)
 
     def select_order(self, order_record_id: str):
-        self._apply_record(order_record_id)
+        self._apply_record(order_record_id, "")
         return rx.redirect(f"/loading?order={order_record_id}" if order_record_id else "/loading")
 
-    def cancel_discard(self):
-        self.pending_order_id = ""
-        self.pending_exit = False
-        self.discard_confirmation_open = False
+    def request_route_label(self, label: str):
+        route_key = next(
+            (item["route_key"] for item in self.route_options if item["label"] == label),
+            "",
+        )
+        return self.select_route(route_key)
 
-    def confirm_discard(self):
-        order_record_id = self.pending_order_id
-        exit_page = self.pending_exit
-        self.pending_order_id = ""
-        self.pending_exit = False
-        self.discard_confirmation_open = False
-        if exit_page:
-            return rx.redirect(self.back_target)
-        return self.select_order(order_record_id)
-
-    def set_loaded_box_count(self, line_id: str, value: str):
-        if self.is_read_only or line_id not in self.draft_box_counts:
+    def select_route(self, route_key: str):
+        if not self.selected_order_id or route_key == self.selected_route_key:
             return
-        amounts = dict(self.draft_box_counts)
-        amounts[line_id] = value
-        self.draft_box_counts = amounts
-        self.loading_rows = _loading_rows(self.selected_record, amounts)
-        self.total_ordered_kg, self.total_loaded_boxes = _loading_totals(self.loading_rows)
-        self.is_dirty = True
+        self._apply_record(self.selected_order_id, route_key)
+        history_param = "&from=history" if self.back_target == "/?page=history" else ""
+        return rx.redirect(
+            f"/loading?order={self.selected_order_id}&route={route_key}{history_param}"
+        )
+
+    def set_measurement_field(self, line_id: str, field: str, value: str):
+        if self.is_read_only or line_id not in self.draft_measurements:
+            return
+        try:
+            record = save_loading_draft(
+                self.selected_order_id,
+                self.selected_route_key,
+                line_id,
+                field,
+                value,
+                self.principal,
+            )
+        except OrderRecordConflict as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.status = str(error)
+            return
+        except OrderRecordError as error:
+            self.status = str(error)
+            return
+        self.selected_record = record
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.status = "Черновик сохранён"
         self.save_completed = False
-        self.status = ""
 
     def toggle_summary(self):
         self.summary_expanded = not self.summary_expanded
+
+    def refresh_trip(self):
+        if not self.selected_order_id:
+            return
+        self._refresh_options()
+        self._apply_record(self.selected_order_id)
+        self.status = "Данные рейса обновлены"
 
     def save_loading(self):
         if not self.selected_order_id:
             self.status = "Выберите заказ"
             return
         if self.is_read_only:
-            self.status = "Загрузка уже сохранена и доступна только для просмотра"
-            return
-        if any(value.strip() == "" for value in self.draft_box_counts.values()):
-            self.status = "Заполните загрузку для каждой позиции"
+            self.status = "Загрузка маршрута уже подтверждена"
             return
         try:
-            record = save_loading_update(
+            record = confirm_route_loading(
                 self.selected_order_id,
                 int(self.selected_record.get("revision", -1)),
-                self.draft_box_counts,
+                self.selected_route_key,
                 self.principal,
             )
         except OrderRecordConflict as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
             self.status = str(error)
-            self._apply_record(self.selected_order_id)
             return
         except OrderRecordError as error:
             self.status = str(error)
             return
         self.selected_record = record
-        self.draft_box_counts = {
-            str(line["id"]): str(line.get("loaded_box_count", ""))
-            for line in record.get("loading_lines", [])
-        }
-        self.loading_rows = _loading_rows(record, self.draft_box_counts)
-        self.total_ordered_kg, self.total_loaded_boxes = _loading_totals(self.loading_rows)
-        self.is_read_only = (record.get("loading") or {}).get("status") == "loaded"
-        self.is_dirty = False
+        self._apply_record(self.selected_order_id, self.selected_route_key)
         self.save_completed = True
-        self.status = "Загрузка сохранена"
+        self.status = "Загрузка маршрута подтверждена. Водитель может начать отгрузку."
         self._refresh_options()
 
     def load_next_order(self):
@@ -329,10 +474,6 @@ class LoadingState(rx.State):
         self.status = "Следующих заказов для загрузки нет"
 
     def back_to_orders(self):
-        if self.is_dirty:
-            self.pending_exit = True
-            self.discard_confirmation_open = True
-            return
         return rx.redirect(self.back_target)
 
 
@@ -341,170 +482,358 @@ def _loading_summary():
         rx.button(
             rx.hstack(
                 rx.vstack(
-                    rx.text(LoadingState.summary_order_number, color=ui.INK, font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-                    rx.text(LoadingState.summary_client_name, color=ui.INK_2, font_size="13px"),
+                    rx.text(LoadingState.summary_order_number, class_name="loading-summary-title"),
+                    rx.text(LoadingState.summary_client_name, class_name="loading-summary-client"),
                     align="start", spacing="1",
                 ),
                 rx.spacer(),
-                rx.text("Свернуть", color=ui.PURPLE, font_size="13px"),
+                rx.text(rx.cond(LoadingState.summary_expanded, "Свернуть", "Подробнее"), class_name="loading-summary-toggle"),
                 width="100%", align="center",
             ),
+            aria_expanded=LoadingState.summary_expanded, aria_controls="loading-order-summary",
             on_click=LoadingState.toggle_summary,
             width="100%", padding="0", background=ui.TRANSPARENT, border="0", cursor="pointer",
         ),
         rx.cond(
             LoadingState.summary_expanded,
             rx.vstack(
-                rx.text("Обработан: ", LoadingState.summary_processed_at, color=ui.INK_2, font_size="13px"),
-                rx.text("Режим: ", LoadingState.summary_mode, color=ui.INK_2, font_size="13px"),
-                rx.text("Маршруты: ", LoadingState.summary_routes, color=ui.INK_2, font_size="13px"),
-                rx.text("Письмо: ", LoadingState.summary_received_at, color=ui.INK_2, font_size="13px"),
-                rx.text("Позиций: ", LoadingState.summary_position_count, color=ui.INK_2, font_size="13px"),
+                rx.text("Обработан: ", LoadingState.summary_processed_at, class_name="loading-summary-meta"),
+                rx.text("Режим: ", LoadingState.summary_mode, class_name="loading-summary-meta"),
+                rx.text("Маршруты: ", LoadingState.summary_routes, class_name="loading-summary-meta"),
+                rx.text("Письмо: ", LoadingState.summary_received_at, class_name="loading-summary-meta"),
+                rx.text("Позиций: ", LoadingState.summary_position_count, class_name="loading-summary-meta"),
+                id="loading-order-summary", align="start", spacing="1", width="100%",
+            ),
+            rx.box(display="none"),
+        ),
+        align="start", spacing="3", width="100%", class_name="loading-summary",
+    )
+
+
+def _loading_context():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Параметры рейса", size="3"),
+                rx.text("Выберите заказ и маршрут для загрузки", class_name="loading-panel-description"),
+                align="start", spacing="1",
+            ),
+            rx.cond(
+                LoadingState.selected_order_id != "",
+                rx.text(
+                    LoadingState.route_loaded_count,
+                    " из ",
+                    LoadingState.route_total_count,
+                    class_name="loading-count",
+                ),
+                rx.box(),
+            ),
+            class_name="loading-panel-heading",
+            width="100%",
+            align="start",
+        ),
+        rx.vstack(
+            rx.text("Заказ", class_name="loading-field-label"),
+            rx.select(
+                LoadingState.order_option_labels,
+                value=LoadingState.selected_order_label,
+                on_change=LoadingState.request_order_label,
+                placeholder="Выберите заказ",
+                width="100%",
+                class_name="loading-select",
+            ),
+            align="start", spacing="1", width="100%",
+        ),
+        rx.cond(
+            LoadingState.selected_order_id != "",
+            rx.vstack(
+                rx.text("Маршрут", class_name="loading-field-label"),
+                rx.select(
+                    LoadingState.route_option_labels,
+                    value=LoadingState.selected_route_label,
+                    on_change=LoadingState.request_route_label,
+                    width="100%",
+                    class_name="loading-select",
+                ),
+                rx.text(
+                    "Подтверждено маршрутов: ",
+                    LoadingState.route_loaded_count,
+                    " из ",
+                    LoadingState.route_total_count,
+                    class_name="loading-route-progress",
+                ),
                 align="start", spacing="1", width="100%",
             ),
             rx.box(),
         ),
-        align="start", spacing="3", width="100%", padding="16px",
-        border=f"1px solid {ui.LINE}", border_radius="12px", background=ui.PANEL,
-        class_name="loading-summary",
+        rx.cond(LoadingState.order_not_found, rx.text("Заказ не найден", class_name="loading-message loading-message-error"), rx.box()),
+        rx.cond(LoadingState.selected_order_id != "", _loading_summary(), rx.box()),
+        align="start", spacing="4", width="100%",
+        class_name="loading-panel loading-context-panel",
+    )
+
+
+def _measurement_control(row, field: str, label: str):
+    return rx.el.label(
+        rx.text(label, class_name="loading-mobile-label"),
+        rx.el.input(value=row[field], on_change=LoadingState.set_measurement_field(row["id"], field),
+                 type="text", input_mode="numeric" if field == "box_count" else "decimal",
+                 disabled=LoadingState.is_read_only, aria_label=row["name"].to(str) + ": " + label,
+                 class_name="loading-amount-input"),
+        class_name="loading-measurement-control",
     )
 
 
 def _loading_table():
     return rx.vstack(
         rx.hstack(
-            rx.text("Товар", class_name="loading-table-title"),
-            rx.text("Заказано, кг", class_name="loading-table-title"),
-            rx.text("Загружено, ящики", class_name="loading-table-title"),
-            class_name="loading-table-row loading-table-header",
-        ),
-        rx.foreach(
-            LoadingState.loading_rows,
-            lambda row: rx.hstack(
-                rx.text(row["name"], color=ui.INK, font_weight=ui.FONT_WEIGHT_MEDIUM, min_width="0"),
-                rx.text(row["planned_kg"], " кг", color=ui.INK_2),
-                rx.input(
-                    value=row["loaded_box_count"],
-                    on_change=LoadingState.set_loaded_box_count(row["id"]),
-                    type="number",
-                    min="0",
-                    step="1",
-                    disabled=LoadingState.is_read_only,
-                    class_name="loading-amount-input",
-                ),
-                class_name="loading-table-row",
-                align="center",
+            rx.vstack(
+                rx.heading("Загрузка", size="3"),
+                rx.text("Фактические веса маршрута «", LoadingState.selected_route_label, "»", class_name="loading-panel-description"),
+                align="start", spacing="1",
             ),
+            rx.text(LoadingState.summary_position_count, " поз.", class_name="loading-count"),
+            class_name="loading-panel-heading",
+            width="100%",
+            align="start",
         ),
-        rx.hstack(
-            rx.text("Итого", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-            rx.text("Заказано: ", LoadingState.total_ordered_kg, " кг", color=ui.INK_2),
-            rx.text("Загружено: ", LoadingState.total_loaded_boxes, " ящ.", color=ui.INK_2),
-            rx.spacer(),
-            class_name="loading-table-total",
-        ),
-        width="100%", spacing="0", class_name="loading-table",
-    )
-
-
-def _discard_dialog():
-    return rx.cond(
-        LoadingState.discard_confirmation_open,
         rx.box(
             rx.vstack(
-                rx.heading("Есть несохранённые данные", size="5", color=ui.INK),
-                rx.text("Выйти без сохранения?", color=ui.INK_2),
                 rx.hstack(
-                    rx.button("Остаться", on_click=LoadingState.cancel_discard, class_name="loading-secondary-button"),
-                    rx.button("Выйти", on_click=LoadingState.confirm_discard, class_name="loading-primary-button"),
-                    width="100%", justify="end", spacing="2",
+                    rx.text("Товар", class_name="loading-table-title"),
+                    rx.text("Заказано, кг", class_name="loading-table-title"),
+                    rx.text("Ящики", class_name="loading-table-title"),
+                    rx.text("Тара, кг/ящ.", class_name="loading-table-title"),
+                    rx.text("Брутто, кг", class_name="loading-table-title"),
+                    rx.text("Нетто, кг", class_name="loading-table-title"),
+                    class_name="loading-table-row loading-table-header loading-table-measurement-row",
                 ),
-                align="start", spacing="4", padding="20px", width="min(420px, calc(100vw - 32px))",
-                background=ui.PANEL, border_radius="14px",
+                rx.foreach(
+                    LoadingState.loading_rows,
+                    lambda row: rx.vstack(
+                        rx.hstack(
+                            rx.text(row["name"], class_name="loading-product-name"),
+                            rx.text(row["planned_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Заказано"}),
+                            _measurement_control(row, "box_count", "Ящики"),
+                            _measurement_control(row, "tare_weight_per_box_kg", "Тара, кг/ящик"),
+                            _measurement_control(row, "gross_weight_kg", "Брутто, кг"),
+                            rx.text(row["preview_net_weight_kg"], rx.cond(row["preview_net_weight_kg"] != "", " кг", "—"), class_name="loading-table-value loading-net-weight", custom_attrs={"data-label": "Нетто"}),
+                            class_name="loading-table-row loading-table-measurement-row",
+                            align="center",
+                        ),
+                        rx.cond(
+                            row["needs_zero_reason"],
+                            rx.hstack(
+                                rx.text("Причина нулевой позиции", class_name="loading-zero-reason-label"),
+                                rx.cond(
+                                    LoadingState.is_read_only,
+                                    rx.text(row["zero_reason"], class_name="loading-zero-reason-value"),
+                                    rx.select(
+                                        list(ZERO_REASON_OPTIONS),
+                                        value=row["zero_reason"],
+                                        on_change=LoadingState.set_measurement_field(row["id"], "zero_reason"),
+                                        placeholder="Укажите причину",
+                                        width="min(100%, 360px)",
+                                        class_name="loading-zero-reason-select",
+                                    ),
+                                ),
+                                class_name="loading-zero-reason",
+                                width="100%",
+                                align="center",
+                                wrap="wrap",
+                            ),
+                            rx.box(),
+                        ),
+                        width="100%",
+                        spacing="0",
+                    ),
+                ),
+                rx.hstack(
+                    rx.text("Итого", class_name="loading-total-title"),
+                    rx.text("Заказано: ", LoadingState.total_ordered_kg, " кг", class_name="loading-table-value"),
+                    rx.text("Загружено нетто: ", LoadingState.total_loaded_net_kg, " кг", class_name="loading-table-value"),
+                    rx.spacer(),
+                    class_name="loading-table-total",
+                ),
+                width="100%", spacing="0", class_name="loading-table",
             ),
-            position="fixed", inset="0", display="flex", align_items="center", justify_content="center",
-            background="rgba(20, 25, 36, .45)", z_index="100",
+            width="100%", class_name="loading-table-wrap",
         ),
-        rx.box(),
+        width="100%", spacing="3",
     )
 
 
-DIRTY_GUARD_JS = """
-(() => {
-    if (window.__loadingDirtyGuard) return;
-    window.__loadingDirtyGuard = true;
-    window.addEventListener('beforeunload', (event) => {
-        const marker = document.getElementById('loading-dirty-state');
-        if (marker?.dataset.dirty !== 'true') return;
-        event.preventDefault();
-        event.returnValue = '';
-    });
-})();
-"""
+def _shipment_progress():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Отгрузка по магазинам", size="3"),
+                rx.text(
+                    LoadingState.shipment_completed_count,
+                    " из ",
+                    LoadingState.shipment_total_count,
+                    " магазинов подтверждено водителями",
+                    class_name="loading-panel-description",
+                ),
+                align="start", spacing="1",
+            ),
+            rx.spacer(),
+            rx.button("Обновить", on_click=LoadingState.refresh_trip, class_name="loading-secondary"),
+            width="100%", align="center",
+        ),
+        rx.foreach(
+            LoadingState.shipment_rows,
+            lambda row: rx.hstack(
+                rx.text(row["route"], class_name="loading-shipment-route"),
+                rx.text(row["store"], class_name="loading-shipment-store", width="100%"),
+                rx.text(row["status"], class_name=rx.cond(row["completed"], "loading-shipment-status loading-shipment-status-complete", "loading-shipment-status")),
+                width="100%", align="center", class_name="loading-shipment-row",
+            ),
+        ),
+        width="100%", spacing="2", class_name="loading-panel loading-shipment-progress",
+    )
+
+
+def _reconciliation():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Итог рейса", size="3"),
+                rx.text("Сверка заказа, загрузки и отгрузки", class_name="loading-panel-description"),
+                align="start", spacing="1",
+            ),
+            class_name="loading-panel-heading",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.text("Заказано: ", LoadingState.reconciliation["total_ordered_kg"], " кг", class_name="loading-reconciliation-stat"),
+            rx.text("Загружено: ", LoadingState.reconciliation["total_loaded_net_kg"], " кг", class_name="loading-reconciliation-stat"),
+            rx.text("Отгружено: ", LoadingState.reconciliation["total_shipped_net_kg"], " кг", class_name="loading-reconciliation-stat"),
+            rx.text("Недостача заказа: ", LoadingState.reconciliation["total_shortage_kg"], " кг", class_name="loading-reconciliation-stat loading-shortage-stat"),
+            rx.text("Возвращено на склад: ", LoadingState.reconciliation["total_returned_kg"], " кг", class_name="loading-reconciliation-stat"),
+            rx.text("Необъяснённый остаток: ", LoadingState.reconciliation["total_unexplained_kg"], " кг", class_name="loading-reconciliation-stat"),
+            rx.text("Превышение отгрузки над загрузкой: ", LoadingState.reconciliation["total_excess_kg"], " кг", class_name="loading-reconciliation-stat"),
+            wrap="wrap", spacing="2", width="100%",
+        ),
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.text("Товар", class_name="loading-table-title"),
+                    rx.text("Заказано", class_name="loading-table-title"),
+                    rx.text("Загружено", class_name="loading-table-title"),
+                    rx.text("Отгружено", class_name="loading-table-title"),
+                    rx.text("Недостача заказа", class_name="loading-table-title"),
+                    rx.text("Возвращено", class_name="loading-table-title"),
+                    rx.text("Остаток / расхождение", class_name="loading-table-title"),
+                    class_name="loading-table-row loading-table-header loading-reconciliation-row",
+                ),
+                rx.foreach(
+                    LoadingState.reconciliation_rows,
+                    lambda row: rx.hstack(
+                        rx.text(row["name"], class_name="loading-product-name"),
+                        rx.text(row["planned_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Заказано"}),
+                        rx.text(row["loaded_net_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Загружено"}),
+                        rx.text(row["shipped_net_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Отгружено"}),
+                        rx.text(row["shortage_kg"], " кг", class_name="loading-table-value loading-shortage-stat", custom_attrs={"data-label": "Недостача заказа"}),
+                        rx.text(row["returned_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Возвращено"}),
+                        rx.vstack(
+                            rx.text(row["unexplained_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Остаток"}),
+                            rx.cond(row["excess_kg"] != "0", rx.text("Превышение: ", row["excess_kg"], " кг", class_name="loading-table-value loading-shortage-stat"), rx.box()),
+                            align="end", spacing="1",
+                        ),
+                        class_name="loading-table-row loading-reconciliation-row",
+                    ),
+                ),
+                width="100%", spacing="0", class_name="loading-table loading-reconciliation",
+            ),
+            width="100%", class_name="loading-table-wrap",
+        ),
+        width="100%", spacing="3", class_name="loading-panel loading-reconciliation-panel",
+    )
 
 
 def loading_page():
     return rx.cond(
         LoadingState.is_authorized,
         rx.box(
-            rx.box(
-                id="loading-dirty-state",
-                custom_attrs={"data-dirty": LoadingState.is_dirty},
-                display="none",
-            ),
-            rx.script(DIRTY_GUARD_JS),
-            rx.vstack(
+            rx.hstack(
                 rx.hstack(
-                    rx.button("← Назад", on_click=LoadingState.back_to_orders, class_name="loading-secondary-button"),
+                    rx.box("Д", class_name="loading-brand-mark"),
                     rx.vstack(
-                        rx.heading("Загрузка", color=ui.INK, size="6"),
-                        rx.text("Фактическая загрузка заказа", color=ui.INK_2, font_size="13px"),
+                        rx.text("Доставка", class_name="loading-brand-title"),
+                        rx.text("Складская загрузка", class_name="loading-brand-subtitle"),
+                        align="start", spacing="0",
+                    ),
+                    class_name="loading-brand",
+                    align="center",
+                ),
+                rx.hstack(
+                    rx.el.select(rx.el.option("Как на устройстве", value="system"), rx.el.option("Светлая", value="light"),
+                                 rx.el.option("Тёмная", value="dark"), default_value="system", aria_label="Тема оформления",
+                                 custom_attrs={"data-theme-select": ""}, class_name="theme-select"),
+                    rx.button("← Назад", on_click=LoadingState.back_to_orders, class_name="loading-secondary loading-back-button"),
+                    align="center", spacing="2", class_name="loading-header-actions",
+                ),
+                class_name="loading-app-header",
+                width="100%",
+                align="center",
+            ),
+            rx.vstack(
+                rx.text("Загрузка и сверка", class_name="loading-breadcrumb"),
+                rx.hstack(
+                    rx.vstack(
+                        rx.heading("Рейс: загрузка и отгрузка", size="6"),
+                        rx.text("Загрузка склада, отгрузка водителями и итоговая недостача", class_name="loading-page-description"),
                         align="start", spacing="1",
                     ),
-                    width="100%", align="center", spacing="3",
-                ),
-                rx.vstack(
-                    rx.text("Заказ", color=ui.INK_2, font_size="13px"),
-                    rx.select(
-                        LoadingState.order_option_labels,
-                        value=LoadingState.selected_order_label,
-                        on_change=LoadingState.request_order_label,
-                        placeholder="Выберите заказ",
-                        width="100%",
-                        class_name="loading-select",
+                    rx.cond(
+                        LoadingState.selected_order_id != "",
+                        rx.text(LoadingState.selected_route_label, class_name="loading-route-badge"),
+                        rx.box(),
                     ),
-                    align="start", spacing="1", width="100%",
+                    class_name="loading-route-title",
+                    width="100%",
+                    align="start",
                 ),
-                rx.cond(LoadingState.order_not_found, rx.text("Заказ не найден", color=ui.STATUS_RED_TEXT), rx.box()),
                 rx.cond(
                     LoadingState.selected_order_id != "",
                     rx.vstack(
-                        _loading_summary(),
-                        _loading_table(),
-                        rx.cond(
-                            LoadingState.is_read_only,
-                            rx.text("Загрузка сохранена. Доступен режим просмотра.", color=ui.STATUS_GREEN_TEXT),
-                            rx.button("Сохранить загрузку", on_click=LoadingState.save_loading, class_name="loading-primary-button"),
-                        ),
-                        rx.cond(LoadingState.status != "", rx.text(LoadingState.status, color=ui.PURPLE, font_size="13px"), rx.box()),
-                        rx.cond(
-                            LoadingState.save_completed,
-                            rx.hstack(
-                                rx.button("К списку заказов", on_click=LoadingState.back_to_orders, class_name="loading-secondary-button"),
-                                rx.button("Загрузить следующий заказ", on_click=LoadingState.load_next_order, class_name="loading-primary-button"),
-                                wrap="wrap", spacing="2",
+                        rx.vstack(
+                            _loading_table(),
+                            rx.cond(
+                                LoadingState.is_read_only,
+                                rx.text(
+                                    "Загрузка маршрута подтверждена. Отгрузку по магазинам вводит водитель этого маршрута.",
+                                    class_name="loading-message loading-message-success",
+                                ),
+                                rx.button("Подтвердить загрузку маршрута", on_click=LoadingState.save_loading, class_name="loading-primary"),
                             ),
-                            rx.box(),
+                            rx.cond(LoadingState.status != "", rx.text(LoadingState.status, class_name="loading-message", aria_live="polite"), rx.box()),
+                            rx.cond(
+                                LoadingState.save_completed,
+                                rx.hstack(
+                                    rx.button("К списку заказов", on_click=LoadingState.back_to_orders, class_name="loading-secondary"),
+                                    rx.button("Загрузить следующий заказ", on_click=LoadingState.load_next_order, class_name="loading-primary loading-next-button"),
+                                    wrap="wrap", spacing="2", width="100%",
+                                ),
+                                rx.box(),
+                            ),
+                            align="start", spacing="4", width="100%", class_name="loading-panel loading-measurement-panel",
                         ),
-                        align="start", spacing="4", width="100%",
+                        _loading_context(),
+                        width="100%", class_name="loading-workspace",
                     ),
-                    rx.text("Выберите заказ, чтобы начать загрузку.", color=ui.INK_2),
+                    rx.vstack(
+                        _loading_context(),
+                        rx.text("Выберите заказ, чтобы начать загрузку.", class_name="loading-empty-message"),
+                        align="start", spacing="3", width="100%", class_name="loading-empty-workspace",
+                    ),
                 ),
-                align="start", spacing="5", width="100%", max_width="920px", padding="20px",
-                class_name="loading-page-content",
+                rx.cond(LoadingState.is_read_only, _shipment_progress(), rx.box()),
+                rx.cond(LoadingState.shipment_status == "shipment_completed", _reconciliation(), rx.box()),
+                align="start", spacing="4", width="100%", class_name="loading-shell",
             ),
-            _discard_dialog(),
-            width="100%", min_height="100vh", background=ui.PAGE, class_name="loading-page",
+            width="100%", min_height="100vh", class_name="loading-app-frame",
         ),
         rx.center(rx.spinner(size="3"), width="100%", min_height="100vh", background=ui.PAGE),
     )

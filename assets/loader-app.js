@@ -42,6 +42,26 @@ function numberText(value) {
   return String(value ?? "0");
 }
 
+function themePreference() {
+  return window.LogisticsTheme?.getPreference?.() || "system";
+}
+
+function appHeader(showLogout = false) {
+  return `<header class="driver-app-header">
+    <a class="driver-brand" href="/loader" aria-label="Dostavo.online">
+      <span class="driver-brand-mark"><img src="/icon-192.svg" alt="" aria-hidden="true"></span><strong>dostavo.online</strong><span class="driver-brand-subtitle">Кабинет грузчика</span>
+    </a>
+    <div class="driver-header-actions">
+      <label class="driver-theme-control">Тема<select data-theme-select aria-label="Тема оформления">
+        <option value="system" ${themePreference() === "system" ? "selected" : ""}>Системная</option>
+        <option value="light" ${themePreference() === "light" ? "selected" : ""}>Светлая</option>
+        <option value="dark" ${themePreference() === "dark" ? "selected" : ""}>Тёмная</option>
+      </select></label>
+      ${showLogout ? '<button data-logout class="driver-logout" type="button">Выйти</button>' : ""}
+    </div>
+  </header>`;
+}
+
 function setMessage(message, error = false) {
   const element = root()?.querySelector("[data-message]");
   if (element) {
@@ -73,8 +93,10 @@ function render() {
 
 function renderLogin() {
   root().innerHTML = `
-    <main class="driver-shell driver-login-shell">
-      <section class="driver-panel driver-login-panel">
+    <div class="loader-app-frame"><div class="driver-app-frame">
+      ${appHeader()}
+      <main class="driver-shell driver-login-shell">
+        <section class="driver-panel driver-login-panel">
         <img class="driver-logo" src="/icon-192.svg" alt="Логистика">
         <h1>Рабочее место грузчика</h1>
         <p class="driver-muted">Войдите по индивидуальному коду и PIN-коду</p>
@@ -83,9 +105,10 @@ function renderLogin() {
           <label>PIN-код<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required minlength="4" maxlength="12"></label>
           <button class="driver-primary" type="submit">Войти</button>
         </form>
-        <p data-message class="driver-message"></p>
-      </section>
-    </main>`;
+          <p data-message class="driver-message"></p>
+        </section>
+      </main>
+    </div></div>`;
   root().querySelector("[data-login-form]").addEventListener("submit", login);
 }
 
@@ -94,11 +117,14 @@ function renderVehicles() {
     <span>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · "))}</span><strong>Открыть</strong>
   </button>`).join("");
   root().innerHTML = `
-    <main class="driver-shell">
-      <header class="driver-header"><div><h1>Выберите машину</h1><p class="driver-muted">Доступны машины с текущими назначениями</p></div><button data-logout class="driver-secondary">Выйти</button></header>
-      <p data-message class="driver-message"></p>
-      <section class="driver-panel"><div class="driver-store-list">${cards || "<p class=\"driver-muted\">Сейчас нет доступных назначений</p>"}</div></section>
-    </main>`;
+    <div class="loader-app-frame"><div class="driver-app-frame">
+      ${appHeader(true)}
+      <main class="driver-shell">
+        <header class="driver-header"><div><h1>Выберите машину</h1><p class="driver-muted">Доступны машины с текущими назначениями</p></div></header>
+        <p data-message class="driver-message"></p>
+        <section class="driver-panel"><div class="driver-store-list">${cards || "<p class=\"driver-muted\">Сейчас нет доступных назначений</p>"}</div></section>
+      </main>
+    </div></div>`;
   root().querySelector("[data-logout]").addEventListener("click", logout);
   root().querySelectorAll("[data-vehicle-id]").forEach((button) => {
     button.addEventListener("click", () => selectVehicle(button.dataset.vehicleId));
@@ -107,7 +133,7 @@ function renderVehicles() {
 
 function assignmentCard(assignment) {
   const storeCards = (assignment.stores || []).map((store) => {
-    const lines = (store.lines || []).map((line) => `<tr><td>${esc(line.name)}</td><td>${esc(line.unit)}</td><td>${numberText(line.required_qty)}</td></tr>`).join("");
+    const lines = (store.lines || []).map((line) => `<tr><td data-label="Товар">${esc(line.name)}</td><td data-label="Ед.">${esc(line.unit)}</td><td data-label="План">${numberText(line.required_qty)}</td></tr>`).join("");
     return `<section class="driver-panel"><h2>${esc(store.name)}</h2><p class="driver-muted">${store.status === "completed" ? "Магазин выполнен" : "Запланирован"}</p><div class="driver-table-wrap"><table class="driver-table"><thead><tr><th>Товар</th><th>Ед.</th><th>План</th></tr></thead><tbody>${lines}</tbody></table></div></section>`;
   }).join("");
   return `<section class="driver-panel"><h2>${esc(assignment.route_label || "Маршрут")}</h2><p class="driver-muted">${esc(assignment.driver_name || "Водитель не указан")}</p></section>${storeCards}`;
@@ -116,11 +142,14 @@ function assignmentCard(assignment) {
 function renderOrders() {
   const vehicle = vehicles.find((item) => item.id === selectedVehicleId) || {};
   root().innerHTML = `
-    <main class="driver-shell">
-      <header class="driver-header"><div><h1>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Выбранная машина")}</h1><p class="driver-muted">Заказы доступны только для этой машины</p></div><div><button data-loading class="driver-secondary">Загрузка</button> <button data-change class="driver-secondary">Сменить</button> <button data-logout class="driver-secondary">Выйти</button></div></header>
-      <p data-message class="driver-message"></p>
-      <div class="driver-store-list">${assignments.map(assignmentCard).join("") || "<p class=\"driver-muted\">Для машины нет текущих назначений</p>"}</div>
-    </main>`;
+    <div class="loader-app-frame"><div class="driver-app-frame">
+      ${appHeader(true)}
+      <main class="driver-shell">
+        <header class="driver-header"><div><h1>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Выбранная машина")}</h1><p class="driver-muted">Заказы доступны только для этой машины</p></div><div><button data-loading class="driver-secondary">Загрузка</button> <button data-change class="driver-secondary">Сменить</button></div></header>
+        <p data-message class="driver-message"></p>
+        <div class="driver-store-list">${assignments.map(assignmentCard).join("") || "<p class=\"driver-muted\">Для машины нет текущих назначений</p>"}</div>
+      </main>
+    </div></div>`;
   root().querySelector("[data-loading]").addEventListener("click", () => window.location.assign("/loading"));
   root().querySelector("[data-change]").addEventListener("click", () => { view = "vehicles"; render(); });
   root().querySelector("[data-logout]").addEventListener("click", logout);

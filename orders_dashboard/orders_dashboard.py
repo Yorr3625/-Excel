@@ -25,6 +25,7 @@ from modules import (
     driver_mileage,
     driver_orders,
     driver_sessions,
+    goods_returns,
     loader_sessions,
     gdemoi,
     paths,
@@ -60,10 +61,17 @@ from modules.history import (
 )
 from modules.order_positions import order_position_names
 from modules.order_records import (
+    OrderRecordConflict,
     OrderRecordError,
+    OrderRecordNotFound,
     create_processed_order_record,
     latest_record_ids_by_source_filename,
     list_order_record_summaries,
+    list_route_trip_summaries,
+    load_order_record,
+    logistics_summary,
+    route_loading_ready,
+    save_store_shipment,
 )
 from modules.processed_files import (
     ProcessedFileError,
@@ -215,11 +223,13 @@ def _admin_session_for_router(router) -> bool:
 
 
 def _router_query_param(router, name: str) -> str:
-    page = getattr(router, "page", None)
-    params = getattr(page, "params", None)
+    url = getattr(router, "url", None)
+    params = getattr(url, "query_parameters", None)
     if params is None and isinstance(router, dict):
-        params = router.get("params", {})
-    if not isinstance(params, dict):
+        url = router.get("url", {})
+        params = url.get("query_parameters") if isinstance(url, dict) else None
+        params = params if params is not None else router.get("params", {})
+    if not hasattr(params, "get"):
         return ""
     value = params.get(name, "")
     return str(value[0] if isinstance(value, list) and value else value)
@@ -285,7 +295,7 @@ def _session(request: Request, mutate: bool = False):
     if session is None:
         return None, JSONResponse({"ok": False, "error": "Требуется вход"}, status_code=401)
     driver = driver_by_id(str(session.get("driver_id", "")))
-    if driver is None or not driver.get("active"):
+    if driver is None or not driver.get("active") or employee_role(driver) != "driver":
         driver_sessions.destroy_session(token)
         return None, JSONResponse({"ok": False, "error": "Профиль недоступен"}, status_code=401)
     cache_key = request.headers.get("x-driver-cache-key")
@@ -354,6 +364,89 @@ def _set_loader_cookie(response: JSONResponse, request: Request, token: str) -> 
 
 def _assignment_for_session(session: dict) -> dict | None:
     return driver_orders.find_assignment_for_driver(str(session.get("driver_id", "")))
+
+
+def _public_driver_assignment(assignment: dict | None) -> dict | None:
+    if assignment is None:
+        return None
+    payload = driver_orders.public_snapshot(assignment)
+    try:
+        payload["return_context"] = goods_returns.return_context(assignment)
+    except (goods_returns.GoodsReturnError, OrderRecordError) as error:
+        payload["return_context"] = {"eligible": False, "complete": False, "lines": [], "error": str(error)}
+    record_id = str(assignment.get("order_record_id", ""))
+    if not record_id:
+        payload["loading_status"] = "legacy_unlinked"
+        payload["shipment_status"] = "legacy_unlinked"
+        return payload
+    try:
+        record = load_order_record(record_id)
+        summary = logistics_summary(record)
+    except (OrderRecordError, OrderRecordNotFound):
+        payload["loading_status"] = "record_unavailable"
+        payload["shipment_status"] = "record_unavailable"
+        return payload
+    route_ready = route_loading_ready(record, str(assignment.get("route_key", "")))
+    payload["loading_status"] = "loaded" if route_ready else "waiting_loading"
+    payload["shipment_status"] = summary["shipment_status"]
+    return payload
+
+
+def _return_assignment(session: dict, assignment_id: str) -> dict:
+    assignment = driver_orders.load_snapshot(assignment_id)
+    if assignment.get("driver_id") != session.get("driver_id"):
+        raise DriverOrderNotFound("Назначение не найдено")
+    return assignment
+
+
+async def driver_returns(request: Request):
+    session, error = _session(request)
+    if error:
+        return error
+    try:
+        driver_id = str(session["driver_id"])
+        documents = [item for item in goods_returns.list_returns() if item["driver_id"] == driver_id]
+        assignments = [
+            {
+                "assignment_id": item["assignment_id"],
+                "route_label": str(item.get("route_label", "")),
+                "order_number": str(item.get("source_file", "")),
+                "created_at": str(item.get("created_at", "")),
+            }
+            for item in driver_orders.completed_assignments_for_driver(driver_id)
+        ]
+    except (goods_returns.GoodsReturnError, DriverOrderError) as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+    return JSONResponse(
+        {"ok": True, "returns": documents, "assignments": assignments},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def driver_return_detail(request: Request):
+    session, error = _session(request, mutate=request.method == "POST")
+    if error:
+        return error
+    try:
+        assignment = _return_assignment(session, request.path_params["assignment_id"])
+        if request.method == "GET":
+            result = {"ok": True, "context": goods_returns.return_context(assignment)}
+        else:
+            payload = await _json_payload(request)
+            if payload is None:
+                return JSONResponse({"ok": False, "error": "Некорректный запрос"}, status_code=400)
+            document = goods_returns.submit_return(
+                assignment, payload,
+                {"kind": "driver", "id": str(session["driver_id"]), "name": str(assignment.get("driver_name", ""))},
+            )
+            result = {"ok": True, "document": document}
+    except (DriverOrderNotFound, goods_returns.GoodsReturnNotFound) as missing:
+        return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
+    except goods_returns.GoodsReturnConflict as conflict:
+        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+    except (DriverOrderError, goods_returns.GoodsReturnError, OrderRecordError) as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 def _mileage_status(session: dict, assignment: dict | None = None) -> dict:
@@ -452,7 +545,7 @@ async def driver_me(request: Request):
         "ok": True,
         "driver": {"id": driver.get("id", ""), "name": driver.get("name", "")},
         "csrf_token": session["csrf_token"],
-        "assignment": driver_orders.public_snapshot(assignment) if assignment else None,
+        "assignment": _public_driver_assignment(assignment),
         "mileage": _mileage_status(session, assignment),
     })
 
@@ -527,7 +620,7 @@ async def driver_order(request: Request):
         return mileage_error
     if assignment is None:
         return JSONResponse({"ok": True, "assignment": None})
-    return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
+    return JSONResponse({"ok": True, "assignment": _public_driver_assignment(assignment)})
 
 
 async def driver_complete_store(request: Request):
@@ -544,17 +637,88 @@ async def driver_complete_store(request: Request):
     assignment = _assignment_for_session(session)
     if assignment is None:
         return JSONResponse({"ok": False, "error": "Активное назначение не найдено"}, status_code=404)
+    if payload.get("assignment_id", assignment["assignment_id"]) != assignment["assignment_id"]:
+        return JSONResponse(
+            {"ok": False, "error": "Операция относится к другому рейсу. Данные сохранены на устройстве."},
+            status_code=409,
+        )
     photo = str(payload.get("photo", ""))
     if ".." in photo or photo.startswith(("/", "\\")):
         return JSONResponse({"ok": False, "error": "Некорректная фотография"}, status_code=400)
+
+    measurements = payload.get("measurements")
+    legacy_quantities = not isinstance(measurements, dict)
+    if legacy_quantities:
+        measurements = payload.get("quantities", {})
+    if not isinstance(measurements, dict):
+        return JSONResponse({"ok": False, "error": "Некорректные данные отгрузки"}, status_code=400)
+    store_id = request.path_params["store_id"]
+    store = next(
+        (item for item in assignment.get("stores", []) if item.get("store_id") == store_id),
+        None,
+    )
+    if store is None:
+        return JSONResponse({"ok": False, "error": "Магазин не найден в назначении"}, status_code=404)
+    expected_line_ids = {str(line.get("line_id", "")) for line in store.get("lines", [])}
+    if set(measurements) != expected_line_ids:
+        return JSONResponse(
+            {"ok": False, "error": "Заполните отгрузку для каждой позиции"}, status_code=400
+        )
+    operation_id = str(payload.get("operation_id", ""))
+    known_operation = any(
+        operation.get("operation_id") == operation_id
+        for operation in assignment.get("operations", [])
+    )
+    if not known_operation and payload.get("base_revision", -1) != assignment.get("revision"):
+        return JSONResponse(
+            {"ok": False, "error": "Заказ уже изменён на другом устройстве"}, status_code=409
+        )
+
+    record_id = str(assignment.get("order_record_id", ""))
+    if record_id:
+        record_measurements = {}
+        for line in store.get("lines", []):
+            position_id = str(line.get("order_record_position_id", ""))
+            line_id = str(line.get("line_id", ""))
+            if not position_id or line_id not in measurements:
+                return JSONResponse(
+                    {"ok": False, "error": "Рейс не связан с позициями заказа"}, status_code=409
+                )
+            if legacy_quantities:
+                record_measurements[position_id] = {
+                    "legacy_net_weight_kg": measurements[line_id]
+                }
+            else:
+                record_measurements[position_id] = measurements[line_id]
+        try:
+            save_store_shipment(
+                record_id,
+                str(assignment.get("route_key", "")),
+                str(store.get("order_record_destination_id", "")),
+                record_measurements,
+                operation_id,
+                {
+                    "kind": "driver",
+                    "id": str(session.get("driver_id", "")),
+                    "name": str(assignment.get("driver_name", "")),
+                },
+            )
+        except OrderRecordNotFound as not_found:
+            return JSONResponse({"ok": False, "error": str(not_found)}, status_code=404)
+        except OrderRecordConflict as conflict:
+            return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+        except OrderRecordError as invalid:
+            return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+
     try:
         result = driver_orders.complete_store(
             driver_orders.sidecar_path(assignment["assignment_id"]),
-            request.path_params["store_id"],
-            payload.get("quantities", {}),
-            str(payload.get("operation_id", "")),
+            store_id,
+            measurements,
+            operation_id,
             payload.get("base_revision", -1),
             photo,
+            legacy_quantities=legacy_quantities,
         )
     except DriverOrderConflict as conflict:
         return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
@@ -562,7 +726,7 @@ async def driver_complete_store(request: Request):
         return JSONResponse({"ok": False, "error": str(not_found)}, status_code=404)
     except DriverOrderError as invalid:
         return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
-    return JSONResponse({"ok": True, "assignment": result})
+    return JSONResponse({"ok": True, "assignment": _public_driver_assignment(result)})
 
 
 async def driver_sync(request: Request):
@@ -575,7 +739,7 @@ async def driver_sync(request: Request):
         return mileage_error
     if assignment is None:
         return JSONResponse({"ok": True, "assignment": None})
-    return JSONResponse({"ok": True, "assignment": driver_orders.public_snapshot(assignment)})
+    return JSONResponse({"ok": True, "assignment": _public_driver_assignment(assignment)})
 
 
 async def loader_login(request: Request):
@@ -766,6 +930,8 @@ custom_api = Starlette(routes=[
     Route("/api/driver/order", driver_order, methods=["GET"]),
     Route("/api/driver/order/stores/{store_id}/complete", driver_complete_store, methods=["POST"]),
     Route("/api/driver/sync", driver_sync, methods=["POST"]),
+    Route("/api/driver/returns", driver_returns, methods=["GET"]),
+    Route("/api/driver/returns/{assignment_id}", driver_return_detail, methods=["GET", "POST"]),
     Route("/api/loader/login", loader_login, methods=["POST"]),
     Route("/api/loader/logout", loader_logout, methods=["POST"]),
     Route("/api/loader/me", loader_me, methods=["GET"]),
@@ -852,7 +1018,6 @@ SIDEBAR_HOVER = ui.STATUS_GRAY_BG
 SIDEBAR_SURFACE_ALT = ui.PAGE
 MAIL_APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
 UPLOAD_ID = "order_upload"
-INVOICE_UPLOAD_ID = "invoice_upload"
 INVOICE_OCR_UPLOAD_ID = "invoice_ocr_upload"
 VOLUME_CHART_DAYS = 31
 ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
@@ -886,23 +1051,31 @@ HELP_CHAT_MODEL_OPTIONS = list(HELP_CHAT_MODEL_BY_LABEL)
 VERSION_HISTORY = load_changelog()
 
 NAV_GROUPS = [
-    {"label": "Сводка", "icon": "layout_dashboard", "target": "Dashboard"},
-    {"label": "Заказы", "icon": "package", "target": "Заказы"},
-    {"label": "Рейсы", "icon": "route", "target": "Маршруты"},
-    {"label": "Накладные", "icon": "file_spreadsheet", "target": "OCR накладных"},
-    {"label": "Вес", "icon": "scale", "target": "Вес"},
-    {"label": "Настройки", "icon": "settings", "target": "Настройки"},
+    {'label': 'Сегодня', 'icon': 'layout_dashboard', 'target': 'Dashboard', 'section': 'Работа'},
+    {'label': 'Заказы', 'icon': 'package', 'target': 'Заказы', 'section': 'Работа'},
+    {'label': 'Рейсы', 'icon': 'route', 'target': 'Маршруты', 'section': 'Работа'},
+    {'label': 'Возвраты', 'icon': 'package', 'target': 'Возвраты', 'section': 'Работа'},
+    {'label': 'Накладные', 'icon': 'file_spreadsheet', 'target': 'OCR накладных', 'section': 'Работа'},
+    {'label': 'Шаблоны маршрутов', 'icon': 'list', 'target': 'Шаблоны маршрутов', 'section': 'Справочники'},
+    {'label': 'Водители и транспорт', 'icon': 'truck', 'target': 'Водители и транспорт', 'section': 'Справочники'},
+    {'label': 'Учёт веса', 'icon': 'scale', 'target': 'Вес', 'section': 'Дополнительно'},
+    {'label': 'Отчёт по отгрузкам', 'icon': 'list', 'target': 'Сданный товар', 'section': 'Дополнительно'},
+    {'label': 'Отслеживание', 'icon': 'map', 'target': 'Трекинг', 'section': 'Дополнительно'},
+    {'label': 'Настройки', 'icon': 'settings', 'target': 'Настройки', 'section': 'Сервис'},
+    {'label': 'Помощь', 'icon': 'info', 'target': 'Помощь', 'section': 'Сервис'},
 ]
 
 PAGE_GROUPS = {
     "Dashboard": "Сводка",
+    "Помощь": "Помощь",
     "Заказы": "Заказы",
     "Почта": "Заказы",
     "История": "Заказы",
     "Маршруты": "Рейсы",
-    "Трекинг": "Рейсы",
-    "Водители и транспорт": "Рейсы",
-    "Сданный товар": "Рейсы",
+    "Трекинг": "Дополнительно",
+    "Водители и транспорт": "Справочники",
+    "Сданный товар": "Дополнительно",
+    "Возвраты": "Возвраты",
     "OCR накладных": "Накладные",
     "Вес": "Вес",
     "Настройки": "Настройки",
@@ -911,8 +1084,10 @@ PAGE_GROUPS = {
 }
 
 PAGE_LABELS = {
-    "Dashboard": "Сводка дня",
+    "Dashboard": "Сегодня",
     **{page: page for page in PAGE_GROUPS if page != "Dashboard"},
+    "Маршруты": "Рейсы", "Вес": "Учёт веса", "Сданный товар": "Отчёт по отгрузкам",
+    "Трекинг": "Отслеживание", "OCR накладных": "Накладные", "Помощь": "Помощь",
 }
 
 GROUP_TABS = {
@@ -922,12 +1097,8 @@ GROUP_TABS = {
         {"label": "Почта", "page": "Почта", "icon": "mail"},
         {"label": "История", "page": "История", "icon": "history"},
     ],
-    "Рейсы": [
-        {"label": "Маршруты", "page": "Маршруты", "icon": "list"},
-        {"label": "Трекинг", "page": "Трекинг", "icon": "map"},
-        {"label": "Водители и транспорт", "page": "Водители и транспорт", "icon": "truck"},
-        {"label": "Сданный товар", "page": "Сданный товар", "icon": "list"},
-    ],
+    "Рейсы": [{"label": "Рейсы", "page": "Маршруты", "icon": "list"}],
+    "Справочники": [], "Дополнительно": [], "Возвраты": [], "Помощь": [],
     "Накладные": [
         {"label": "OCR накладных", "page": "OCR накладных", "icon": "camera"},
     ],
@@ -960,6 +1131,97 @@ class RouteGroupView(TypedDict):
     stores: list[RouteStoreView]
     collapsed: bool
     adding: bool
+
+
+DISPATCH_STAGES = ["Все", "Ожидает загрузки", "Загрузка начата", "Готов к отгрузке", "Отгрузка идёт", "Отгрузка завершена"]
+
+
+class DispatchStoreView(TypedDict):
+    id: str
+    name: str
+    completed: bool
+    status: str
+    shipped_net_kg: str
+
+
+class DispatchAssignmentView(TypedDict):
+    assignment_id: str
+    driver_name: str
+    vehicle_name: str
+    vehicle_plate: str
+    active: bool
+
+
+class DispatchTripView(TypedDict):
+    order_record_id: str
+    order_number: str
+    client_name: str
+    processed_at: str
+    processed_display: str
+    mode: str
+    route_key: str
+    route_label: str
+    stage: str
+    loading_ready: bool
+    limited_data: bool
+    loaded_net_kg: str
+    shipped_net_kg: str
+    completed_stores: int
+    store_count: int
+    stores: list[DispatchStoreView]
+    assignments: list[DispatchAssignmentView]
+    has_active_assignment: bool
+    return_label: str
+    return_net_kg: str
+    loading_href: str
+    search_text: str
+
+
+class DispatchRouteView(TypedDict):
+    route_key: str
+    label: str
+    trip_count: int
+    completed_stores: int
+    store_count: int
+
+
+def _dispatch_trips(processed_date: str, mode: str) -> list[DispatchTripView]:
+    trips = list_route_trip_summaries(processed_date, mode)
+    pairs = {(trip["order_record_id"], trip["route_key"]) for trip in trips}
+    assignments = driver_orders.route_assignment_summaries(pairs) if pairs else []
+    returns = {(doc["order_record_id"], doc["route_key"]): doc for doc in goods_returns.list_returns()} if pairs else {}
+    result = []
+    for trip in trips:
+        pair = (trip["order_record_id"], trip["route_key"])
+        linked = [item for item in assignments if (item["order_record_id"], item["route_key"]) == pair]
+        doc = returns.get(pair)
+        result.append({
+            **trip, "processed_display": datetime.fromisoformat(trip["processed_at"]).strftime("%d.%m.%Y %H:%M"),
+            "assignments": linked, "has_active_assignment": any(item["active"] and item["driver_id"] for item in linked),
+            "return_label": {"submitted": "Возврат на проверке", "accepted": "Возврат принят", "rejected": "Возврат отклонён"}.get(doc["status"], "") if doc else "",
+            "return_net_kg": doc["total_net_kg"] if doc else "",
+            "loading_href": f"/loading?order={quote(trip['order_record_id'], safe='')}&route={quote(trip['route_key'], safe='')}",
+            "search_text": " ".join([
+                trip["order_number"], trip["client_name"], trip["route_label"],
+                *(store["name"] for store in trip["stores"]),
+                *(" ".join((item["driver_name"], item["vehicle_name"], item["vehicle_plate"])) for item in linked),
+            ]).casefold(),
+        })
+    return result
+
+
+def _dispatch_routes(trips: list[dict], count: int, show_empty: bool) -> list[DispatchRouteView]:
+    routes = {f"route_{index + 1}": f"Маршрут №{index + 1}" for index in range(count)} if show_empty else {}
+    routes.update({trip["route_key"]: trip["route_label"] for trip in trips})
+    result = []
+    for key, label in sorted(routes.items(), key=lambda pair: (route_index_from_name(pair[1]) if route_index_from_name(pair[1]) is not None else MAX_ROUTES, pair[0])):
+        selected = [trip for trip in trips if trip["route_key"] == key]
+        result.append({
+            "route_key": key, "label": label, "trip_count": len(selected),
+            "completed_stores": sum(trip["completed_stores"] for trip in selected),
+            "store_count": sum(trip["store_count"] for trip in selected),
+        })
+    return result
 
 
 class DeliveryLineView(TypedDict):
@@ -1253,6 +1515,56 @@ class State(rx.State):
     current_page: str = "Dashboard"
     search_query: str = ""
     nav_groups: list[dict] = NAV_GROUPS
+    mobile_menu_open: bool = False
+    today_mode: str = "Область"
+    today_waiting: int = 0
+    today_drafts: int = 0
+    today_ready: int = 0
+    today_shipping: int = 0
+    today_completed: int = 0
+    today_returns: int = 0
+    today_error: str = ""
+
+    def toggle_mobile_menu(self):
+        self.mobile_menu_open = not self.mobile_menu_open
+
+    def close_mobile_menu(self):
+        self.mobile_menu_open = False
+
+    def navigate(self, target: str):
+        if target == "Шаблоны маршрутов":
+            self.mobile_menu_open = False
+            self.current_page = "Маршруты"
+            self.open_routes_editor()
+            return
+        if target == "Маршруты" and self.routes_editor_open:
+            self.mobile_menu_open = False
+            return self.close_routes_editor()
+        return self.set_page(target)
+
+    def load_today_overview(self):
+        self.today_error = ""
+        try:
+            trips = list_route_trip_summaries(datetime.now().astimezone().date().isoformat(), self.today_mode)
+            self.today_waiting = sum(t["stage"] == "Ожидает загрузки" for t in trips)
+            self.today_drafts = sum(t["stage"] == "Загрузка начата" for t in trips)
+            self.today_ready = sum(t["stage"] == "Готов к отгрузке" for t in trips)
+            self.today_shipping = sum(t["stage"] == "Отгрузка идёт" for t in trips)
+            self.today_completed = sum(t["stage"] == "Отгрузка завершена" for t in trips)
+            self.today_returns = sum(doc.get("status") == "submitted" for doc in goods_returns.list_returns())
+        except (OrderRecordError, goods_returns.GoodsReturnError, OSError, ValueError) as error:
+            self.today_error = f"Не удалось обновить обзор: {error}"
+
+    def set_today_mode(self, value: str):
+        if value in {"Город", "Область"}:
+            self.today_mode = value
+            self.load_today_overview()
+
+    def open_today_stage(self, stage: str):
+        self.dispatch_date = datetime.now().astimezone().date().isoformat()
+        self.dispatch_mode = self.today_mode
+        self.dispatch_stage = stage if stage in DISPATCH_STAGES else "Все"
+        return self.set_page("Маршруты")
 
     is_authenticated: bool = False
 
@@ -1272,6 +1584,7 @@ class State(rx.State):
         if not self.is_authenticated:
             return rx.redirect("/login", replace=True)
         self.load_history()
+        self.load_today_overview()
         if _router_query_param(self.router, "page") == "history":
             self.current_page = "История"
 
@@ -1281,6 +1594,19 @@ class State(rx.State):
             return rx.redirect("/", replace=True)
 
     routes_source: str = "Область"
+    routes_editor_open: bool = False
+    route_editor_baseline: list[list[str]] = []
+    route_editor_pending_action: str = ""
+    route_editor_pending_value: str = ""
+    route_editor_error: str = ""
+    dispatch_date: str = ""
+    dispatch_mode: str = "Область"
+    dispatch_stage: str = "Все"
+    dispatch_selected_route: str = ""
+    dispatch_mobile_detail: bool = False
+    dispatch_trips: list[DispatchTripView] = []
+    dispatch_route_count: int = DEFAULT_ROUTE_COUNT
+    dispatch_message: str = ""
     # Списки по маршрутам (индексы 0..MAX_ROUTES-1 соответствуют ROUTE_KEYS);
     # сколько из них реально показываются — active_route_count.
     route_stores: list[list[str]] = [[] for _ in range(MAX_ROUTES)]
@@ -1346,7 +1672,7 @@ class State(rx.State):
     invoice_search: str = ""
     order_detail_status: str = ""
 
-    tracking_view: str = "Симуляция"
+    tracking_view: str = "Реальные данные"
     real_vehicles: list[dict] = []
     real_watching: bool = False
 
@@ -1383,6 +1709,17 @@ class State(rx.State):
     delivery_line_count: int = 0
     delivery_summary: list[DeliverySummaryView] = []
     delivery_items: list[DeliveryItemView] = []
+    returns_items: list[dict] = []
+    returns_status_filter: str = "Все"
+    returns_route_filter: str = "Все"
+    returns_driver_filter: str = "Все"
+    returns_date_from: str = ""
+    returns_date_to: str = ""
+    returns_message: str = ""
+    returns_decision_id: str = ""
+    returns_decision_revision: int = 0
+    returns_decision_kind: str = ""
+    returns_decision_comment: str = ""
     fleet_vehicle_id: str = ""
     fleet_vehicle_name: str = ""
     fleet_vehicle_plate: str = ""
@@ -1450,18 +1787,24 @@ class State(rx.State):
 
     @rx.var
     def current_group(self) -> str:
+        if self.current_page == "Маршруты" and self.routes_editor_open:
+            return "Справочники"
         return PAGE_GROUPS.get(self.current_page, "Сводка")
 
     @rx.var
     def current_page_label(self) -> str:
+        if self.current_page == "Маршруты" and self.routes_editor_open:
+            return "Шаблоны маршрутов"
         return PAGE_LABELS.get(self.current_page, self.current_page)
 
     @rx.var
     def current_tabs(self) -> list[dict]:
-        return GROUP_TABS.get(self.current_group, GROUP_TABS["Сводка"])
+        return GROUP_TABS.get(self.current_group, [])
 
     def set_search_query(self, value: str):
         self.search_query = value
+        if self.current_page == "Маршруты" and not self.routes_editor_open:
+            self._select_visible_dispatch_route()
 
     @rx.var
     def weight_visible_rows(self) -> list[dict]:
@@ -1556,26 +1899,41 @@ class State(rx.State):
         return format_decimal(total)
 
     def set_page(self, page: str):
+        self.mobile_menu_open = False
+        if getattr(self, "routes_editor_open", False) and page != "Маршруты" and self.route_editor_baseline != self.route_stores:
+            self.route_editor_pending_action = "page"
+            self.route_editor_pending_value = page
+            return
+        if page != "Маршруты":
+            self.routes_editor_open = False
         self.current_page = page
 
-        if page == "История":
+        if page == "Dashboard":
+            self.load_history()
+            self.load_today_overview()
+        elif page == "История":
             self.load_history()
         elif page == "Заказы":
             self.load_route_drivers_form()
         elif page == "Маршруты":
-            self.load_routes()
+            if not self.routes_editor_open:
+                self.load_dispatch()
         elif page == "Настройки":
             self.load_settings_form()
             self.load_ai_settings_form()
             self.load_gdemoi_settings_form()
         elif page == "Резервные копии":
             self.load_backups()
-        elif page == "Трекинг" and not self.vehicles:
-            self.init_tracking()
+        elif page == "Трекинг":
+            self.refresh_real_data()
+            if not self.vehicles:
+                self.init_tracking()
         elif page == "Водители и транспорт":
             self.load_fleet()
         elif page == "Сданный товар":
             self.load_delivery_report()
+        elif page == "Возвраты":
+            self.load_returns_report()
         elif page == "Вес":
             self.load_weight()
         elif page == "OCR накладных":
@@ -2285,13 +2643,133 @@ class State(rx.State):
     def stores_file(self) -> Path:
         return paths.stores_file_for(self.routes_source)
 
+    def load_dispatch(self):
+        if not self.dispatch_date:
+            self.dispatch_date = datetime.now().astimezone().date().isoformat()
+        self.dispatch_message = ""
+        try:
+            self.dispatch_route_count = load_route_count()
+            self.dispatch_trips = _dispatch_trips(self.dispatch_date, self.dispatch_mode)
+        except (OrderRecordError, DriverOrderError, goods_returns.GoodsReturnError, OSError, ValueError) as error:
+            self.dispatch_trips = []
+            self.dispatch_message = f"Не удалось загрузить рейсы: {error}"
+        self._select_visible_dispatch_route()
+
+    @rx.var
+    def dispatch_filtered_trips(self) -> list[DispatchTripView]:
+        query = self.search_query.strip().casefold()
+        return [trip for trip in self.dispatch_trips
+                if (self.dispatch_stage == "Все" or trip["stage"] == self.dispatch_stage)
+                and (not query or query in trip["search_text"])]
+
+    @rx.var
+    def dispatch_routes(self) -> list[DispatchRouteView]:
+        return _dispatch_routes(self.dispatch_filtered_trips, self.dispatch_route_count,
+                                self.dispatch_stage == "Все" and not self.search_query.strip())
+
+    @rx.var
+    def dispatch_selected_trips(self) -> list[DispatchTripView]:
+        return [trip for trip in self.dispatch_filtered_trips if trip["route_key"] == self.dispatch_selected_route]
+
+    @rx.var
+    def dispatch_selected_label(self) -> str:
+        return next((route["label"] for route in self.dispatch_routes if route["route_key"] == self.dispatch_selected_route), "Маршрут не выбран")
+
+    def _select_visible_dispatch_route(self):
+        routes = self.dispatch_routes
+        keys = {route["route_key"] for route in routes}
+        if self.dispatch_selected_route not in keys:
+            self.dispatch_selected_route = routes[0]["route_key"] if routes else ""
+            self.dispatch_mobile_detail = False
+
+    def set_dispatch_date(self, value: str):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            return
+        self.dispatch_date = value
+        self.load_dispatch()
+
+    def set_dispatch_mode(self, value: str):
+        if value not in {"Город", "Область"}:
+            return
+        self.dispatch_mode = value
+        self.load_dispatch()
+
+    def set_dispatch_stage(self, value: str):
+        if value not in DISPATCH_STAGES:
+            return
+        self.dispatch_stage = value
+        self._select_visible_dispatch_route()
+
+    def reset_dispatch_filters(self):
+        self.dispatch_stage = "Все"
+        self.search_query = ""
+        self._select_visible_dispatch_route()
+
+    def select_dispatch_route(self, route_key: str):
+        if route_key not in {route["route_key"] for route in self.dispatch_routes}:
+            return
+        self.dispatch_selected_route = route_key
+        self.dispatch_mobile_detail = True
+
+    def back_to_dispatch_routes(self):
+        self.dispatch_mobile_detail = False
+
+    def open_routes_editor(self):
+        if self.routes_editor_open:
+            return
+        self.routes_source = self.dispatch_mode
+        self.load_routes()
+        self.routes_editor_open = True
+        self.route_editor_pending_action = ""
+        self.route_editor_error = ""
+
+    def close_routes_editor(self):
+        if self.route_editor_baseline != self.route_stores:
+            self.route_editor_pending_action = "overview"
+            self.route_editor_pending_value = ""
+            return
+        self.routes_editor_open = False
+        self.search_query = ""
+        self.load_dispatch()
+
+    def cancel_route_editor_transition(self):
+        self.route_editor_pending_action = ""
+        self.route_editor_pending_value = ""
+        self.route_editor_error = ""
+
+    def finish_route_editor_transition(self, save: bool):
+        if not self.route_editor_pending_action:
+            return
+        if save:
+            try:
+                self.save_routes()
+            except (OSError, ValueError) as error:
+                self.route_editor_error = f"Не удалось сохранить маршруты: {error}"
+                return
+        else:
+            self.route_stores = [list(names) for names in self.route_editor_baseline]
+        action, value = self.route_editor_pending_action, self.route_editor_pending_value
+        self.cancel_route_editor_transition()
+        if action == "source":
+            self.routes_source = value
+            self.load_routes()
+        elif action == "page":
+            self.routes_editor_open = False
+            return self.set_page(value)
+        else:
+            self.routes_editor_open = False
+            self.search_query = ""
+            self.load_dispatch()
+
     def load_routes(self):
         data = load_stores(self.stores_file)
         self.route_stores = [list(data.get(key, [])) for key in ROUTE_KEYS]
+        self.route_editor_baseline = [list(names) for names in self.route_stores]
         self.active_route_count = load_route_count()
         drivers = load_route_drivers()
         self.route_driver_names = [drivers.get(key, "----") for key in ROUTE_KEYS]
-        self.refresh_real_data()
         self.search_query = ""
         if self.selected_route_index >= self.active_route_count:
             self.selected_route_index = 0
@@ -2309,12 +2787,6 @@ class State(rx.State):
 
     @rx.var
     def route_groups(self) -> list[RouteGroupView]:
-        """Маршруты для таблицы: только сохранённые магазины и реальные статусы водителей."""
-
-        real_by_index = {
-            int(vehicle.get("route_index", -1)): vehicle
-            for vehicle in self.real_vehicles
-        }
         query = self.search_query.strip().lower()
         groups = []
 
@@ -2331,23 +2803,13 @@ class State(rx.State):
             else:
                 driver_initials = ""
 
-            vehicle = real_by_index.get(index, {})
-            status_by_store = {
-                str(stop.get("name", "")).strip().lower(): stop.get("status", "pending")
-                for stop in vehicle.get("stops", [])
-            }
             source_stores = self.route_stores[index] if index < len(self.route_stores) else []
             group_matches = query in " ".join((route_label, area, driver)).lower()
             stores = []
             for name in source_stores:
                 if query and not group_matches and query not in name.lower():
                     continue
-                done = status_by_store.get(name.strip().lower()) == "done"
-                stores.append({
-                    "name": name,
-                    "status": "Отгружен" if done else "Ожидает",
-                    "done": done,
-                })
+                stores.append({"name": name, "status": "Шаблон", "done": False})
 
             if query and not group_matches and not stores:
                 continue
@@ -2473,6 +2935,12 @@ class State(rx.State):
         self.refresh_route_backups()
 
     def set_routes_source(self, value: str):
+        if value not in {"Город", "Область"} or value == self.routes_source:
+            return
+        if getattr(self, "routes_editor_open", False) and self.route_editor_baseline != self.route_stores:
+            self.route_editor_pending_action = "source"
+            self.route_editor_pending_value = value
+            return
         self.routes_source = value
         self.load_routes()
 
@@ -2510,6 +2978,7 @@ class State(rx.State):
             append_route_backup(self.routes_source, previous, "перед сохранением")
 
         save_stores(routes_dict(self.route_stores), stores_file)
+        self.route_editor_baseline = [list(names) for names in self.route_stores]
 
         self.refresh_route_backups()
         self.routes_status = f"Сохранено в {stores_file}"
@@ -3595,6 +4064,98 @@ class State(rx.State):
         self.delivery_summary = report["summary"]
         self.delivery_items = report["deliveries"]
 
+    def load_returns_report(self):
+        if not _admin_session_for_router(self.router):
+            self.returns_items = []
+            return rx.redirect("/login", replace=True)
+        try:
+            self.returns_items = [_return_view(item) for item in goods_returns.list_returns()]
+        except goods_returns.GoodsReturnError as error:
+            self.returns_items = []
+            self.returns_message = str(error)
+
+    @rx.var
+    def returns_filtered(self) -> list[dict]:
+        return [
+            item for item in self.returns_items
+            if (self.returns_status_filter == "Все" or item["status_label"] == self.returns_status_filter)
+            and (self.returns_route_filter == "Все" or item["route_label"] == self.returns_route_filter)
+            and (self.returns_driver_filter == "Все" or item["driver_filter"] == self.returns_driver_filter)
+            and (not self.returns_date_from or item["submitted_at"][:10] >= self.returns_date_from)
+            and (not self.returns_date_to or item["submitted_at"][:10] <= self.returns_date_to)
+        ]
+
+    @rx.var
+    def returns_route_options(self) -> list[str]:
+        return ["Все"] + sorted({item["route_label"] for item in self.returns_items})
+
+    @rx.var
+    def returns_driver_options(self) -> list[str]:
+        return ["Все"] + sorted({item["driver_filter"] for item in self.returns_items})
+
+    @rx.var
+    def returns_totals(self) -> dict[str, str]:
+        items = self.returns_filtered
+        return {
+            "submitted": str(sum(item["status"] == "submitted" for item in items)),
+            "accepted": str(sum(item["status"] == "accepted" for item in items)),
+            "rejected": str(sum(item["status"] == "rejected" for item in items)),
+            "pending_kg": format_decimal(sum((Decimal(item["total_net_kg"]) for item in items if item["status"] == "submitted"), Decimal(0))),
+            "accepted_kg": format_decimal(sum((Decimal(item["total_net_kg"]) for item in items if item["status"] == "accepted"), Decimal(0))),
+        }
+
+    def set_returns_filter(self, field: str, value: str):
+        if field not in {"status", "route", "driver", "date_from", "date_to"}:
+            return
+        if field.startswith("date_"):
+            if value:
+                try:
+                    datetime.strptime(value, "%Y-%m-%d")
+                except ValueError:
+                    return
+            setattr(self, f"returns_{field}", value)
+        else:
+            setattr(self, f"returns_{field}_filter", value)
+
+    def begin_return_decision(self, document_id: str, decision: str):
+        if not _admin_session_for_router(self.router):
+            return rx.redirect("/login", replace=True)
+        item = next((row for row in self.returns_items if row["id"] == document_id), None)
+        if item is None or item["status"] != "submitted" or decision not in {"accepted", "rejected"}:
+            return
+        self.returns_decision_id = document_id
+        self.returns_decision_revision = int(item["revision"])
+        self.returns_decision_kind = decision
+        self.returns_decision_comment = ""
+        self.returns_message = ""
+
+    def set_return_decision_comment(self, value: str):
+        self.returns_decision_comment = value[:2000]
+
+    def cancel_return_decision(self):
+        self.returns_decision_id = ""
+        self.returns_decision_kind = ""
+        self.returns_decision_comment = ""
+
+    def confirm_return_decision(self):
+        if not _admin_session_for_router(self.router):
+            return rx.redirect("/login", replace=True)
+        if not self.returns_decision_id:
+            return
+        try:
+            goods_returns.decide_return(
+                self.returns_decision_id, self.returns_decision_revision,
+                self.returns_decision_kind, self.returns_decision_comment,
+                {"kind": "dashboard", "id": "admin", "name": "Администратор"},
+            )
+        except goods_returns.GoodsReturnError as error:
+            self.returns_message = str(error)
+            self.load_returns_report()
+            return
+        self.cancel_return_decision()
+        self.load_returns_report()
+        self.returns_message = "Решение сохранено"
+
     def load_fleet(self):
         data = load_fleet()
         vehicles_by_id = {item.get("id", ""): item for item in data["vehicles"]}
@@ -3931,8 +4492,9 @@ class State(rx.State):
             self.output_file = str(output_file)
             self.log_file = str(log_file)
             self.order_record_warning = ""
+            order_record = None
             try:
-                create_processed_order_record(
+                order_record = create_processed_order_record(
                     self.output_file,
                     self.selected_file,
                     self.order_client_name,
@@ -3958,6 +4520,7 @@ class State(rx.State):
                         self.mode,
                         self.selected_file,
                         published_assignments,
+                        order_record,
                     )
             self.route_assignments = []
             self.status = "Обработка завершена"
@@ -4058,45 +4621,6 @@ def icon_button(icon: str, on_click=None, label: str = "", disabled=False):
         border=f"1px solid {ui.LINE}",
         _hover={"background": ui.STATUS_GRAY_BG, "color": ui.INK},
         **button_base(),
-    )
-
-
-def nav_button(label: str, icon: str):
-    active = State.current_page == label
-
-    children = [
-        fa_icon(tag=icon, size=19),
-        rx.text(label, font_size=ui.FONT_SIZE_BODY),
-    ]
-    if label == "Почта":
-        children.extend([
-            rx.spacer(),
-            rx.cond(
-                State.mail_new_orders_count > 0,
-                rx.box(
-                    State.mail_new_orders_count,
-                    color=ui.STATUS_RED_TEXT,
-                    background=ui.STATUS_RED_BG,
-                    border_radius=ui.RADIUS_PILL,
-                    padding="1px 7px",
-                    font_size=ui.FONT_SIZE_CAPTION,
-                    font_weight=ui.FONT_WEIGHT_SEMIBOLD,
-                ),
-                rx.box(),
-            ),
-        ])
-
-    return rx.button(
-        *children,
-        on_click=State.set_page(label),
-        width="100%",
-        justify_content="flex-start",
-        gap="8px",
-        color=rx.cond(active, ui.PURPLE, ui.INK_2),
-        background=rx.cond(active, ui.PURPLE_BG, ui.TRANSPARENT),
-        border="1px solid transparent",
-        _hover={"background": rx.cond(active, ui.PURPLE_BG, ui.STATUS_GRAY_BG)},
-        **button_base(font_weight=rx.cond(active, ui.FONT_WEIGHT_MEDIUM, ui.FONT_WEIGHT_REGULAR)),
     )
 
 
@@ -4257,114 +4781,65 @@ def navigation_icon(name, size=19):
     )
 
 
+def theme_selector():
+    return rx.el.select(
+        rx.el.option("Как на устройстве", value="system"),
+        rx.el.option("Светлая", value="light"),
+        rx.el.option("Тёмная", value="dark"),
+        aria_label="Тема оформления", custom_attrs={"data-theme-select": ""},
+        class_name="theme-select", default_value="system",
+    )
+
+
 def sidebar_logo():
-    return rx.box(
-        "Э",
-        display="flex",
-        align_items="center",
-        justify_content="center",
-        width="32px",
-        height="32px",
-        min_height="32px",
-        color=ui.WHITE,
-        background=ui.PURPLE,
-        border_radius=ui.RADIUS_CONTROL,
-        font_size="15px",
-        font_weight=ui.FONT_WEIGHT_SEMIBOLD,
-        margin_bottom="8px",
-        aria_label="Склад",
+    return rx.hstack(
+        rx.box("Д", class_name="app-brand-mark"),
+        rx.vstack(rx.text("Доставка", font_weight="600"), muted_text("Рабочее место"), spacing="0"),
+        class_name="app-brand", align="center", spacing="2",
     )
 
 
 def rail_item(item):
-    active = State.current_group == item["label"]
+    if item["target"] == "Шаблоны маршрутов":
+        active = (State.current_page == "Маршруты") & State.routes_editor_open
+    else:
+        active = (State.current_page == item["target"]) & ~((State.current_page == "Маршруты") & State.routes_editor_open)
     return rx.button(
-        navigation_icon(item["icon"], 20),
-        rx.text(item["label"], class_name="app-rail-label", font_size="10px", line_height="1.1"),
-        on_click=State.set_page(item["target"]),
-        aria_label=item["label"],
-        width="52px",
-        min_width="52px",
-        height="52px",
-        padding="6px 2px",
-        display="flex",
-        flex_direction="column",
-        align_items="center",
-        justify_content="center",
-        gap="3px",
-        color=rx.cond(active, ui.PURPLE, ui.INK_2),
-        background=rx.cond(active, ui.PURPLE_BG, ui.TRANSPARENT),
-        border="1px solid transparent",
-        border_radius=ui.RADIUS_CONTROL,
-        font_weight=ui.FONT_WEIGHT_REGULAR,
-        _hover={"background": rx.cond(active, ui.PURPLE_BG, ui.STATUS_GRAY_BG)},
-        class_name="app-rail-item prototype-interactive",
+        navigation_icon(item["icon"], 18), rx.text(item["label"]),
+        on_click=State.navigate(item["target"]), aria_label=item["label"], aria_pressed=active,
+        class_name=rx.cond(active, "app-nav-item app-nav-active", "app-nav-item"),
     )
 
 
 def loading_rail_item():
-    return rx.button(
-        navigation_icon("package", 20),
-        rx.text("Загрузка", class_name="app-rail-label", font_size="10px", line_height="1.1"),
-        on_click=rx.redirect("/loading"),
-        aria_label="Загрузка",
-        width="52px",
-        min_width="52px",
-        height="52px",
-        padding="6px 2px",
-        display="flex",
-        flex_direction="column",
-        align_items="center",
-        justify_content="center",
-        gap="3px",
-        color=ui.INK_2,
-        background=ui.TRANSPARENT,
-        border="1px solid transparent",
-        border_radius=ui.RADIUS_CONTROL,
-        font_weight=ui.FONT_WEIGHT_REGULAR,
-        _hover={"background": ui.STATUS_GRAY_BG},
-        class_name="app-rail-item prototype-interactive",
-    )
+    return rx.button(navigation_icon("package", 18), rx.text("Загрузка и сверка"),
+                     on_click=rx.redirect("/loading"), class_name="app-nav-item", aria_label="Загрузка и сверка")
 
 
 def sidebar():
-    return rx.vstack(
-        sidebar_logo(),
-        rx.foreach(State.nav_groups, rail_item),
-        loading_rail_item(),
-        align="center",
-        spacing="1",
-        width="64px",
-        min_width="64px",
-        height="100vh",
-        padding="12px 0",
-        background=ui.PANEL,
-        border_right=f"1px solid {ui.LINE}",
-        position="sticky",
-        top="0",
-        overflow_y="auto",
-        class_name="app-rail",
+    return rx.fragment(
+        rx.cond(State.mobile_menu_open,
+                rx.button(aria_label="Закрыть меню", on_click=State.close_mobile_menu, class_name="app-menu-backdrop"),
+                rx.box(display="none")),
+        rx.vstack(
+            rx.hstack(sidebar_logo(), rx.button("Закрыть", on_click=State.close_mobile_menu, class_name="app-mobile-only"), width="100%", align="center"),
+            *[rx.vstack(
+                rx.text(section, class_name="app-nav-section"),
+                *[rail_item(item) for item in NAV_GROUPS if item["section"] == section],
+                *([loading_rail_item()] if section == "Работа" else []),
+                spacing="1", width="100%", align="start",
+            ) for section in ["Работа", "Справочники", "Дополнительно", "Сервис"]],
+            rx.spacer(), rx.text("Оформление", class_name="app-nav-section"), theme_selector(),
+            class_name=rx.cond(State.mobile_menu_open, "app-sidebar app-sidebar-open", "app-sidebar"),
+            spacing="3", align="start",
+        ),
     )
 
 
 def app_header():
     return rx.hstack(
-        rx.hstack(
-            fa_icon(tag="warehouse", size=16, color=ui.INK_2),
-            rx.text("Склад", color=ui.INK_2),
-            fa_icon(tag="chevron_right", size=14, color=ui.INK_3),
-            rx.text(State.current_group, color=ui.INK_2),
-            fa_icon(tag="chevron_right", size=14, color=ui.INK_3),
-            rx.text(
-                State.current_page_label,
-                color=ui.INK,
-                font_weight=ui.FONT_WEIGHT_MEDIUM,
-            ),
-            class_name="app-header-breadcrumb",
-            spacing="2",
-            align="center",
-            min_width="0",
-        ),
+        rx.button(fa_icon(tag="menu", size=20), on_click=State.toggle_mobile_menu, aria_label="Открыть меню", aria_expanded=State.mobile_menu_open, class_name="app-menu-button"),
+        rx.text(State.current_page_label, font_weight="600", class_name="app-header-title"),
         rx.spacer(),
         rx.cond(
             (State.current_page == "Маршруты") | (State.current_page == "OCR накладных"),
@@ -4373,7 +4848,8 @@ def app_header():
                 rx.input(
                     value=State.search_query,
                     on_change=State.set_search_query,
-                    placeholder="Найти магазин или товар",
+                    placeholder=rx.cond(State.current_page == "Маршруты", "Заказ, магазин, водитель…", "Найти магазин или товар"),
+                    aria_label="Поиск по текущему разделу",
                     variant="soft",
                     border="0",
                     background=ui.TRANSPARENT,
@@ -4393,8 +4869,9 @@ def app_header():
             rx.box(),
         ),
         secondary_button("Выйти", on_click=State.logout, width="72px"),
+        class_name="app-header",
         width="100%",
-        height="52px",
+        height="56px",
         min_height="52px",
         padding="0 16px",
         background=ui.PANEL,
@@ -4433,29 +4910,20 @@ def page_primary_action():
         ),
         (
             "Маршруты",
-            primary_button("Добавить маршрут", on_click=State.add_route, width="170px"),
+            rx.cond(State.routes_editor_open, primary_button("Добавить маршрут", on_click=State.add_route, width="170px"), rx.box()),
         ),
         rx.box(),
     )
 
 
 def app_tabs():
-    return rx.hstack(
+    return rx.cond(
+        (State.current_tabs.length() > 1) | (State.current_page == "Dashboard") | State.routes_editor_open,
         rx.hstack(
-            rx.foreach(State.current_tabs, page_tab),
-            spacing="0",
-            overflow_x="auto",
-            min_width="0",
-        ),
-        rx.spacer(),
-        page_primary_action(),
-        width="100%",
-        min_height="45px",
-        padding="0 16px",
-        background=ui.PANEL,
-        border_bottom=f"1px solid {ui.LINE}",
-        align="center",
-        spacing="3",
+            rx.cond(State.current_tabs.length() > 1, rx.hstack(rx.foreach(State.current_tabs, page_tab), spacing="0", overflow_x="auto", min_width="0"), rx.box(display="none")),
+            rx.spacer(), page_primary_action(), width="100%", min_height="45px", padding="0 20px",
+            background=ui.PANEL, border_bottom=f"1px solid {ui.LINE}", align="center", spacing="3", class_name="app-tabs",
+        ), rx.box(display="none"),
     )
 
 
@@ -4535,10 +5003,9 @@ def order_panel():
             ),
             width="100%",
             align="center",
-            padding="14px 16px",
-            border=f"1px solid {border()}",
-            border_radius="10px",
-            background=surface_alt(),
+            padding="12px 0",
+            border="0",
+            background=ui.TRANSPARENT,
         ),
         rx.cond(
             State.duplicate_note != "",
@@ -4568,10 +5035,9 @@ def order_panel():
             align="start",
             spacing="2",
             width="100%",
-            padding="14px 16px",
-            border=f"1px solid {border()}",
-            border_radius="10px",
-            background=surface_alt(),
+            padding="12px 0",
+            border="0",
+            background=ui.TRANSPARENT,
         ),
         rx.hstack(
             rx.vstack(
@@ -4594,10 +5060,9 @@ def order_panel():
             ),
             width="100%",
             align="center",
-            padding="14px 16px",
-            border=f"1px solid {border()}",
-            border_radius="10px",
-            background=surface_alt(),
+            padding="12px 0",
+            border="0",
+            background=ui.TRANSPARENT,
         ),
         rx.cond(
             State.preview_ready,
@@ -4623,8 +5088,9 @@ def order_panel():
             ),
             rx.box(),
         ),
-        spacing="5",
-        padding="18px",
+        class_name="order-form",
+        spacing="4",
+        padding="20px",
         border=f"1px solid {border()}",
         border_radius="14px",
         background=surface(),
@@ -4940,9 +5406,9 @@ def page_shell(*children):
 
 
 def topbar(title: str, subtitle: str, actions=None):
-    del title
     return rx.hstack(
-        rx.text(subtitle, color=ui.INK_2, font_size=ui.FONT_SIZE_LABEL),
+        rx.vstack(rx.heading(PAGE_LABELS.get(title, title), size="5"),
+                  rx.text(subtitle, color=ui.INK_2, font_size=ui.FONT_SIZE_LABEL), align="start", spacing="1"),
         rx.spacer(),
         *(actions or []),
         width="100%",
@@ -5032,40 +5498,32 @@ def dashboard_tracking_preview():
     )
 
 
+def _today_action(label, count, action, note):
+    return rx.button(
+        rx.hstack(rx.vstack(rx.text(label, font_weight="600"), muted_text(note), align="start", spacing="1"),
+                  rx.spacer(), rx.text(count, class_name="today-count"), fa_icon(tag="chevron_right", size=18), width="100%", align="center"),
+        on_click=action, class_name="today-action",
+    )
+
+
 def overview_page():
     return page_shell(
-        topbar(
-            "Dashboard",
-            "Обзор: заказы, магазины и маршруты — и переход в нужный раздел.",
-        ),
-        rx.grid(
-            stat_card(
-                "package", "green",
-                "Заказы сегодня", State.orders_today_count,
-                muted_text("Всего обработано: ", State.orders_total_count),
-            ),
-            stat_card(
-                "store", "blue",
-                "Магазинов в базе", State.stores_total_count,
-                muted_text("Город + Область"),
-            ),
-            stat_card(
-                "route", "violet",
-                "Маршрутов", 4,
-                muted_text("готовы к выгрузке"),
-            ),
-            columns="3",
-            spacing="4",
-            width="100%",
-        ),
-        rx.grid(
-            volume_chart_panel(),
-            dashboard_tracking_preview(),
-            columns="2",
-            spacing="4",
-            width="100%",
-            align_items="start",
-        ),
+        topbar("Сегодня", "Работа по заказам, обработанным сегодня. Выберите направление."),
+        rx.hstack(segmented_control(["Город", "Область"], State.today_mode, State.set_today_mode),
+                  rx.spacer(), secondary_button("Обновить", on_click=[State.load_history, State.load_today_overview], width="110px"),
+                  width="100%", wrap="wrap", align="center"),
+        rx.cond(State.today_error != "", rx.text(State.today_error, role="alert", color=ui.STATUS_RED_TEXT),
+            rx.vstack(
+                _today_action("Ожидают загрузки", State.today_waiting, State.open_today_stage("Ожидает загрузки"), "Загрузка ещё не начата"),
+                _today_action("Загрузка начата", State.today_drafts, State.open_today_stage("Загрузка начата"), "Черновики, ожидающие подтверждения"),
+                _today_action("Готовы к отгрузке", State.today_ready, State.open_today_stage("Готов к отгрузке"), "Загрузка подтверждена"),
+                _today_action("Отгрузка идёт", State.today_shipping, State.open_today_stage("Отгрузка идёт"), "Есть подтверждённые позиции отгрузки"),
+                _today_action("Отгрузка завершена", State.today_completed, State.open_today_stage("Отгрузка завершена"), "Все магазины рейса завершены"),
+                _today_action("Возвраты на проверке", State.today_returns, State.set_page("Возвраты"), "Все даты и направления"),
+                spacing="0", width="100%", class_name="today-queue",
+            )),
+        muted_text("Обработано заказов сегодня: ", State.orders_today_count, ". За весь период: ", State.orders_total_count, "."),
+        rx.el.details(rx.el.summary("История объёмов", class_name="dispatch-store-summary"), volume_chart_panel(), width="100%"),
     )
 
 
@@ -5452,10 +5910,12 @@ def weight_page():
     return page_shell(
         topbar(
             "Вес",
-            "Три этапа за день: загрузка утром, выгрузка остатка вечером и отгрузка по магазинам. "
-            "Если взвесили с ящиками — впишите грязный вес: чистый вес = грязный вес − "
-            "кол-во ящиков × средний вес ящика. Если чистый вес уже известен — впишите его "
-            "напрямую в поле «Чистый вес», тара вычитаться не будет.",
+            "Отдельный журнал взвешиваний. Загрузка конкретного рейса вводится на странице «Загрузка и сверка».",
+        ),
+        rx.el.details(
+            rx.el.summary("Как рассчитывается вес", class_name="dispatch-store-summary"),
+            muted_text("Нетто = брутто − ящики × тара одного ящика. В этом журнале также можно ввести известный чистый вес напрямую. Этапы: загрузка, остаток вечером и отгрузка по магазинам."),
+            width="100%",
         ),
         panel_shell(
             panel_title("scale", "Этап"),
@@ -6551,44 +7011,13 @@ def mail_page():
 
 
 def route_store_row(group, store):
-    return rx.box(
-        rx.hstack(
-            rx.cond(
-                store["done"],
-                fa_icon(tag="circle_check", size=17, color=ui.STATUS_GREEN_TEXT),
-                fa_icon(tag="circle", size=17, color=ui.LINE_STRONG),
-            ),
-            rx.text(
-                store["name"],
-                color=rx.cond(store["done"], ui.INK_3, ui.INK),
-                text_decoration=rx.cond(store["done"], "line-through", "none"),
-                overflow="hidden",
-                text_overflow="ellipsis",
-                white_space="nowrap",
-            ),
-            spacing="2",
-            align="center",
-            min_width="0",
-        ),
-        rx.box(
-            driver_avatar(
-                group["driver_initials"],
-                group["driver_assigned"],
-                group["driver"],
-            ),
-            class_name="responsive-secondary-column",
-        ),
-        status_pill(store["status"]),
-        icon_button(
-            "x",
-            on_click=State.remove_route_store(group["index"], store["name"]),
-            label="Удалить точку",
-        ),
-        align_items="center",
-        min_height="45px",
-        padding="7px 12px",
+    return rx.hstack(
+        fa_icon(tag="store", size=16, color=ui.INK_2),
+        rx.text(store["name"], color=ui.INK, overflow_wrap="anywhere"),
+        rx.spacer(),
+        icon_button("x", on_click=State.remove_route_store(group["index"], store["name"]), label="Удалить точку"),
+        width="100%", align="center", spacing="2", min_height="40px", padding="7px 12px",
         border_bottom=f"1px solid {ui.LINE_SOFT}",
-        class_name="route-table-row prototype-row prototype-interactive",
     )
 
 
@@ -6653,7 +7082,7 @@ def route_group(group):
             rx.text(group["point_count_label"], color=ui.INK_3, font_size=ui.FONT_SIZE_LABEL),
             rx.text("·", color=ui.INK_3, class_name="responsive-secondary-column"),
             rx.text(
-                group["driver"],
+                "По умолчанию: ", group["driver"],
                 color=ui.INK_3,
                 font_size=ui.FONT_SIZE_LABEL,
                 class_name="responsive-secondary-column",
@@ -6676,19 +7105,7 @@ def route_group(group):
             group["collapsed"],
             rx.box(),
             table_container(
-                rx.box(
-                    rx.text("Магазин"),
-                    rx.text("Водитель", class_name="responsive-secondary-column"),
-                    rx.text("Статус"),
-                    rx.box(),
-                    align_items="center",
-                    min_height="34px",
-                    padding="7px 12px",
-                    color=ui.INK_3,
-                    font_size=ui.FONT_SIZE_CAPTION,
-                    border_bottom=f"1px solid {ui.LINE_SOFT}",
-                    class_name="route-table-row",
-                ),
+                rx.text("Магазины шаблона", padding="7px 12px", color=ui.INK_3, font_size=ui.FONT_SIZE_CAPTION),
                 rx.foreach(group["stores"], lambda store: route_store_row(group, store)),
                 route_add_row(group),
             ),
@@ -6720,35 +7137,227 @@ def routes_backup_bar():
     )
 
 
-def routes_page():
-    return page_shell(
-        topbar(
-            "Маршруты",
-            "Магазины сгруппированы по маршрутам. Статус берётся из приложения водителя.",
-            actions=[segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source)],
+def _dispatch_stage_badge(stage):
+    return rx.match(
+        stage,
+        ("Отгрузка завершена", _pill(stage, ui.STATUS_GREEN_BG, ui.STATUS_GREEN_TEXT)),
+        ("Отгрузка идёт", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
+        ("Готов к отгрузке", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
+        ("Загрузка начата", _pill(stage, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
+        _pill(stage, ui.STATUS_GRAY_BG, ui.STATUS_GRAY_TEXT),
+    )
+
+
+def _dispatch_route_button(route):
+    selected = State.dispatch_selected_route == route["route_key"]
+    return rx.button(
+        rx.hstack(
+            rx.text(route["label"], font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            rx.spacer(),
+            rx.cond(selected, rx.text("Выбран", class_name="dispatch-selected-mark"), rx.box()),
+            width="100%", align="center",
+        ),
+        rx.text("Рейсов: ", route["trip_count"], class_name="dispatch-route-caption"),
+        rx.text("Магазины: ", route["completed_stores"], " / ", route["store_count"], class_name="dispatch-route-caption"),
+        on_click=State.select_dispatch_route(route["route_key"]),
+        aria_pressed=selected,
+        class_name=rx.cond(selected, "dispatch-route-button dispatch-route-selected", "dispatch-route-button"),
+    )
+
+
+def _dispatch_assignment(assignment):
+    return rx.hstack(
+        fa_icon(tag="truck", size=16, color=ui.INK_2),
+        rx.text(assignment["driver_name"], font_weight=ui.FONT_WEIGHT_MEDIUM),
+        muted_text(assignment["vehicle_name"], " · ", assignment["vehicle_plate"]),
+        rx.text(rx.cond(assignment["active"], "Актуальное назначение", "Историческое назначение"), class_name="dispatch-assignment-note"),
+        wrap="wrap", spacing="2", width="100%", align="center",
+    )
+
+
+def _dispatch_store(store):
+    return rx.hstack(
+        fa_icon(tag="store", size=15, color=ui.INK_2),
+        rx.text(store["name"], flex="1", min_width="0", overflow_wrap="anywhere"),
+        muted_text(store["shipped_net_kg"], rx.cond(store["shipped_net_kg"] != "—", " кг", "")),
+        rx.text(store["status"], color=rx.cond(store["completed"], ui.STATUS_GREEN_TEXT, ui.INK_2), font_size="11px"),
+        width="100%", align="center", spacing="2", class_name="dispatch-store-row",
+    )
+
+
+def _dispatch_trip_card(trip):
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Заказ ", trip["order_number"], size="3"),
+                muted_text(trip["client_name"], " · ", trip["processed_display"]),
+                align="start", spacing="1", min_width="0",
+            ),
+            rx.spacer(),
+            _dispatch_stage_badge(trip["stage"]),
+            width="100%", align="start", wrap="wrap", spacing="2",
         ),
         rx.cond(
-            State.route_groups.length() > 0,
+            trip["assignments"].length() > 0,
+            rx.vstack(rx.foreach(trip["assignments"], _dispatch_assignment), width="100%", spacing="2"),
+            muted_text("Водитель не назначен"),
+        ),
+        rx.cond(
+            (trip["assignments"].length() > 0) & ~trip["has_active_assignment"],
+            muted_text("Актуального назначения нет. Показана история."), rx.box(display="none"),
+        ),
+        rx.cond(trip["limited_data"], muted_text("Старая запись: нет точного распределения загрузки по маршрутам."), rx.box(display="none")),
+        rx.hstack(
+            rx.text("Загрузка: ", rx.cond(trip["limited_data"], "Нет маршрутных данных", rx.cond(trip["loading_ready"], "Подтверждена", "Не подтверждена"))),
+            rx.text("Магазины: ", trip["completed_stores"], " из ", trip["store_count"]),
+            wrap="wrap", spacing="3", class_name="dispatch-trip-facts", width="100%",
+        ),
+        rx.hstack(
+            rx.text("Загружено: ", trip["loaded_net_kg"], rx.cond(trip["loaded_net_kg"] != "—", " кг", "")),
+            rx.text("Отгружено: ", trip["shipped_net_kg"], rx.cond(trip["shipped_net_kg"] != "—", " кг", "")),
+            wrap="wrap", spacing="3", class_name="dispatch-trip-weights", width="100%",
+        ),
+        rx.cond(trip["return_label"] != "", rx.text(trip["return_label"], " · ", trip["return_net_kg"], " кг", class_name="dispatch-return-note"), rx.box(display="none")),
+        rx.el.details(
+            rx.el.summary("Магазины маршрута", class_name="dispatch-store-summary"),
+            rx.vstack(rx.foreach(trip["stores"], _dispatch_store), width="100%", spacing="0"),
+            width="100%",
+        ),
+        rx.link("Открыть загрузку и сверку", href=trip["loading_href"], class_name="dispatch-loading-link"),
+        width="100%", align="start", spacing="3", class_name="dispatch-trip-card",
+    )
+
+
+def _dispatch_overview():
+    return rx.vstack(
+        rx.hstack(
             rx.vstack(
-                rx.foreach(State.route_groups, route_group),
-                spacing="4",
-                width="100%",
+                rx.heading("Обзор рейсов", size="4"),
+                muted_text("Подтверждённая загрузка и отгрузка по каждому заказу."),
+                align="start", spacing="1",
+            ),
+            rx.spacer(),
+            secondary_button("Редактировать маршруты", on_click=State.open_routes_editor, width="210px"),
+            width="100%", align="center", wrap="wrap", spacing="3",
+        ),
+        rx.hstack(
+            rx.vstack(
+                muted_text("Дата обработки заказа"),
+                rx.input(type="date", value=State.dispatch_date, on_change=State.set_dispatch_date, aria_label="Дата обработки заказа"),
+                align="start", spacing="1",
+            ),
+            rx.vstack(
+                muted_text("Направление"),
+                segmented_control(["Город", "Область"], State.dispatch_mode, State.set_dispatch_mode),
+                align="start", spacing="1",
+            ),
+            rx.vstack(
+                muted_text("Этап рейса"),
+                rx.select.root(
+                    rx.select.trigger(aria_label="Этап рейса", width="100%"),
+                    rx.select.content(*[rx.select.item(stage, value=stage) for stage in DISPATCH_STAGES]),
+                    value=State.dispatch_stage, on_change=State.set_dispatch_stage,
+                ),
+                align="start", spacing="1", width="230px", max_width="100%",
+            ),
+            secondary_button("Обновить", on_click=State.load_dispatch, width="120px"),
+            rx.cond((State.dispatch_stage != "Все") | (State.search_query != ""), secondary_button("Сбросить фильтры", on_click=State.reset_dispatch_filters, width="170px"), rx.box()),
+            width="100%", align="end", wrap="wrap", spacing="3", class_name="dispatch-filters",
+        ),
+        rx.cond(State.dispatch_message != "", rx.text(State.dispatch_message, role="status"), rx.box()),
+        rx.cond(
+            State.dispatch_routes.length() == 0,
+            rx.vstack(
+                rx.heading("Рейсов по выбранным условиям нет", size="3"),
+                muted_text("Измените дату, направление или этап рейса."),
+                secondary_button("Сбросить фильтры", on_click=State.reset_dispatch_filters, width="170px"),
+                align="start", spacing="3", class_name="dispatch-empty",
             ),
             rx.box(
-                rx.text("По вашему запросу маршруты и магазины не найдены", color=ui.INK_2),
-                padding="28px 16px",
+                rx.vstack(
+                    rx.text("Маршруты", class_name="dispatch-panel-title"),
+                    rx.cond(
+                        State.dispatch_routes.length() > 0,
+                        rx.foreach(State.dispatch_routes, _dispatch_route_button),
+                        muted_text("Маршрутов по выбранным условиям нет."),
+                    ),
+                    width="100%", align="start", spacing="2", class_name="dispatch-route-list",
+                ),
+                rx.vstack(
+                    rx.button("← К маршрутам", on_click=State.back_to_dispatch_routes, class_name="dispatch-mobile-back"),
+                    rx.hstack(
+                        rx.heading(State.dispatch_selected_label, size="4"),
+                        rx.spacer(),
+                        muted_text("Рейсов: ", State.dispatch_selected_trips.length()),
+                        width="100%", align="center", wrap="wrap", spacing="2",
+                    ),
+                    rx.cond(
+                        State.dispatch_selected_trips.length() > 0,
+                        rx.foreach(State.dispatch_selected_trips, _dispatch_trip_card),
+                        rx.vstack(
+                            fa_icon(tag="route", size=28, color=ui.INK_3),
+                            rx.text("Рейсов по выбранным условиям нет", font_weight=ui.FONT_WEIGHT_MEDIUM),
+                            muted_text("Измените дату, направление или фильтры. Шаблоны магазинов доступны в редакторе."),
+                            secondary_button("Сбросить фильтры", on_click=State.reset_dispatch_filters, width="170px"),
+                            width="100%", align="start", spacing="3", class_name="dispatch-trip-card",
+                        ),
+                    ),
+                    width="100%", align="start", spacing="3", class_name="dispatch-detail",
+                ),
+                class_name=rx.cond(State.dispatch_mobile_detail, "dispatch-workspace dispatch-show-detail", "dispatch-workspace"),
                 width="100%",
-                text_align="center",
-                border=f"1px solid {ui.LINE}",
-                border_radius=ui.RADIUS_CARD,
-                background=ui.PANEL,
             ),
         ),
-        routes_backup_bar(),
+        width="100%", align="start", spacing="4",
+    )
+
+
+def _routes_editor():
+    return rx.vstack(
+        rx.hstack(
+            rx.vstack(
+                rx.heading("Шаблоны маршрутов", size="4"),
+                muted_text("Изменения применяются к будущим заказам, не к опубликованным рейсам."),
+                align="start", spacing="1",
+            ),
+            rx.spacer(),
+            secondary_button("К обзору рейсов", on_click=State.close_routes_editor, width="160px"),
+            width="100%", align="center", wrap="wrap", spacing="3",
+        ),
+        segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source),
         rx.cond(
-            State.routes_status != "",
-            rx.text(State.routes_status, color=ui.INK_2, font_size=ui.FONT_SIZE_BODY),
-            rx.box(),
+            State.route_groups.length() > 0,
+            rx.vstack(rx.foreach(State.route_groups, route_group), spacing="4", width="100%"),
+            muted_text("По вашему запросу маршруты и магазины не найдены."),
+        ),
+        routes_backup_bar(),
+        rx.cond(State.routes_status != "", rx.text(State.routes_status, role="status"), rx.box()),
+        width="100%", align="start", spacing="4",
+    )
+
+
+def routes_page():
+    return page_shell(
+        rx.input(
+            value=State.search_query, on_change=State.set_search_query,
+            placeholder="Заказ, магазин, водитель…", aria_label="Поиск по текущему разделу",
+            width="100%", class_name="dispatch-mobile-search",
+        ),
+        rx.cond(State.routes_editor_open, _routes_editor(), _dispatch_overview()),
+        rx.alert_dialog.root(
+            rx.alert_dialog.content(
+                rx.alert_dialog.title("Сохранить изменения маршрутов?"),
+                rx.alert_dialog.description("Состав магазинов изменён. Сохраните его или явно откажитесь от изменений перед переходом."),
+                rx.cond(State.route_editor_error != "", rx.text(State.route_editor_error, role="status"), rx.box()),
+                rx.hstack(
+                    secondary_button("Остаться", on_click=State.cancel_route_editor_transition, width="110px"),
+                    secondary_button("Не сохранять", on_click=State.finish_route_editor_transition(False), width="140px"),
+                    primary_button("Сохранить", on_click=State.finish_route_editor_transition(True), width="130px"),
+                    spacing="2", justify="end", wrap="wrap", margin_top="16px",
+                ),
+                max_width="520px",
+            ),
+            open=State.route_editor_pending_action != "",
         ),
     )
 
@@ -6953,7 +7562,7 @@ def event_log_panel():
 def tracking_view_toggle():
     return rx.hstack(
         segment_button(
-            "Симуляция", State.tracking_view,
+            "Демонстрация", rx.cond(State.tracking_view == "Симуляция", "Демонстрация", State.tracking_view),
             State.set_tracking_view("Симуляция"),
         ),
         segment_button(
@@ -6971,6 +7580,7 @@ def tracking_view_toggle():
 
 def simulation_section():
     return rx.vstack(
+        rx.text("Демонстрационные данные. Не используются для учёта рейсов.", role="status", color=ui.STATUS_AMBER_TEXT),
         tracking_controls(),
         rx.grid(
             stat_card(
@@ -7128,7 +7738,7 @@ def tracking_page():
     return page_shell(
         topbar(
             "Трекинг",
-            "Симуляция движения машин по маршрутам либо реальные данные от водителей.",
+            "Реальные данные от водителей. Демонстрация не отражает выполнение заказов.",
             actions=[tracking_view_toggle()],
         ),
         rx.cond(
@@ -7958,6 +8568,179 @@ def delivery_page():
     )
 
 
+RETURN_STATUS_LABELS = {"submitted": "На проверке", "accepted": "Принят", "rejected": "Отклонён"}
+
+
+def _return_view(document: dict) -> dict:
+    item = dict(document)
+    item["status_label"] = RETURN_STATUS_LABELS[document["status"]]
+    item["driver_filter"] = f"{document['driver_name']} · {document['driver_id']}"
+    item["lines"] = [
+        {
+            **line,
+            **line["measurement"],
+            "residual_kg": format_decimal(Decimal(line["loaded_net_kg"]) - Decimal(line["shipped_net_kg"])),
+        }
+        for line in document["lines"]
+    ]
+    item["history"] = [
+        {
+            "kind_label": RETURN_STATUS_LABELS.get(event["kind"], event["kind"]),
+            "at": event["at"],
+            "actor_name": event["actor"].get("name") or event["actor"]["id"],
+            "comment": event.get("comment", ""),
+            "details": " · ".join(
+                f"{line['name']}: {line['measurement']['net_weight_kg']} кг; {line['reason']}; {line.get('comment', '')}"
+                for line in event.get("lines", [])
+            ),
+        }
+        for event in document["history"]
+    ]
+    return item
+
+
+def return_line_row(line):
+    return rx.vstack(
+        rx.text(line["name"], font_weight=ui.FONT_WEIGHT_SEMIBOLD, color=ui.INK),
+        rx.hstack(
+            muted_text("Загружено: ", line["loaded_net_kg"], " кг"),
+            muted_text("Принято магазинами: ", line["shipped_net_kg"], " кг"),
+            muted_text("Остаток: ", line["residual_kg"], " кг"),
+            rx.text("Возврат: ", line["net_weight_kg"], " кг", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            wrap="wrap", spacing="3", width="100%",
+        ),
+        muted_text("Ящики: ", line["box_count"], " · Тара: ", line["tare_weight_per_box_kg"], " кг/ящ. · Грязный вес: ", line["gross_weight_kg"], " кг"),
+        rx.text("Причина: ", line["reason"], color=ui.INK_2, font_size="12px"),
+        rx.cond(line["comment"] != "", muted_text(line["comment"]), rx.box()),
+        width="100%", align="start", spacing="2", padding="12px 0",
+        border_bottom=f"1px solid {ui.LINE_SOFT}",
+    )
+
+
+def return_item_card(item):
+    return rx.el.details(
+        rx.el.summary(
+            rx.hstack(
+                rx.vstack(
+                    rx.text("Заказ ", item["order_number"], " · ", item["route_label"], font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+                    muted_text(item["driver_name"], " · ", item["vehicle_plate"]),
+                    muted_text(item["submitted_at"], " · версия ", item["version"]),
+                    align="start", spacing="1",
+                ),
+                rx.spacer(),
+                rx.text(item["total_net_kg"], " кг", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+                status_pill(item["status_label"]),
+                width="100%", wrap="wrap", align="center", spacing="3",
+            ),
+            cursor="pointer",
+        ),
+        rx.vstack(
+            rx.foreach(item["lines"].to(list[dict]), return_line_row),
+            rx.cond(
+                item["status"] == "submitted",
+                rx.hstack(
+                    primary_button("Принять возврат", on_click=State.begin_return_decision(item["id"], "accepted")),
+                    secondary_button("Отклонить", on_click=State.begin_return_decision(item["id"], "rejected")),
+                    wrap="wrap", spacing="2",
+                ),
+                rx.box(),
+            ),
+            rx.text("История документа", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            rx.foreach(
+                item["history"].to(list[dict]),
+                lambda event: rx.vstack(
+                    muted_text(event["at"], " · ", event["kind_label"], " · ", event["actor_name"]),
+                    rx.cond(event["comment"] != "", rx.text(event["comment"], font_size="12px"), rx.box()),
+                    rx.cond(event["details"] != "", muted_text(event["details"]), rx.box()),
+                    width="100%", align="start", spacing="1",
+                ),
+            ),
+            padding_top="12px", spacing="3", width="100%", align="start",
+        ),
+        width="100%", padding="14px", border=f"1px solid {ui.LINE}",
+        border_radius=ui.RADIUS_CONTROL, background=ui.PANEL,
+    )
+
+
+def returns_page():
+    return page_shell(
+        topbar("Возвраты", "Остаток текущего рейса. Принятие подтверждает поступление товара на склад, но не меняет недостачу заказа."),
+        rx.hstack(
+            rx.vstack(
+                muted_text("Статус"),
+                rx.select(["Все", *RETURN_STATUS_LABELS.values()], value=State.returns_status_filter, on_change=State.set_returns_filter("status")),
+                align="start", spacing="1",
+            ),
+            rx.vstack(
+                muted_text("Маршрут"),
+                rx.select(State.returns_route_options, value=State.returns_route_filter, on_change=State.set_returns_filter("route")),
+                align="start", spacing="1",
+            ),
+            rx.vstack(
+                muted_text("Водитель"),
+                rx.select(State.returns_driver_options, value=State.returns_driver_filter, on_change=State.set_returns_filter("driver"), width="100%"),
+                align="start", spacing="1", width="300px", max_width="100%",
+            ),
+            rx.vstack(
+                muted_text("Подача с"),
+                rx.input(type="date", value=State.returns_date_from, on_change=State.set_returns_filter("date_from"), aria_label="Подача с"),
+                align="start", spacing="1",
+            ),
+            rx.vstack(
+                muted_text("Подача по"),
+                rx.input(type="date", value=State.returns_date_to, on_change=State.set_returns_filter("date_to"), aria_label="Подача по"),
+                align="start", spacing="1",
+            ),
+            secondary_button("Обновить", on_click=State.load_returns_report),
+            wrap="wrap", align="end", spacing="3", width="100%",
+        ),
+        rx.grid(
+            metric_card("На проверке", State.returns_totals["submitted"]),
+            metric_card("Принято", State.returns_totals["accepted"]),
+            metric_card("Отклонено", State.returns_totals["rejected"]),
+            columns=rx.breakpoints(initial="1", sm="3"), width="100%", spacing="3",
+        ),
+        rx.grid(
+            metric_card("Заявлено к проверке, кг", State.returns_totals["pending_kg"]),
+            metric_card("Принято на склад, кг", State.returns_totals["accepted_kg"]),
+            columns=rx.breakpoints(initial="1", sm="2"), width="100%", spacing="3",
+        ),
+        rx.cond(State.returns_message != "", rx.text(State.returns_message, role="status"), rx.box()),
+        panel_shell(
+            panel_title("package", "Журнал возвратов"),
+            muted_text("Показатели рассчитаны по выбранным фильтрам. Отклонение заявки не является списанием товара."),
+            rx.cond(
+                State.returns_filtered.length() > 0,
+                rx.vstack(rx.foreach(State.returns_filtered, return_item_card), width="100%", spacing="3"),
+                muted_text("Возвратов по выбранным условиям нет."),
+            ),
+        ),
+        rx.alert_dialog.root(
+            rx.alert_dialog.content(
+                rx.alert_dialog.title(rx.cond(State.returns_decision_kind == "accepted", "Подтвердить приёмку?", "Отклонить возврат?")),
+                rx.alert_dialog.description(rx.cond(
+                    State.returns_decision_kind == "accepted",
+                    "Подтвердите, что все указанные товары и вес фактически приняты складом. Решение нельзя отменить.",
+                    "Укажите, что нужно исправить. Водитель сможет отправить новую версию документа.",
+                )),
+                rx.text_area(
+                    value=State.returns_decision_comment, on_change=State.set_return_decision_comment,
+                    placeholder="Комментарий (обязателен при отклонении)", max_length=2000,
+                    aria_label="Комментарий администратора", width="100%", margin_top="12px",
+                ),
+                rx.text(State.returns_message, role="status", margin_top="8px"),
+                rx.hstack(
+                    secondary_button("Отмена", on_click=State.cancel_return_decision),
+                    primary_button("Подтвердить решение", on_click=State.confirm_return_decision),
+                    wrap="wrap", justify="end", margin_top="12px",
+                ),
+                max_width="460px",
+            ),
+            open=State.returns_decision_id != "",
+        ),
+    )
+
+
 def route_assignment_row(item, index):
     return rx.hstack(
         rx.text(item["label"], color=text(), font_weight=ui.FONT_WEIGHT_SEMIBOLD, min_width="130px"),
@@ -8023,14 +8806,32 @@ def route_assignment_dialog():
     )
 
 
+def help_page():
+    return page_shell(
+        topbar("Помощь", "Короткие инструкции и чат-помощник."),
+        panel_shell(
+            rx.heading("Ежедневная работа", size="3"),
+            muted_text("Заказы: загрузите файл, укажите клиента и направление, проверьте просмотр и подтвердите обработку."),
+            muted_text("Рейсы: выберите маршрут и заказ. Откройте загрузку и сверку, чтобы увидеть складские измерения и отгрузку."),
+            muted_text("Возвраты: проверьте документ водителя и примите или отклоните его с комментарием."),
+            muted_text("Шаблоны маршрутов меняют будущие заказы. Учёт веса — отдельный журнал, а не форма загрузки рейса."),
+        ),
+        panel_shell(rx.heading("Чат-помощник", size="3"),
+                    muted_text("Обычный чат без доступа к заказам и измерениям. Подключение настраивается в настройках."),
+                    secondary_button("Открыть чат", on_click=State.toggle_help_chat, width="150px")),
+    )
+
+
 def main_content():
     return rx.match(
         State.current_page,
         ("Заказы", orders_page()),
+        ("Помощь", help_page()),
         ("Почта", mail_page()),
         ("Маршруты", routes_page()),
         ("Водители и транспорт", fleet_page()),
         ("Сданный товар", delivery_page()),
+        ("Возвраты", returns_page()),
         ("Вес", weight_page()),
         ("OCR накладных", invoice_ocr_page()),
         ("Трекинг", tracking_page()),
@@ -8280,7 +9081,7 @@ def dashboard_shell():
         ),
         order_details_drawer(),
         route_assignment_dialog(),
-        help_chat_widget(),
+        rx.cond(State.current_page == "Помощь", help_chat_widget(), rx.box(display="none")),
     )
 
 
@@ -8297,295 +9098,9 @@ def dashboard():
     )
 
 
-DRIVER_VEHICLES = list(zip(ROUTE_KEYS, ROUTE_LABELS, ROUTE_COLORS))
-
-GPS_WATCH_JS = """
-(function () {
-    if (!navigator.geolocation || window.__driverGpsWatching) { return; }
-    window.__driverGpsWatching = true;
-
-    function send(pos) {
-        var meta = document.getElementById('driver-vehicle-meta');
-        var vehicle = meta ? meta.getAttribute('data-vehicle') : '';
-        if (!vehicle) { return; }
-
-        fetch('/api/gps-ping', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                vehicle: vehicle,
-                lat: pos.coords.latitude,
-                lon: pos.coords.longitude,
-                speed: pos.coords.speed
-            })
-        }).catch(function () {});
-    }
-
-    navigator.geolocation.watchPosition(send, function () {}, {
-        enableHighAccuracy: true,
-        maximumAge: 10000,
-        timeout: 15000
-    });
-})();
-"""
-
-
-class DriverState(rx.State):
-    vehicle_key: str = ""
-    vehicle_label: str = ""
-    source: str = "Область"
-    stops: list[dict] = []
-    active_stop: str = ""
-    upload_status: str = ""
-    active_route_count: int = DEFAULT_ROUTE_COUNT
-
-    def _stores_file(self) -> Path:
-        return paths.stores_file_for(self.source)
-
-    def load_active_routes(self):
-        self.active_route_count = load_route_count()
-
-    def select_vehicle(self, key: str, label: str):
-        self.vehicle_key = key
-        self.vehicle_label = label
-        self.active_stop = ""
-        self.upload_status = ""
-        data = driver_data.load_or_init_day(key, self._stores_file())
-        self.stops = data["stops"]
-
-    def set_source(self, value: str):
-        self.source = value
-
-        if self.vehicle_key:
-            data = driver_data.load_or_init_day(self.vehicle_key, self._stores_file())
-            self.stops = data["stops"]
-
-    def change_vehicle(self):
-        self.vehicle_key = ""
-        self.vehicle_label = ""
-        self.stops = []
-        self.active_stop = ""
-
-    def open_upload(self, name: str):
-        self.active_stop = name
-        self.upload_status = ""
-
-    def cancel_upload(self):
-        self.active_stop = ""
-
-    async def handle_invoice_upload(self, files: list[rx.UploadFile]):
-        if not files or not self.active_stop:
-            self.upload_status = "Сначала сделайте фото накладной"
-            return
-
-        file = files[0]
-        data = await file.read()
-        safe_stop = "".join(ch if ch.isalnum() else "_" for ch in self.active_stop)
-        filename = f"{datetime.now():%Y%m%d_%H%M%S}_{safe_stop}.jpg"
-
-        vehicle_upload_dir = rx.get_upload_dir() / "invoices" / self.vehicle_key
-        vehicle_upload_dir.mkdir(parents=True, exist_ok=True)
-        (vehicle_upload_dir / filename).write_bytes(data)
-
-        photo_rel_path = f"invoices/{self.vehicle_key}/{filename}"
-        updated = driver_data.mark_stop_done(
-            self.vehicle_key, self._stores_file(), self.active_stop, photo_rel_path,
-        )
-        self.stops = updated["stops"]
-        self.active_stop = ""
-        self.upload_status = "Накладная сохранена"
-
-
-def driver_vehicle_button(key, label, color):
-    return rx.button(
-        fa_icon(tag="truck", size=22, color=ui.WHITE),
-        rx.text(label, font_size="17px", font_weight=ui.FONT_WEIGHT_SEMIBOLD, color=ui.WHITE),
-        on_click=DriverState.select_vehicle(key, label),
-        width="100%",
-        height="76px",
-        border_radius="14px",
-        background=color,
-        _hover={"opacity": 0.9},
-        cursor="pointer",
-    )
-
-
-def driver_select_screen():
-    return rx.vstack(
-        rx.heading("Выберите машину", color=text(), size="6"),
-        segmented_control(["Город", "Область"], DriverState.source, DriverState.set_source),
-        rx.vstack(
-            *[
-                rx.cond(
-                    index < DriverState.active_route_count,
-                    driver_vehicle_button(key, label, color),
-                    rx.box(),
-                )
-                for index, (key, label, color) in enumerate(DRIVER_VEHICLES)
-            ],
-            spacing="3",
-            width="100%",
-        ),
-        spacing="5",
-        width="100%",
-        max_width="620px",
-        padding="18px",
-        class_name="driver-select-screen",
-    )
-
-
-def driver_upload_box():
-    return rx.vstack(
-        rx.upload(
-            rx.vstack(
-                fa_icon(tag="camera", size=22, color=ACCENT),
-                rx.text(
-                    "Нажмите, чтобы сфотографировать накладную",
-                    color=muted(), font_size="13px", text_align="center",
-                ),
-                align="center",
-                spacing="2",
-            ),
-            id=INVOICE_UPLOAD_ID,
-            accept={"image/*": [".jpg", ".jpeg", ".png"]},
-            max_files=1,
-            border=f"1px dashed {border()}",
-            border_radius="10px",
-            background=surface_alt(),
-            padding="18px",
-            width="100%",
-            cursor="pointer",
-        ),
-        rx.hstack(
-            rx.button(
-                "Сохранить",
-                on_click=DriverState.handle_invoice_upload(rx.upload_files(upload_id=INVOICE_UPLOAD_ID)),
-                height="42px",
-                width="100%",
-                border_radius="9px",
-                background=ACCENT,
-                color=ui.WHITE,
-                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
-                cursor="pointer",
-            ),
-            rx.button(
-                "Отмена",
-                on_click=DriverState.cancel_upload,
-                height="42px",
-                width="120px",
-                border_radius="9px",
-                background=surface_alt(),
-                color=text(),
-                cursor="pointer",
-            ),
-            width="100%",
-            spacing="2",
-        ),
-        rx.cond(
-            DriverState.upload_status != "",
-            rx.text(DriverState.upload_status, color=muted(), font_size="12px"),
-            rx.box(),
-        ),
-        spacing="3",
-        width="100%",
-        padding="12px",
-        border=f"1px solid {border()}",
-        border_radius="10px",
-        background=surface(),
-        class_name="driver-upload-box",
-    )
-
-
-def driver_stop_card(stop):
-    return rx.vstack(
-        rx.hstack(
-            rx.cond(
-                stop["status"] == "done",
-                fa_icon(tag="circle_check", size=20, color=ACCENT),
-                fa_icon(tag="circle", size=20, color=muted()),
-            ),
-            rx.text(stop["name"], color=text(), font_size="16px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-            rx.spacer(),
-            rx.cond(
-                stop["status"] == "done",
-                rx.text(stop["done_at"], color=muted(), font_size="12px"),
-                rx.box(),
-            ),
-            width="100%",
-            align="center",
-            spacing="3",
-        ),
-        rx.cond(
-            stop["status"] == "done",
-            rx.image(
-                src=f"/_upload/{stop['photo']}",
-                width="100%", max_height="160px",
-                object_fit="cover", border_radius="8px",
-            ),
-            rx.cond(
-                DriverState.active_stop == stop["name"],
-                driver_upload_box(),
-                rx.button(
-                    "Закрыть магазин",
-                    on_click=DriverState.open_upload(stop["name"]),
-                    width="100%",
-                    height="46px",
-                    border_radius="9px",
-                    background=ACCENT,
-                    color=ui.WHITE,
-                    font_weight=ui.FONT_WEIGHT_SEMIBOLD,
-                    cursor="pointer",
-                ),
-            ),
-        ),
-        align="start",
-        spacing="3",
-        padding="16px",
-        border=f"1px solid {border()}",
-        border_radius="12px",
-        background=surface(),
-        width="100%",
-        class_name="driver-stop-card",
-    )
-
-
-def driver_stops_screen():
-    return rx.vstack(
-        rx.hstack(
-            rx.vstack(
-                rx.heading(DriverState.vehicle_label, color=text(), size="6"),
-                rx.text("Список магазинов на сегодня", color=muted(), font_size="13px"),
-                align="start",
-                spacing="1",
-            ),
-            rx.spacer(),
-            secondary_button("Сменить машину", on_click=DriverState.change_vehicle, width="170px"),
-            width="100%",
-            align="center",
-        ),
-        rx.box(
-            id="driver-vehicle-meta",
-            custom_attrs={"data-vehicle": DriverState.vehicle_key},
-            display="none",
-        ),
-        rx.script(GPS_WATCH_JS),
-        rx.vstack(
-            rx.foreach(DriverState.stops, driver_stop_card),
-            spacing="3",
-            width="100%",
-        ),
-        spacing="4",
-        width="100%",
-        max_width="620px",
-        padding="20px",
-        class_name="driver-stops-screen",
-    )
-
-
 def driver_page():
     return rx.center(
         rx.box(id="driver-app", width="100%"),
-        rx.script(src="/driver-app.js"),
         width="100%",
         min_height="100vh",
         background=page_bg(),
@@ -8596,7 +9111,6 @@ def driver_page():
 def loader_page():
     return rx.center(
         rx.box(id="loader-app", width="100%"),
-        rx.script(src="/loader-app.js"),
         width="100%",
         min_height="100vh",
         background=page_bg(),
@@ -8636,7 +9150,7 @@ class DashboardAuthMiddleware(rx.Middleware):
 
 
 PWA_META = [
-    {"name": "theme-color", "content": "#7B68EE"},
+    {"name": "theme-color", "content": "#ffffff"},
     {"name": "mobile-web-app-capable", "content": "yes"},
     {"name": "apple-mobile-web-app-capable", "content": "yes"},
     {"name": "apple-mobile-web-app-status-bar-style", "content": "default"},
@@ -8648,8 +9162,9 @@ PWA_META = [
 
 app = rx.App(
     api_transformer=custom_api,
+    html_lang="ru",
+    head_components=[rx.el.script(src="/theme-preference.js"), rx.el.script(src="/workspace-bootstrap.js")],
     stylesheets=[
-        "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap",
         "/theme.css",
         "/scrollbar.css",
     ],
@@ -8681,7 +9196,6 @@ app.add_page(
     driver_page,
     route="/driver",
     title="Водитель",
-    on_load=DriverState.load_active_routes,
     meta=PWA_META,
 )
 app.add_page(

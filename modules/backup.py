@@ -32,6 +32,7 @@ _BACKUP_RELATIVE_FILES = (
     "data/volume_history.json",
     "data/processed_files.json",
     "data/order_records.json",
+    "data/goods_returns.json",
     "data/mail_items.json",
     "data/mail_seen.json",
     "data/mail_uid_cache.json",

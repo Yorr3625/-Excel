@@ -54,6 +54,20 @@ def test_create_backup_contains_state_and_manifest_but_not_workbooks(tmp_path):
     assert "config/mail.json" not in names
 
 
+def test_goods_return_ledger_backup_and_restore(tmp_path):
+    ledger = {"schema_version": 1, "documents": [{"id": "return-1", "status": "accepted"}], "operations": []}
+    _write_json(tmp_path, "data/goods_returns.json", ledger)
+
+    info = backup.create_backup(tmp_path / "archives", project_root=tmp_path)
+    with zipfile.ZipFile(info.path) as archive:
+        assert json.loads(archive.read("data/goods_returns.json")) == ledger
+
+    _write_json(tmp_path, "data/goods_returns.json", {"documents": []})
+    result = backup.restore_backup(info.path, project_root=tmp_path, safety_backup=False)
+    assert "data/goods_returns.json" in result.restored_files
+    assert json.loads((tmp_path / "data" / "goods_returns.json").read_text(encoding="utf-8")) == ledger
+
+
 def test_backup_directory_round_trip(tmp_path):
     selected = tmp_path / "my backups"
 

@@ -1,10 +1,10 @@
-"""Durable order snapshots used by the warehouse loading workspace."""
+"""Durable order snapshots for warehouse loading and store shipment."""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import json
 import os
 from pathlib import Path
@@ -20,6 +20,13 @@ from modules.route_drivers import ROUTE_AREAS
 
 SCHEMA_VERSION = 1
 MAX_AMOUNT_DIGITS = 18
+MAX_OPERATION_ID_LENGTH = 128
+ZERO_REASON_OPTIONS = (
+    "Недостаток товара на складе",
+    "Брак или несоответствие качеству",
+    "Ошибка в заявке",
+    "Отсутствие тары",
+)
 _LOCK = threading.RLock()
 
 
@@ -32,7 +39,7 @@ class OrderRecordNotFound(OrderRecordError):
 
 
 class OrderRecordConflict(OrderRecordError):
-    """The loading form was saved from an obsolete revision."""
+    """The record was changed by another operation."""
 
 
 def _now() -> str:
@@ -66,12 +73,95 @@ def _integer_quantity(value, field: str) -> str:
     return str(int(number))
 
 
-def calculate_net_weight(gross_weight, tare_weight, box_count) -> Decimal:
-    """Return gross weight minus tare weight for every loaded box."""
+def calculate_net_weight(gross_weight, tare_weight_per_box, box_count) -> Decimal:
+    """Return gross weight minus tare weight for every box."""
 
-    return _decimal(gross_weight, "Вес брутто") - (
-        _decimal(tare_weight, "Вес тары") * _decimal(box_count, "Количество ящиков")
+    return _decimal(gross_weight, "Грязный вес") - (
+        _decimal(tare_weight_per_box, "Вес тары")
+        * _decimal(box_count, "Количество ящиков")
     )
+
+
+def _empty_measurement(box_count: str = "") -> dict:
+    return {
+        "box_count": str(box_count),
+        "tare_weight_per_box_kg": "",
+        "gross_weight_kg": "",
+        "net_weight_kg": "",
+        "zero_reason": "",
+    }
+
+
+def _measurement_complete(measurement: object) -> bool:
+    return isinstance(measurement, dict) and all(
+        str(measurement.get(key, "")).strip() != ""
+        for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg")
+    )
+
+
+def is_zero_measurement(measurement: object) -> bool:
+    if not isinstance(measurement, dict):
+        return False
+    fields = ("box_count", "tare_weight_per_box_kg", "gross_weight_kg")
+    if any(str(measurement.get(field, "")).strip() == "" for field in fields):
+        return False
+    try:
+        return all(_decimal(measurement[field], field) == 0 for field in fields)
+    except OrderRecordError:
+        return False
+
+
+def _shipment_measurement_complete(measurement: object) -> bool:
+    if _measurement_complete(measurement):
+        return True
+    return isinstance(measurement, dict) and str(measurement.get("legacy_net_weight_kg", "")).strip() != ""
+
+
+def _validated_measurement(value: object, require_zero_reason: bool = False) -> dict:
+    if not isinstance(value, dict):
+        raise OrderRecordError("Некорректные данные взвешивания")
+    box_count = _integer_quantity(value.get("box_count", ""), "Количество ящиков")
+    tare_weight = _quantity(value.get("tare_weight_per_box_kg", ""), "Вес тары")
+    gross_weight = _quantity(value.get("gross_weight_kg", ""), "Грязный вес")
+    net_weight = calculate_net_weight(gross_weight, tare_weight, box_count)
+    if net_weight < 0:
+        raise OrderRecordError("Грязный вес не может быть меньше веса тары")
+    measurement = {
+        "box_count": box_count,
+        "tare_weight_per_box_kg": tare_weight,
+        "gross_weight_kg": gross_weight,
+        "net_weight_kg": _quantity(net_weight, "Чистый вес"),
+        "zero_reason": "",
+    }
+    if is_zero_measurement(measurement):
+        zero_reason = str(value.get("zero_reason", "")).strip()
+        if require_zero_reason and zero_reason not in ZERO_REASON_OPTIONS:
+            raise OrderRecordError("Укажите причину нулевой позиции")
+        if zero_reason in ZERO_REASON_OPTIONS:
+            measurement["zero_reason"] = zero_reason
+    return measurement
+
+
+def _validated_shipment_measurement(value: object) -> dict:
+    if isinstance(value, dict) and "legacy_net_weight_kg" in value:
+        net_weight = _quantity(value.get("legacy_net_weight_kg", ""), "Фактическое количество")
+        return {
+            "box_count": "",
+            "tare_weight_per_box_kg": "",
+            "gross_weight_kg": "",
+            "net_weight_kg": net_weight,
+            "legacy_net_weight_kg": net_weight,
+        }
+    return _validated_measurement(value)
+
+
+def _actor(value: object) -> dict:
+    value = value if isinstance(value, dict) else {}
+    return {
+        "kind": str(value.get("kind", "")),
+        "id": str(value.get("id", "")),
+        "name": str(value.get("name", "")),
+    }
 
 
 def _atomic_write(payload: dict) -> None:
@@ -103,23 +193,276 @@ def _empty_payload() -> dict:
     return {"schema_version": SCHEMA_VERSION, "records": []}
 
 
+def _line_key(name: object, unit: object) -> tuple[str, str]:
+    return str(name or "").strip().casefold(), str(unit or "kg").strip().casefold()
+
+
+def _normalize_measurement(line: dict) -> None:
+    measurement = line.get("measurement")
+    if isinstance(measurement, dict):
+        for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason"):
+            measurement[key] = str(measurement.get(key, ""))
+        if measurement["zero_reason"] not in ZERO_REASON_OPTIONS:
+            measurement["zero_reason"] = ""
+        return
+
+    legacy_box_count = line.get("loaded_box_count", line.pop("loading_amount", ""))
+    line["measurement"] = _empty_measurement(legacy_box_count)
+
+
+def _normalize_shipment(position: dict) -> None:
+    shipment = position.get("shipment")
+    if not isinstance(shipment, dict):
+        position["shipment"] = {
+            "status": "pending",
+            "operation_id": "",
+            "completed_at": "",
+            "completed_by": _actor({}),
+            "measurement": _empty_measurement(),
+        }
+        return
+
+    shipment["status"] = "completed" if shipment.get("status") == "completed" else "pending"
+    shipment["operation_id"] = str(shipment.get("operation_id", ""))
+    shipment["completed_at"] = str(shipment.get("completed_at", ""))
+    shipment["completed_by"] = _actor(shipment.get("completed_by"))
+    measurement = shipment.get("measurement")
+    if not isinstance(measurement, dict):
+        measurement = {
+            "box_count": shipment.get("box_count", ""),
+            "tare_weight_per_box_kg": shipment.get("tare_weight_per_box_kg", ""),
+            "gross_weight_kg": shipment.get("gross_weight_kg", ""),
+            "net_weight_kg": shipment.get("net_weight_kg", ""),
+        }
+    shipment["measurement"] = {
+        key: str(measurement.get(key, ""))
+        for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg")
+    }
+    if "legacy_net_weight_kg" in measurement:
+        shipment["measurement"]["legacy_net_weight_kg"] = str(measurement["legacy_net_weight_kg"])
+
+
+def _empty_route_loading() -> dict:
+    return {
+        "status": "new",
+        "last_saved_at": "",
+        "last_saved_by": _actor({}),
+        "confirmed_at": "",
+        "confirmed_by": _actor({}),
+    }
+
+
+def _normalize_route_loading(value: object) -> dict:
+    value = value if isinstance(value, dict) else {}
+    status = str(value.get("status", "new"))
+    return {
+        "status": status if status in {"new", "draft", "loaded"} else "new",
+        "last_saved_at": str(value.get("last_saved_at", "")),
+        "last_saved_by": _actor(value.get("last_saved_by")),
+        "confirmed_at": str(value.get("confirmed_at", "")),
+        "confirmed_by": _actor(value.get("confirmed_by")),
+    }
+
+
+def _route_keys(record: dict) -> list[str]:
+    return [
+        str(route.get("route_key", ""))
+        for route in record.get("routes", [])
+        if isinstance(route, dict) and str(route.get("route_key", ""))
+    ]
+
+
+def _route_lines(record: dict, route_key: str) -> list[dict]:
+    return [
+        line
+        for line in record.get("loading_lines", [])
+        if isinstance(line, dict) and str(line.get("route_key", "")) == route_key
+    ]
+
+
+def _legacy_loading_ready(record: dict) -> bool:
+    return (
+        (record.get("loading") or {}).get("status") == "loaded"
+        and bool(record.get("loading_lines"))
+        and all(_measurement_complete(line.get("measurement")) for line in record["loading_lines"])
+    )
+
+
+def route_loading_ready(record: dict, route_key: str) -> bool:
+    lines = _route_lines(record, route_key)
+    if not lines:
+        return _legacy_loading_ready(record)
+    state = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {})
+    return state.get("status") == "loaded" and all(
+        _measurement_complete(line.get("measurement")) for line in lines
+    )
+
+
+def route_return_balance(record: dict, route_key: str) -> dict:
+    """Keep exact destination facts to detect incomplete two-file shipment saves."""
+    routes = [route for route in record.get("routes", []) if route.get("route_key") == route_key]
+    lines = _route_lines(record, route_key)
+    if len(routes) != 1 or not lines:
+        raise OrderRecordError("Нет надёжной связи загрузки с маршрутом")
+    if not route_loading_ready(record, route_key):
+        raise OrderRecordError("Склад ещё не подтвердил загрузку маршрута")
+
+    def number(value, field):
+        if len(str(value)) > 64:
+            raise OrderRecordError(f"Слишком большое значение: {field}")
+        result = _decimal(value, field)
+        if abs(result.as_tuple().exponent) > 9 or result > Decimal("1000000000"):
+            raise OrderRecordError(f"Слишком большое значение: {field}")
+        return result
+
+    def net(measurement, legacy=False):
+        if not isinstance(measurement, dict):
+            raise OrderRecordError("Отсутствует подтверждённое измерение нетто")
+        result = number(measurement.get("net_weight_kg"), "Нетто")
+        if legacy and "legacy_net_weight_kg" in measurement:
+            expected = number(measurement["legacy_net_weight_kg"], "Нетто")
+        else:
+            boxes = number(measurement.get("box_count"), "Количество ящиков")
+            if boxes != boxes.to_integral_value():
+                raise OrderRecordError("Количество ящиков должно быть целым")
+            tare = number(measurement.get("tare_weight_per_box_kg"), "Вес тары")
+            gross = number(measurement.get("gross_weight_kg"), "Грязный вес")
+            expected = calculate_net_weight(gross, tare, boxes)
+        if result != expected:
+            raise OrderRecordError("Измерение нетто не согласовано с взвешиванием")
+        return result
+
+    with localcontext() as arithmetic:
+        arithmetic.prec = 60
+        balances = {}
+        for line in lines:
+            line_id = str(line.get("id", ""))
+            if not line_id or line_id in balances:
+                raise OrderRecordError("Некорректные идентификаторы загрузки")
+            balances[line_id] = {
+                "loading_line_id": line_id, "name": str(line.get("name", "")),
+                "planned": number(line.get("planned_amount"), "Заказано"),
+                "loaded": net(line.get("measurement")), "shipped": Decimal("0"),
+            }
+        destination_facts = []
+        destination_ids, position_ids, used_lines = set(), set(), set()
+        complete = True
+        for destination in routes[0].get("destinations", []):
+            destination_id = str(destination.get("id", ""))
+            if not destination_id or destination_id in destination_ids or not destination.get("positions"):
+                raise OrderRecordError("Некорректные связи магазинов маршрута")
+            destination_ids.add(destination_id)
+            facts = []
+            for position in destination["positions"]:
+                position_id = str(position.get("id", ""))
+                line_id = str(position.get("loading_line_id", ""))
+                if not position_id or position_id in position_ids or line_id not in balances:
+                    raise OrderRecordError("Нет надёжной связи отгрузки с загрузкой маршрута")
+                position_ids.add(position_id)
+                used_lines.add(line_id)
+                shipment = position.get("shipment") or {}
+                completed = shipment.get("status") == "completed"
+                shipped = net(shipment.get("measurement"), legacy=True) if completed else Decimal("0")
+                balances[line_id]["shipped"] += shipped
+                complete = complete and completed
+                facts.append({"id": position_id, "loading_line_id": line_id,
+                              "completed": completed, "net_weight_kg": _format_number(shipped) if completed else ""})
+            destination_facts.append({"id": destination_id, "positions": sorted(facts, key=lambda item: item["id"])})
+        if not destination_facts or used_lines != set(balances):
+            raise OrderRecordError("Нет надёжной связи магазинов с загрузкой маршрута")
+        result_lines = [{
+            "loading_line_id": line["loading_line_id"], "name": line["name"],
+            "planned_kg": _format_number(line["planned"]),
+            "loaded_net_kg": _format_number(line["loaded"]),
+            "shipped_net_kg": _format_number(line["shipped"]),
+            "available_net_kg": _format_number(line["loaded"] - line["shipped"]),
+        } for line in balances.values()]
+    return {"route_key": route_key, "route_label": str(routes[0].get("route_label", "")),
+            "complete": complete, "lines": sorted(result_lines, key=lambda item: item["loading_line_id"]),
+            "destinations": sorted(destination_facts, key=lambda item: item["id"])}
+
+
+def _refresh_overall_loading_status(record: dict) -> None:
+    route_keys = _route_keys(record)
+    if not any(_route_lines(record, route_key) for route_key in route_keys):
+        return
+    loading = record["loading"]
+    states = loading["route_states"]
+    if route_keys and all(route_loading_ready(record, route_key) for route_key in route_keys):
+        loading["status"] = "loaded"
+    elif any(states[route_key]["status"] != "new" for route_key in route_keys):
+        loading["status"] = "draft"
+    else:
+        loading["status"] = "new"
+
+
 def _normalize_legacy_record(record: dict) -> None:
-    for route in record.get("routes", []):
-        for destination in route.get("destinations", []):
-            for position in destination.get("positions", []):
-                if position.get("unit") in {"", "box"}:
-                    position["unit"] = "kg"
-    for line in record.get("loading_lines", []):
-        if line.get("unit") in {"", "box"}:
+    loading_lines = record.get("loading_lines")
+    if not isinstance(loading_lines, list):
+        record["loading_lines"] = []
+        loading_lines = record["loading_lines"]
+
+    route_keys = set(_route_keys(record))
+    line_ids_by_key: dict[tuple[str, str], str] = {}
+    route_line_ids_by_key: dict[tuple[str, str, str], str] = {}
+    for line in loading_lines:
+        if not isinstance(line, dict):
+            continue
+        if line.get("unit") in {"", "box", None}:
             line["unit"] = "kg"
-        if "loaded_box_count" not in line:
-            legacy_amount = line.pop("loading_amount", "")
-            try:
-                line["loaded_box_count"] = _integer_quantity(
-                    legacy_amount, "Загружено"
-                ) if legacy_amount != "" else ""
-            except OrderRecordError:
-                line["loaded_box_count"] = ""
+        line.setdefault("id", uuid.uuid4().hex)
+        line.setdefault("planned_amount", "0")
+        route_key = str(line.get("route_key", ""))
+        if route_key not in route_keys:
+            line.pop("route_key", None)
+            route_key = ""
+        _normalize_measurement(line)
+        key = _line_key(line.get("name"), line.get("unit"))
+        line_ids_by_key[key] = str(line["id"])
+        if route_key:
+            route_line_ids_by_key[(route_key, *key)] = str(line["id"])
+
+    for route in record.get("routes", []):
+        if not isinstance(route, dict):
+            continue
+        route_key = str(route.get("route_key", ""))
+        for destination in route.get("destinations", []):
+            if not isinstance(destination, dict):
+                continue
+            destination.setdefault("id", uuid.uuid4().hex)
+            for position in destination.get("positions", []):
+                if not isinstance(position, dict):
+                    continue
+                if position.get("unit") in {"", "box", None}:
+                    position["unit"] = "kg"
+                position.setdefault("id", uuid.uuid4().hex)
+                position.setdefault("planned_amount", "0")
+                line_key = _line_key(position.get("name"), position.get("unit"))
+                position.setdefault(
+                    "loading_line_id",
+                    route_line_ids_by_key.get(
+                        (route_key, *line_key), line_ids_by_key.get(line_key, "")
+                    ),
+                )
+                _normalize_shipment(position)
+
+    loading = record.get("loading")
+    loading = loading if isinstance(loading, dict) else {}
+    states = loading.get("route_states")
+    states = states if isinstance(states, dict) else {}
+    record["loading"] = {
+        "status": str(loading.get("status", "new")),
+        "last_saved_at": str(loading.get("last_saved_at", "")),
+        "last_saved_by": _actor(loading.get("last_saved_by")),
+        "route_states": {
+            route_key: _normalize_route_loading(states.get(route_key))
+            for route_key in route_keys
+        },
+    }
+    if record["loading"]["status"] not in {"new", "draft", "loaded"}:
+        record["loading"]["status"] = "new"
+    _refresh_overall_loading_status(record)
+    record.setdefault("revision", 0)
 
 
 def _read_payload() -> dict:
@@ -175,7 +518,22 @@ def _store_columns(sheet) -> list[tuple[int, str]]:
     return columns
 
 
-def _route_snapshot(sheet, route_number: int, aggregate: dict[tuple[str, str], dict]) -> dict:
+def _aggregate_line(aggregate: dict[tuple[str, str], dict], name: str) -> dict:
+    key = _line_key(name, "kg")
+    return aggregate.setdefault(
+        key,
+        {
+            "id": uuid.uuid4().hex,
+            "name": name,
+            "unit": "kg",
+            "planned_amount": Decimal("0"),
+        },
+    )
+
+
+def _route_snapshot(sheet, route_number: int) -> tuple[dict, list[dict]]:
+    route_key = f"route_{route_number}"
+    aggregate: dict[tuple[str, str], dict] = {}
     stores = _store_columns(sheet)
     destinations = [
         {"id": uuid.uuid4().hex, "name": name, "positions": []}
@@ -194,39 +552,54 @@ def _route_snapshot(sheet, route_number: int, aggregate: dict[tuple[str, str], d
             if value in (None, ""):
                 continue
             planned_amount = _quantity(value, "Заказано")
-            position = {
-                "id": uuid.uuid4().hex,
-                "name": name,
-                "unit": "kg",
-                "planned_amount": planned_amount,
-            }
-            destination_by_column[column]["positions"].append(position)
-            key = (name.casefold(), "kg")
-            line = aggregate.setdefault(
-                key,
+            aggregate_line = _aggregate_line(aggregate, name)
+            aggregate_line["planned_amount"] += _decimal(planned_amount, "Заказано")
+            destination_by_column[column]["positions"].append(
                 {
                     "id": uuid.uuid4().hex,
+                    "loading_line_id": aggregate_line["id"],
                     "name": name,
                     "unit": "kg",
-                    "planned_amount": Decimal("0"),
-                },
+                    "planned_amount": planned_amount,
+                    "shipment": {
+                        "status": "pending",
+                        "operation_id": "",
+                        "completed_at": "",
+                        "completed_by": _actor({}),
+                        "measurement": _empty_measurement(),
+                    },
+                }
             )
-            line["planned_amount"] += _decimal(planned_amount, "Заказано")
 
-    return {
-        "route_key": f"route_{route_number}",
+    route = {
+        "route_key": route_key,
         "route_label": f"Маршрут №{route_number}",
         "area": ROUTE_AREAS[route_number - 1] if route_number <= len(ROUTE_AREAS) else "",
         "destinations": [destination for destination in destinations if destination["positions"]],
     }
+    lines = [
+        {
+            "id": line["id"],
+            "route_key": route_key,
+            "name": line["name"],
+            "unit": line["unit"],
+            "planned_amount": _quantity(line["planned_amount"], "Заказано"),
+            "measurement": _empty_measurement(),
+        }
+        for line in aggregate.values()
+    ]
+    lines.sort(key=lambda item: (item["name"].casefold(), item["unit"]))
+    return route, lines
+
+
 def _workbook_snapshot(output_file: Path) -> tuple[list[dict], list[dict]]:
     try:
         workbook = load_workbook(output_file, data_only=True, read_only=True)
     except (OSError, ValueError) as error:
         raise OrderRecordError("Не удалось прочитать обработанный заказ") from error
 
-    aggregate: dict[tuple[str, str], dict] = {}
     routes = []
+    lines = []
     try:
         sheets = sorted(
             (
@@ -237,27 +610,13 @@ def _workbook_snapshot(output_file: Path) -> tuple[list[dict], list[dict]]:
             key=lambda item: item[0],
         )
         for number, sheet in sheets:
-            route = _route_snapshot(sheet, number, aggregate)
+            route, route_lines = _route_snapshot(sheet, number)
             if route["destinations"]:
                 routes.append(route)
+                lines.extend(route_lines)
     finally:
         workbook.close()
 
-    lines = []
-    for line in aggregate.values():
-        lines.append(
-            {
-                "id": line["id"],
-                "name": line["name"],
-                "unit": line["unit"],
-                "planned_amount": _quantity(line["planned_amount"], "Заказано"),
-                "loaded_box_count": "",
-                "tare_weight": "",
-                "gross_weight": "",
-                "net_weight": "",
-            }
-        )
-    lines.sort(key=lambda item: (item["name"].casefold(), item["unit"]))
     if not routes or not lines:
         raise OrderRecordError("В обработанном заказе не найдены позиции маршрутов")
     return routes, lines
@@ -311,7 +670,11 @@ def create_processed_order_record(
         "loading": {
             "status": "new",
             "last_saved_at": "",
-            "last_saved_by": {"kind": "", "id": "", "name": ""},
+            "last_saved_by": _actor({}),
+            "route_states": {
+                str(route["route_key"]): _empty_route_loading()
+                for route in routes
+            },
         },
         "routes": routes,
         "loading_lines": loading_lines,
@@ -323,19 +686,233 @@ def create_processed_order_record(
     return deepcopy(record)
 
 
+def _record_loading_ready(record: dict) -> bool:
+    route_keys = _route_keys(record)
+    if any(_route_lines(record, route_key) for route_key in route_keys):
+        return bool(route_keys) and all(
+            route_loading_ready(record, route_key) for route_key in route_keys
+        )
+    return _legacy_loading_ready(record)
+
+
+def loading_route_summaries(record: dict) -> list[dict]:
+    route_labels = {
+        str(route.get("route_key", "")): str(route.get("route_label", ""))
+        for route in record.get("routes", [])
+        if isinstance(route, dict)
+    }
+    summaries = []
+    for route_key in _route_keys(record):
+        lines = _route_lines(record, route_key)
+        if not lines:
+            continue
+        state = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {})
+        summaries.append(
+            {
+                "route_key": route_key,
+                "route_label": route_labels.get(route_key, route_key),
+                "status": str(state.get("status", "new")),
+                "line_count": len(lines),
+                "ready": route_loading_ready(record, route_key),
+            }
+        )
+    return summaries
+
+
+def _destinations(record: dict):
+    for route in record.get("routes", []):
+        if not isinstance(route, dict):
+            continue
+        for destination in route.get("destinations", []):
+            if isinstance(destination, dict):
+                yield route, destination
+
+
+def shipment_status(record: dict) -> str:
+    if not _record_loading_ready(record):
+        return "waiting_loading"
+    destinations = list(_destinations(record))
+    if not destinations:
+        return "shipment_completed"
+    completed = [
+        all((position.get("shipment") or {}).get("status") == "completed" for position in destination.get("positions", []))
+        for _, destination in destinations
+    ]
+    if all(completed):
+        return "shipment_completed"
+    return "shipment_in_progress" if any(completed) else "ready_for_shipment"
+
+
+def _format_number(value: Decimal) -> str:
+    rendered = format(value, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def logistics_summary(record: dict) -> dict:
+    lines: dict[tuple[str, str], dict] = {}
+    line_groups: dict[str, tuple[str, str]] = {}
+    for loading_line in record.get("loading_lines", []):
+        if not isinstance(loading_line, dict):
+            continue
+        key = _line_key(loading_line.get("name"), loading_line.get("unit"))
+        line = lines.setdefault(
+            key,
+            {
+                "id": str(loading_line.get("id", "")),
+                "name": str(loading_line.get("name", "")),
+                "planned": Decimal("0"),
+                "loaded": Decimal("0"),
+                "shipped": Decimal("0"),
+            },
+        )
+        line_groups[str(loading_line.get("id", ""))] = key
+        try:
+            line["planned"] += _decimal(loading_line.get("planned_amount", "0"), "Заказано")
+        except OrderRecordError:
+            continue
+        measurement = loading_line.get("measurement") or {}
+        route_key = str(loading_line.get("route_key", ""))
+        ready = route_loading_ready(record, route_key) if route_key else _legacy_loading_ready(record)
+        if ready and _measurement_complete(measurement):
+            line["loaded"] += _decimal(measurement["net_weight_kg"], "Чистый вес")
+
+    for _, destination in _destinations(record):
+        for position in destination.get("positions", []):
+            if not isinstance(position, dict):
+                continue
+            shipment = position.get("shipment") or {}
+            measurement = shipment.get("measurement") or {}
+            line = lines.get(line_groups.get(str(position.get("loading_line_id", ""))))
+            if line is None or shipment.get("status") != "completed" or not _shipment_measurement_complete(measurement):
+                continue
+            line["shipped"] += _decimal(measurement["net_weight_kg"], "Чистый вес")
+
+    items = []
+    total_ordered = Decimal("0")
+    total_loaded = Decimal("0")
+    total_shipped = Decimal("0")
+    total_shortage = Decimal("0")
+    total_surplus = Decimal("0")
+    for line in sorted(lines.values(), key=lambda item: item["name"].casefold()):
+        shortage = max(line["planned"] - line["shipped"], Decimal("0"))
+        surplus = max(line["shipped"] - line["planned"], Decimal("0"))
+        items.append(
+            {
+                "id": line["id"],
+                "name": line["name"],
+                "planned_kg": _format_number(line["planned"]),
+                "loaded_net_kg": _format_number(line["loaded"]),
+                "shipped_net_kg": _format_number(line["shipped"]),
+                "underload_kg": _format_number(max(line["planned"] - line["loaded"], Decimal("0"))),
+                "shortage_kg": _format_number(shortage),
+                "surplus_kg": _format_number(surplus),
+                "loading_to_shipment_kg": _format_number(line["loaded"] - line["shipped"]),
+            }
+        )
+        total_ordered += line["planned"]
+        total_loaded += line["loaded"]
+        total_shipped += line["shipped"]
+        total_shortage += shortage
+        total_surplus += surplus
+
+    return {
+        "loading_ready": _record_loading_ready(record),
+        "shipment_status": shipment_status(record),
+        "routes": loading_route_summaries(record),
+        "items": items,
+        "total_ordered_kg": _format_number(total_ordered),
+        "total_loaded_net_kg": _format_number(total_loaded),
+        "total_shipped_net_kg": _format_number(total_shipped),
+        "total_underload_kg": _format_number(max(total_ordered - total_loaded, Decimal("0"))),
+        "total_shortage_kg": _format_number(total_shortage),
+        "total_surplus_kg": _format_number(total_surplus),
+        "total_loading_to_shipment_kg": _format_number(total_loaded - total_shipped),
+    }
+
+
+def list_route_trip_summaries(processed_date: str, mode: str) -> list[dict]:
+    requested_date = datetime.strptime(processed_date, "%Y-%m-%d").date()
+    with _LOCK:
+        records = _read_payload()["records"]
+    trips = []
+    for record in records:
+        if record.get("mode") != mode:
+            continue
+        try:
+            processed_at = datetime.fromisoformat(str(record.get("processed_at", "")))
+        except ValueError:
+            continue
+        if processed_at.astimezone().date() != requested_date:
+            continue
+        for route in record.get("routes", []):
+            route_key = str(route.get("route_key", ""))
+            lines = _route_lines(record, route_key)
+            linked = bool(lines)
+            ready = linked and route_loading_ready(record, route_key)
+            loading_status = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {}).get("status", "new")
+            stores = []
+            shipped_total = Decimal(0)
+            confirmed_positions = 0
+            for destination in route.get("destinations", []):
+                positions = destination.get("positions", [])
+                confirmed = [
+                    position for position in positions
+                    if (position.get("shipment") or {}).get("status") == "completed"
+                    and _shipment_measurement_complete((position.get("shipment") or {}).get("measurement"))
+                ]
+                confirmed_positions += len(confirmed)
+                shipped = sum((
+                    _decimal(position["shipment"]["measurement"]["net_weight_kg"], "Отгружено")
+                    for position in confirmed
+                ), Decimal(0))
+                shipped_total += shipped
+                completed = bool(positions) and len(confirmed) == len(positions)
+                stores.append({
+                    "id": str(destination.get("id", "")), "name": str(destination.get("name", "")),
+                    "completed": completed,
+                    "status": "Отгружено" if completed else "Частично" if confirmed else "Ожидает",
+                    "shipped_net_kg": _format_number(shipped) if confirmed else "—",
+                })
+            completed_count = sum(store["completed"] for store in stores)
+            if stores and completed_count == len(stores):
+                stage = "Отгрузка завершена"
+            elif confirmed_positions:
+                stage = "Отгрузка идёт"
+            elif ready:
+                stage = "Готов к отгрузке"
+            elif loading_status == "draft":
+                stage = "Загрузка начата"
+            else:
+                stage = "Ожидает загрузки"
+            loaded = sum((_decimal(line["measurement"]["net_weight_kg"], "Загружено") for line in lines), Decimal(0)) if ready else None
+            trips.append({
+                "order_record_id": str(record["id"]), "order_number": str(record.get("order_number", "")),
+                "client_name": str(record.get("client_name", "")), "processed_at": processed_at.astimezone().isoformat(),
+                "mode": mode, "route_key": route_key, "route_label": str(route.get("route_label", route_key)),
+                "stage": stage, "loading_ready": ready, "limited_data": not linked,
+                "loaded_net_kg": _format_number(loaded) if loaded is not None else "—",
+                "shipped_net_kg": _format_number(shipped_total) if confirmed_positions else "—",
+                "completed_stores": completed_count, "store_count": len(stores), "stores": stores,
+            })
+    return sorted(trips, key=lambda trip: (trip["processed_at"], trip["order_record_id"], trip["route_key"]), reverse=True)
+
+
 def list_order_record_summaries() -> list[dict]:
     with _LOCK:
         records = _read_payload()["records"]
-    summaries = [
-        {
-            "id": str(record.get("id", "")),
-            "order_number": str(record.get("order_number", "")),
-            "client_name": str(record.get("client_name", "")),
-            "processed_at": str(record.get("processed_at", "")),
-            "status": str((record.get("loading") or {}).get("status", "new")),
-        }
-        for record in records
-    ]
+    summaries = []
+    for record in records:
+        summary = logistics_summary(record)
+        summaries.append(
+            {
+                "id": str(record.get("id", "")),
+                "order_number": str(record.get("order_number", "")),
+                "client_name": str(record.get("client_name", "")),
+                "processed_at": str(record.get("processed_at", "")),
+                "status": str((record.get("loading") or {}).get("status", "new")),
+                "shipment_status": summary["shipment_status"],
+            }
+        )
     return sorted(summaries, key=lambda item: item["processed_at"], reverse=True)
 
 
@@ -359,49 +936,201 @@ def load_order_record(order_record_id: str) -> dict:
     raise OrderRecordNotFound("Заказ не найден")
 
 
-def save_loading_update(
+def _find_record(payload: dict, order_record_id: str) -> dict:
+    record = next(
+        (item for item in payload["records"] if item.get("id") == order_record_id),
+        None,
+    )
+    if record is None:
+        raise OrderRecordNotFound("Заказ не найден")
+    return record
+
+
+def _draft_value(value: object, field: str) -> str:
+    if value in (None, ""):
+        return ""
+    if field == "box_count":
+        return _integer_quantity(value, "Количество ящиков")
+    if field == "tare_weight_per_box_kg":
+        return _quantity(value, "Вес тары")
+    if field == "gross_weight_kg":
+        return _quantity(value, "Грязный вес")
+    zero_reason = str(value).strip()
+    if zero_reason not in ZERO_REASON_OPTIONS:
+        raise OrderRecordError("Некорректная причина нулевой позиции")
+    return zero_reason
+
+
+def _refresh_draft_net_weight(measurement: dict) -> None:
+    measurement["net_weight_kg"] = ""
+    if any(
+        str(measurement.get(field, "")).strip() == ""
+        for field in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg")
+    ):
+        return
+    try:
+        net_weight = calculate_net_weight(
+            measurement["gross_weight_kg"],
+            measurement["tare_weight_per_box_kg"],
+            measurement["box_count"],
+        )
+    except OrderRecordError:
+        return
+    if net_weight >= 0:
+        measurement["net_weight_kg"] = _quantity(net_weight, "Чистый вес")
+
+
+def _route_state(record: dict, route_key: str) -> dict:
+    states = record["loading"]["route_states"]
+    if route_key not in states:
+        raise OrderRecordNotFound("Маршрут не найден в заказе")
+    return states[route_key]
+
+
+def save_loading_draft(
+    order_record_id: str,
+    route_key: str,
+    line_id: str,
+    field: str,
+    value: object,
+    actor: dict,
+) -> dict:
+    if field not in {"box_count", "tare_weight_per_box_kg", "gross_weight_kg", "zero_reason"}:
+        raise OrderRecordError("Некорректное поле загрузки")
+
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        route_state = _route_state(record, route_key)
+        if route_state["status"] == "loaded":
+            raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
+        line = next(
+            (item for item in _route_lines(record, route_key) if item.get("id") == line_id),
+            None,
+        )
+        if line is None:
+            raise OrderRecordNotFound("Позиция не найдена в маршруте")
+
+        source_measurement = line.get("measurement") if isinstance(line.get("measurement"), dict) else {}
+        measurement = {
+            key: str(source_measurement.get(key, ""))
+            for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason")
+        }
+        measurement[field] = _draft_value(value, field)
+        if field == "zero_reason" and not is_zero_measurement(measurement):
+            raise OrderRecordError("Причину можно указать только для нулевой позиции")
+        _refresh_draft_net_weight(measurement)
+        if not is_zero_measurement(measurement):
+            measurement["zero_reason"] = ""
+        line["measurement"] = measurement
+        route_state.update(
+            {
+                "status": "draft",
+                "last_saved_at": _now(),
+                "last_saved_by": _actor(actor),
+            }
+        )
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def confirm_route_loading(
     order_record_id: str,
     revision: int,
-    box_counts: dict[str, object],
+    route_key: str,
     actor: dict,
 ) -> dict:
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise OrderRecordError("Некорректная версия заказа")
-    if not isinstance(box_counts, dict):
-        raise OrderRecordError("Некорректные данные загрузки")
 
     with _LOCK:
         payload = _read_payload()
-        record = next(
-            (item for item in payload["records"] if item.get("id") == order_record_id),
-            None,
-        )
-        if record is None:
-            raise OrderRecordNotFound("Заказ не найден")
+        record = _find_record(payload, order_record_id)
         if record.get("revision") != revision:
             raise OrderRecordConflict("Данные загрузки уже изменены другим пользователем")
-
-        lines = record.get("loading_lines")
-        if not isinstance(lines, list):
-            raise OrderRecordError("В заказе отсутствуют позиции загрузки")
-        line_ids = {str(line.get("id", "")) for line in lines}
-        if not line_ids or set(box_counts) != line_ids:
-            raise OrderRecordError("Заполните загрузку для каждой позиции")
+        route_state = _route_state(record, route_key)
+        if route_state["status"] == "loaded":
+            raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
+        lines = _route_lines(record, route_key)
+        if not lines:
+            raise OrderRecordNotFound("В маршруте отсутствуют позиции загрузки")
 
         for line in lines:
-            line["loaded_box_count"] = _integer_quantity(
-                box_counts[str(line["id"])], "Загружено"
+            line["measurement"] = _validated_measurement(
+                line.get("measurement"), require_zero_reason=True
             )
 
+        confirmed_at = _now()
+        route_state.update(
+            {
+                "status": "loaded",
+                "last_saved_at": confirmed_at,
+                "last_saved_by": _actor(actor),
+                "confirmed_at": confirmed_at,
+                "confirmed_by": _actor(actor),
+            }
+        )
         record["revision"] += 1
-        record["loading"] = {
-            "status": "loaded",
-            "last_saved_at": _now(),
-            "last_saved_by": {
-                "kind": str(actor.get("kind", "")),
-                "id": str(actor.get("id", "")),
-                "name": str(actor.get("name", "")),
-            },
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def _find_destination(record: dict, route_key: str, destination_id: str) -> tuple[dict, dict]:
+    for route, destination in _destinations(record):
+        if route.get("route_key") == route_key and destination.get("id") == destination_id:
+            return route, destination
+    raise OrderRecordNotFound("Магазин не найден в заказе")
+
+
+def save_store_shipment(
+    order_record_id: str,
+    route_key: str,
+    destination_id: str,
+    measurements: dict[str, object],
+    operation_id: str,
+    actor: dict,
+) -> dict:
+    if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
+        raise OrderRecordError("Некорректный идентификатор операции")
+    if not isinstance(measurements, dict):
+        raise OrderRecordError("Некорректные данные отгрузки")
+
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        if not route_loading_ready(record, route_key):
+            raise OrderRecordConflict("Склад ещё не подтвердил загрузку маршрута")
+        _, destination = _find_destination(record, route_key, destination_id)
+        positions = destination.get("positions")
+        if not isinstance(positions, list):
+            raise OrderRecordError("В магазине отсутствуют позиции")
+        position_ids = {str(position.get("id", "")) for position in positions}
+        if not position_ids or set(measurements) != position_ids:
+            raise OrderRecordError("Заполните отгрузку для каждой позиции")
+
+        existing_operations = {
+            str((position.get("shipment") or {}).get("operation_id", ""))
+            for position in positions
         }
+        if operation_id in existing_operations:
+            return deepcopy(record)
+        if any((position.get("shipment") or {}).get("status") == "completed" for position in positions):
+            raise OrderRecordConflict("Магазин уже подтверждён")
+
+        completed_at = _now()
+        completed_by = _actor(actor)
+        for position in positions:
+            position["shipment"] = {
+                "status": "completed",
+                "operation_id": operation_id,
+                "completed_at": completed_at,
+                "completed_by": completed_by,
+                "measurement": _validated_shipment_measurement(measurements[str(position["id"])]),
+            }
+
+        record["revision"] += 1
         _atomic_write(payload)
         return deepcopy(record)

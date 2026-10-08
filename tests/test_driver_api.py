@@ -5,6 +5,7 @@ from openpyxl import Workbook
 from starlette.testclient import TestClient
 
 from modules import driver_mileage, driver_orders, fleet, loader_sessions, paths
+import orders_dashboard.orders_dashboard as dashboard
 from orders_dashboard.orders_dashboard import custom_api
 
 
@@ -124,6 +125,68 @@ def test_driver_api_login_csrf_and_completion(client, driver_api_fixture):
     assert completed.status_code == 200
     assert completed.json()["assignment"]["completed_stores"] == 1
     assert completed.json()["assignment"]["summary"][0]["completed"] == 8
+
+
+def test_driver_api_links_shipment_to_loading_record(client, driver_api_fixture, monkeypatch):
+    driver, snapshot = driver_api_fixture
+    store = snapshot["stores"][0]
+    line = store["lines"][0]
+    snapshot["order_record_id"] = "record-1"
+    store["order_record_destination_id"] = "destination-1"
+    line["order_record_position_id"] = "position-1"
+    driver_orders.save_snapshot(snapshot)
+
+    ready = {"value": False}
+    captured = {}
+    monkeypatch.setattr(dashboard, "load_order_record", lambda record_id: {"id": record_id})
+    monkeypatch.setattr(dashboard, "route_loading_ready", lambda record, route_key: ready["value"])
+    monkeypatch.setattr(
+        dashboard,
+        "logistics_summary",
+        lambda record: {
+            "loading_ready": ready["value"],
+            "shipment_status": "ready_for_shipment" if ready["value"] else "waiting_loading",
+        },
+    )
+
+    def save_shipment(*args):
+        if not ready["value"]:
+            raise dashboard.OrderRecordConflict("Склад ещё не подтвердил загрузку")
+        captured["args"] = args
+        return {"id": "record-1"}
+
+    monkeypatch.setattr(dashboard, "save_store_shipment", save_shipment)
+    login = client.post("/api/driver/login", json={"driver_id": driver["id"], "pin": "1234"})
+    csrf = login.json()["csrf_token"]
+    submit_mileage(client, login)
+
+    order = client.get("/api/driver/order")
+    assert order.json()["assignment"]["loading_status"] == "waiting_loading"
+    values = {
+        line["line_id"]: {
+            "box_count": "2",
+            "tare_weight_per_box_kg": "0.5",
+            "gross_weight_kg": "9",
+        }
+    }
+    blocked = client.post(
+        f"/api/driver/order/stores/{store['store_id']}/complete",
+        headers={"x-driver-csrf": csrf},
+        json={"measurements": values, "operation_id": "blocked", "base_revision": 0},
+    )
+    assert blocked.status_code == 409
+
+    ready["value"] = True
+    completed = client.post(
+        f"/api/driver/order/stores/{store['store_id']}/complete",
+        headers={"x-driver-csrf": csrf},
+        json={"measurements": values, "operation_id": "operation-1", "base_revision": 0},
+    )
+
+    assert completed.status_code == 200
+    assert captured["args"][0:3] == ("record-1", "route_1", "destination-1")
+    assert captured["args"][3] == {"position-1": values[line["line_id"]]}
+    assert completed.json()["assignment"]["stores"][0]["lines"][0]["actual_qty"] == "8"
 
 
 def test_driver_api_accepts_login_code_and_requires_csrf_for_logout(client, driver_api_fixture):
