@@ -21,6 +21,9 @@ from modules.order_records import (
     confirm_route_loading,
     confirm_store_loading,
     loading_line_net_weight,
+    loading_measurement_parts,
+    loading_measurement_totals,
+    change_loading_weighing,
     loading_mode_locked,
     route_loading_mode,
     save_store_loading_draft,
@@ -104,15 +107,34 @@ def _route_summary(record: dict) -> str:
     return " · ".join(item for item in routes if item)
 
 
-def _measurement(measurement: object) -> dict[str, str]:
+def _measurement(measurement: object) -> dict:
     measurement = measurement if isinstance(measurement, dict) else {}
-    return {
-        key: str(measurement.get(key, ""))
-        for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason")
-    }
+    result = {key: str(measurement.get(key, "")) for key in (
+        "box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason",
+    )}
+    if "weighings" in measurement:
+        result["weighings"] = [{**_measurement(part), "id": part["id"]} for part in loading_measurement_parts(measurement)]
+    return result
+
+
+def _weighing_rows(measurement: dict, context: dict) -> list[dict]:
+    parts = loading_measurement_parts(measurement)
+    return [{**context, **part, "weighing_id": str(part.get("id", "")) if "weighings" in measurement else "", "id": context["id"],
+             "label": f"Взвешивание {index + 1}", "can_remove": len(parts) > 1,
+             "preview_net_weight_kg": _preview_net(part), "needs_zero_reason": is_zero_measurement(part)}
+            for index, part in enumerate(parts)]
+
+
+def _decorate_loading_rows(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        row["partial_net_weight_kg"] = loading_measurement_totals(row)["partial_net_weight_kg"]
+        row["weighings"] = _weighing_rows(row.copy(), {key: row[key] for key in ("id", "order_id", "route_key", "destination_id", "name")})
+    return rows
 
 
 def _preview_net(measurement: dict[str, str]) -> str:
+    if "weighings" in measurement:
+        return loading_measurement_totals(measurement)["net_weight_kg"]
     if any(measurement[key].strip() == "" for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg")):
         return ""
     try:
@@ -151,7 +173,7 @@ def _loading_rows(
                 "preview_net_weight_kg": _preview_net(measurement),
             }
         )
-    return rows
+    return _decorate_loading_rows(rows)
 
 
 def _store_loading_rows(record: dict, route_key: str, destination: dict) -> list[dict]:
@@ -167,7 +189,7 @@ def _store_loading_rows(record: dict, route_key: str, destination: dict) -> list
             **measurement, "needs_zero_reason": is_zero_measurement(measurement),
             "preview_net_weight_kg": _preview_net(measurement), "shipped_net_kg": shipped,
         })
-    return rows
+    return _decorate_loading_rows(rows)
 
 
 def _store_loading_cards(record: dict, route_key: str) -> list[dict]:
@@ -309,6 +331,7 @@ class LoadingState(rx.State):
     store_confirmed_count: int = 0
     store_confirmed_net_kg: str = "0"
     route_is_ready: bool = False
+    _last_weighing_request: str = ""
 
     @rx.var
     def filtered_store_cards(self) -> list[dict]:
@@ -341,18 +364,75 @@ class LoadingState(rx.State):
             return
         self._apply_record(self.selected_order_id, self.selected_route_key)
 
-    def set_context_measurement_field(self, order_id: str, route_key: str, destination_id: str, position_id: str, field: str, value: str):
+    def _patch_loading_measurement(self, record: dict, route_key: str, destination_id: str, position_id: str):
+        if str(record["id"]) != self.selected_order_id:
+            return
+        self.selected_record = record
+        if route_key != self.selected_route_key:
+            return
+        self.mode_locked = True
+        if destination_id:
+            route = next(item for item in record["routes"] if item["route_key"] == route_key)
+            destination = next(item for item in route["destinations"] if item["id"] == destination_id)
+            self.store_cards = [
+                {**item, "status": "draft", "status_label": "Черновик"} if item["id"] == destination_id else item
+                for item in self.store_cards
+            ]
+            if destination_id != self.selected_store_id:
+                return
+            position = next(item for item in destination["positions"] if item["id"] == position_id)
+            measurement = _measurement((position.get("loading") or {}).get("measurement"))
+        else:
+            line = next(item for item in record["loading_lines"] if item["id"] == position_id)
+            measurement = _measurement(line.get("measurement"))
+            self.draft_measurements = {**self.draft_measurements, position_id: measurement}
+        # Keep numeric value props unchanged: a delayed ACK must not reset newer local typing.
+        self.loading_rows = [
+            {
+                **row, "preview_net_weight_kg": _preview_net(measurement),
+                "partial_net_weight_kg": loading_measurement_totals(measurement)["partial_net_weight_kg"],
+                "weighings": [
+                    {**old, "preview_net_weight_kg": fresh["preview_net_weight_kg"],
+                     "needs_zero_reason": fresh["needs_zero_reason"], "zero_reason": fresh["zero_reason"]}
+                    for old, fresh in zip(row["weighings"], _weighing_rows(measurement, row))
+                ],
+                "needs_zero_reason": is_zero_measurement(measurement), "zero_reason": measurement["zero_reason"],
+            } if row["id"] == position_id else row
+            for row in self.loading_rows
+        ]
+        self.total_ordered_kg, self.total_loaded_net_kg = _loading_totals(self.loading_rows)
+
+    def set_context_measurement_field(self, order_id: str, route_key: str, destination_id: str, position_id: str, field: str, value: str, weighing_id: str = ""):
         try:
             if destination_id:
-                save_store_loading_draft(order_id, route_key, destination_id, position_id, field, value, self.principal)
+                record = save_store_loading_draft(order_id, route_key, destination_id, position_id, field, value, self.principal, weighing_id)
             else:
-                save_loading_draft(order_id, route_key, position_id, field, value, self.principal)
+                record = save_loading_draft(order_id, route_key, position_id, field, value, self.principal, weighing_id)
         except OrderRecordError as error:
             self._apply_record(self.selected_order_id, self.selected_route_key)
             self.status = str(error)
             return
-        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self._patch_loading_measurement(record, route_key, destination_id, position_id)
         self.status = "Черновик сохранён"
+
+    def change_context_weighing(self, order_id: str, route_key: str, destination_id: str,
+                                position_id: str, revision: int, remove_id: str):
+        request = repr((order_id, route_key, destination_id, position_id, revision, remove_id))
+        if request == self._last_weighing_request:
+            return
+        if order_id != self.selected_order_id or route_key != self.selected_route_key:
+            return
+        # Blur saves queued before the click may advance the form revision.
+        # Use the acknowledged revision, while deduplicating the captured click.
+        try:
+            change_loading_weighing(order_id, int(self.selected_record["revision"]), route_key, destination_id,
+                                   position_id, self.principal, remove_id or None)
+        except OrderRecordError as error:
+            self.status = str(error)
+            return
+        self._last_weighing_request = request
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.status = "Взвешивание удалено" if remove_id else "Взвешивание добавлено"
 
     def confirm_selected_store(self):
         if not self.selected_store_id or self.is_read_only:
@@ -714,89 +794,85 @@ def _loading_context():
 def _measurement_control(row, field: str, label: str):
     return rx.el.label(
         rx.text(label, class_name="loading-mobile-label"),
-        rx.el.input(value=row[field], on_change=LoadingState.set_context_measurement_field(row["order_id"], row["route_key"], row["destination_id"], row["id"], field),
-                 type="text", input_mode="numeric" if field == "box_count" else "decimal",
-                 disabled=LoadingState.is_read_only, aria_label=row["name"].to(str) + ": " + label,
-                 class_name="loading-amount-input"),
+        rx.debounce_input(
+            rx.el.input(
+                value=row[field],
+                on_change=lambda value: LoadingState.set_context_measurement_field(row["order_id"], row["route_key"], row["destination_id"], row["id"], field, value, row["weighing_id"]),
+                type="text", input_mode="numeric" if field == "box_count" else "decimal",
+                disabled=LoadingState.is_read_only, aria_label=row["name"].to(str) + ": " + label,
+                class_name="loading-amount-input",
+                key=row["order_id"].to(str) + ":" + row["route_key"].to(str) + ":" + row["destination_id"].to(str) + ":" + row["id"].to(str) + ":" + row["weighing_id"].to(str) + ":" + field,
+            ),
+            debounce_timeout=350, force_notify_on_blur=True, force_notify_by_enter=True,
+        ),
         class_name="loading-measurement-control",
+    )
+
+
+def _weighing_controls(part):
+    return rx.vstack(
+        rx.hstack(
+            rx.text(part["label"], class_name="loading-weighing-label"),
+            _measurement_control(part, "box_count", "Ящики"),
+            _measurement_control(part, "tare_weight_per_box_kg", "Тара, кг/ящик"),
+            _measurement_control(part, "gross_weight_kg", "Брутто, кг"),
+            rx.text("Нетто: ", part["preview_net_weight_kg"], rx.cond(part["preview_net_weight_kg"] != "", " кг", "—")),
+            rx.cond(
+                part["can_remove"].to(bool) & ~LoadingState.is_read_only,
+                rx.alert_dialog.root(
+                    rx.alert_dialog.trigger(rx.button("Удалить", variant="ghost", color_scheme="red")),
+                    rx.alert_dialog.content(
+                        rx.alert_dialog.title("Удалить взвешивание?"),
+                        rx.alert_dialog.description("Вес этой порции будет исключён из итога товара."),
+                        rx.hstack(
+                            rx.alert_dialog.cancel(rx.button("Отмена", variant="soft")),
+                            rx.alert_dialog.action(rx.button("Удалить взвешивание", color_scheme="red", on_click=LoadingState.change_context_weighing(
+                                part["order_id"], part["route_key"], part["destination_id"], part["id"], LoadingState.selected_record["revision"].to(int), part["weighing_id"]))),
+                            justify="end", margin_top="16px",
+                        ),
+                    ),
+                ), rx.box(),
+            ),
+            class_name="loading-weighing-fields", width="100%", align="center",
+        ),
+        rx.cond(
+            part["needs_zero_reason"],
+            rx.hstack(
+                rx.text("Причина нулевой позиции"),
+                rx.cond(LoadingState.is_read_only, rx.text(part["zero_reason"]), rx.select(
+                    list(ZERO_REASON_OPTIONS), value=part["zero_reason"],
+                    on_change=lambda value: LoadingState.set_context_measurement_field(part["order_id"], part["route_key"], part["destination_id"], part["id"], "zero_reason", value, part["weighing_id"]),
+                    placeholder="Укажите причину",
+                )), wrap="wrap",
+            ), rx.box(),
+        ),
+        class_name="loading-weighing", width="100%", align="start", key=part["weighing_id"].to(str),
     )
 
 
 def _loading_table():
     return rx.vstack(
-        rx.hstack(
-            rx.vstack(
-                rx.heading("Загрузка", size="3"),
-                rx.text(rx.cond(LoadingState.loading_mode == "stores", "Магазин: " + LoadingState.selected_store_name, "Фактические веса маршрута «" + LoadingState.selected_route_label + "»"), class_name="loading-panel-description"),
-                align="start", spacing="1",
+        rx.heading("Загрузка", size="3"),
+        rx.text(rx.cond(LoadingState.loading_mode == "stores", "Магазин: " + LoadingState.selected_store_name, "Фактические веса маршрута «" + LoadingState.selected_route_label + "»"), class_name="loading-panel-description"),
+        rx.foreach(LoadingState.loading_rows, lambda row: rx.vstack(
+            rx.hstack(
+                rx.text(row["name"], class_name="loading-product-name"), rx.spacer(),
+                rx.text("Заказано: ", row["planned_kg"], " кг"), wrap="wrap", width="100%",
             ),
-            rx.text(LoadingState.summary_position_count, " поз.", class_name="loading-count"),
-            class_name="loading-panel-heading",
-            width="100%",
-            align="start",
-        ),
-        rx.box(
-            rx.vstack(
-                rx.hstack(
-                    rx.text("Товар", class_name="loading-table-title"),
-                    rx.text("Заказано, кг", class_name="loading-table-title"),
-                    rx.text("Ящики", class_name="loading-table-title"),
-                    rx.text("Тара, кг/ящ.", class_name="loading-table-title"),
-                    rx.text("Брутто, кг", class_name="loading-table-title"),
-                    rx.text("Нетто, кг", class_name="loading-table-title"),
-                    class_name="loading-table-row loading-table-header loading-table-measurement-row",
-                ),
-                rx.foreach(
-                    LoadingState.loading_rows,
-                    lambda row: rx.vstack(
-                        rx.hstack(
-                            rx.text(row["name"], class_name="loading-product-name"),
-                            rx.text(row["planned_kg"], " кг", class_name="loading-table-value", custom_attrs={"data-label": "Заказано"}),
-                            _measurement_control(row, "box_count", "Ящики"),
-                            _measurement_control(row, "tare_weight_per_box_kg", "Тара, кг/ящик"),
-                            _measurement_control(row, "gross_weight_kg", "Брутто, кг"),
-                            rx.text(row["preview_net_weight_kg"], rx.cond(row["preview_net_weight_kg"] != "", " кг", "—"), class_name="loading-table-value loading-net-weight", custom_attrs={"data-label": "Нетто"}),
-                            class_name="loading-table-row loading-table-measurement-row",
-                            align="center",
-                        ),
-                        rx.cond(
-                            row["needs_zero_reason"],
-                            rx.hstack(
-                                rx.text("Причина нулевой позиции", class_name="loading-zero-reason-label"),
-                                rx.cond(
-                                    LoadingState.is_read_only,
-                                    rx.text(row["zero_reason"], class_name="loading-zero-reason-value"),
-                                    rx.select(
-                                        list(ZERO_REASON_OPTIONS),
-                                        value=row["zero_reason"],
-                                        on_change=LoadingState.set_context_measurement_field(row["order_id"], row["route_key"], row["destination_id"], row["id"], "zero_reason"),
-                                        placeholder="Укажите причину",
-                                        width="min(100%, 360px)",
-                                        class_name="loading-zero-reason-select",
-                                    ),
-                                ),
-                                class_name="loading-zero-reason",
-                                width="100%",
-                                align="center",
-                                wrap="wrap",
-                            ),
-                            rx.box(),
-                        ),
-                        width="100%",
-                        spacing="0",
-                    ),
-                ),
-                rx.hstack(
-                    rx.text("Итого", class_name="loading-total-title"),
-                    rx.text("Заказано: ", LoadingState.total_ordered_kg, " кг", class_name="loading-table-value"),
-                    rx.text("Загружено нетто: ", LoadingState.total_loaded_net_kg, " кг", class_name="loading-table-value"),
-                    rx.spacer(),
-                    class_name="loading-table-total",
-                ),
-                width="100%", spacing="0", class_name="loading-table",
+            rx.foreach(row["weighings"].to(list[dict]), _weighing_controls),
+            rx.hstack(
+                rx.cond(~LoadingState.is_read_only, rx.button("+ Добавить взвешивание", variant="soft", on_click=LoadingState.change_context_weighing(
+                    row["order_id"], row["route_key"], row["destination_id"], row["id"], LoadingState.selected_record["revision"].to(int), "")), rx.box()),
+                rx.spacer(),
+                rx.text("Итого нетто: ", row["preview_net_weight_kg"], rx.cond(row["preview_net_weight_kg"] != "", " кг", "не все взвешивания заполнены"), class_name="loading-net-weight"),
+                width="100%", wrap="wrap", align="center",
             ),
-            width="100%", class_name="loading-table-wrap",
-        ),
+            rx.cond(row["preview_net_weight_kg"] == "", rx.text(
+                "По заполненным взвешиваниям: ", row["partial_net_weight_kg"], " кг. Черновик — заполните остальные порции.",
+                class_name="loading-panel-description"), rx.box()),
+            class_name="loading-weighing-product", width="100%", align="start", spacing="3", key=row["id"].to(str),
+        )),
+        rx.hstack(rx.text("Итого заказано: ", LoadingState.total_ordered_kg, " кг"), rx.text("Загружено нетто: ", LoadingState.total_loaded_net_kg, " кг"), class_name="loading-table-total", wrap="wrap"),
         width="100%", spacing="3",
     )
 

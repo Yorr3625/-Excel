@@ -234,6 +234,7 @@ def ui_state(record):
     state = SimpleNamespace(selected_order_id="", selected_route_key="", selected_store_id="", order_options=[], principal=ACTOR)
     state._clear_record = page.LoadingState._clear_record.__get__(state)
     state._apply_record = page.LoadingState._apply_record.__get__(state)
+    state._patch_loading_measurement = page.LoadingState._patch_loading_measurement.__get__(state)
     state._refresh_options = lambda: None
     state.select_store = page.LoadingState.select_store.fn.__get__(state)
     state._apply_record(record["id"], "route_4")
@@ -267,6 +268,65 @@ def test_ui_confirmation_locks_only_selected_store(record):
     assert not state.is_read_only
     assert state.store_confirmed_count == 1
     assert state.store_confirmed_net_kg == "9"
+
+
+@pytest.mark.parametrize("mode", ["route", "stores"])
+def test_fast_autosave_supports_comma_decimal_without_full_refresh(record, monkeypatch, mode):
+    if mode == "stores":
+        record = choose(record)
+        dest = destinations(record)[0]
+        record = fill(record, dest, "0", "0", "1,5")
+        destination_id = dest["id"]
+        position_id = dest["positions"][0]["id"]
+    else:
+        line = next(line for line in record["loading_lines"] if line["route_key"] == "route_4")
+        for field, value in {"box_count": "0", "tare_weight_per_box_kg": "0", "gross_weight_kg": "1,5"}.items():
+            record = records.save_loading_draft(record["id"], "route_4", line["id"], field, value, ACTOR)
+        destination_id, position_id = "", line["id"]
+    state = ui_state(record)
+    original_rows = [dict(row) for row in state.loading_rows]
+    original_reconciliation = state.reconciliation
+    original_shipments = state.shipment_rows
+    def unexpected(*args):
+        pytest.fail("Successful autosave must not reload the record or rebuild reconciliation")
+    monkeypatch.setattr(page, "load_order_record", unexpected)
+    monkeypatch.setattr(page, "_return_reconciliation", unexpected)
+    page.LoadingState.set_context_measurement_field.fn(state, record["id"], "route_4", destination_id, position_id, "gross_weight_kg", "0,4")
+    assert state.total_loaded_net_kg == "0.4"
+    assert state.loading_rows[0]["gross_weight_kg"] == original_rows[0]["gross_weight_kg"] == "1.5"
+    assert state.loading_rows[0]["preview_net_weight_kg"] == "0.4"
+    assert state.selected_record["revision"] == record["revision"] + 1
+    assert state.reconciliation is original_reconciliation
+    assert state.shipment_rows is original_shipments
+    assert state.mode_locked
+    saved = records.load_order_record(record["id"])
+    measurement = (destinations(saved)[0]["positions"][0]["loading"]["measurement"] if mode == "stores"
+                   else next(line for line in saved["loading_lines"] if line["id"] == position_id)["measurement"])
+    assert measurement["gross_weight_kg"] == "0.4"
+    assert measurement["net_weight_kg"] == "0.4"
+
+
+def test_autosave_of_previous_store_preserves_current_form_and_revision(record):
+    record = choose(record)
+    first, second = destinations(record)
+    state = ui_state(record)
+    current_rows = state.loading_rows
+    page.LoadingState.set_context_measurement_field.fn(state, record["id"], "route_4", second["id"], second["positions"][0]["id"], "gross_weight_kg", "1,5")
+    assert state.selected_store_id == first["id"]
+    assert state.loading_rows is current_rows
+    assert state.selected_record["revision"] == record["revision"] + 1
+    assert next(card for card in state.store_cards if card["id"] == second["id"])["status"] == "draft"
+
+
+def test_clear_autosaved_weight_removes_preview_without_resetting_buffer(record):
+    record = choose(record)
+    dest = destinations(record)[0]
+    record = fill(record, dest, "0", "0", "0,4")
+    state = ui_state(record)
+    page.LoadingState.set_context_measurement_field.fn(state, record["id"], "route_4", dest["id"], dest["positions"][0]["id"], "gross_weight_kg", "")
+    assert state.total_loaded_net_kg == ""
+    assert state.loading_rows[0]["preview_net_weight_kg"] == ""
+    assert state.loading_rows[0]["gross_weight_kg"] == "0.4"
 
 
 def test_store_loading_page_compiles():

@@ -1352,3 +1352,17 @@ button.loading-store-tile:focus-visible { outline:2px solid var(--accent); outli
   .loading-store-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   button.loading-store-tile { min-height:124px; }
 }
+
+/* Each portion keeps its own tare; the product total is net weight only. */
+.loading-weighing-product { padding: 16px; border: 1px solid var(--line); border-radius: 12px; }
+.loading-weighing { padding: 12px 0; border-top: 1px solid var(--line); }
+.loading-weighing-fields { display: grid; grid-template-columns: minmax(110px, 1fr) repeat(3, minmax(90px, 1fr)) minmax(100px, 1fr) auto; gap: 12px; }
+.loading-weighing-fields .loading-mobile-label { display: block; margin-bottom: 6px; }
+.loading-weighing-label { font-size: 13px; color: var(--ink-2); }
+@media (max-width: 760px) {
+  .loading-weighing-fields { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .loading-weighing-label { grid-column: 1 / -1; }
+  .loading-weighing-product { padding: 12px; }
+  .loading-weighing-fields .loading-measurement-control { min-width: 0; }
+  .loading-weighing-fields .loading-amount-input { width: 100%; min-width: 0; }
+}

@@ -142,6 +142,90 @@ def _validated_measurement(value: object, require_zero_reason: bool = False) -> 
     return measurement
 
 
+def loading_measurement_parts(value: object) -> list[dict]:
+    value = value if isinstance(value, dict) else {}
+    if "weighings" not in value:
+        return [value]
+    parts = value["weighings"]
+    if not isinstance(parts, list) or not parts or len(parts) > 100:
+        raise OrderRecordError("Некорректный список взвешиваний")
+    ids = set()
+    for part in parts:
+        if not isinstance(part, dict) or not isinstance(part.get("id"), str) or not part["id"] or part["id"] in ids or "weighings" in part:
+            raise OrderRecordError("Некорректные идентификаторы взвешиваний")
+        ids.add(part["id"])
+    return parts
+
+
+def loading_measurement_totals(value: object) -> dict:
+    """Preview complete portions without treating an unfinished weighing as zero."""
+    parts = loading_measurement_parts(value)
+    boxes = gross = tare = net = Decimal(0)
+    complete = True
+    with localcontext() as arithmetic:
+        arithmetic.prec = 60
+        for part in parts:
+            try:
+                validated = _validated_measurement(part)
+            except OrderRecordError:
+                complete = False
+                continue
+            count = _decimal(validated["box_count"], "Ящики")
+            boxes += count
+            gross += _decimal(validated["gross_weight_kg"], "Брутто")
+            tare += count * _decimal(validated["tare_weight_per_box_kg"], "Тара")
+            net += _decimal(validated["net_weight_kg"], "Нетто")
+    return {
+        "box_count": _format_number(boxes) if complete else "",
+        "gross_weight_kg": _format_number(gross) if complete else "",
+        "total_tare_weight_kg": _format_number(tare) if complete else "",
+        "net_weight_kg": _format_number(net) if complete else "",
+        "partial_net_weight_kg": _format_number(net),
+        "complete": complete,
+    }
+
+
+def _refresh_loading_measurement(measurement: dict) -> None:
+    if "weighings" not in measurement:
+        _refresh_draft_net_weight(measurement)
+        return
+    parts = loading_measurement_parts(measurement)
+    for part in parts:
+        _refresh_draft_net_weight(part)
+    totals = loading_measurement_totals(measurement)
+    for field in ("box_count", "gross_weight_kg", "total_tare_weight_kg", "net_weight_kg"):
+        measurement[field] = totals[field]
+    measurement["tare_weight_per_box_kg"] = ""
+    measurement["zero_reason"] = ""
+
+
+def _validated_loading_measurement(value: object, require_zero_reason: bool = False) -> dict:
+    if not isinstance(value, dict) or "weighings" not in value:
+        return _validated_measurement(value, require_zero_reason=require_zero_reason)
+    parts = []
+    for part in loading_measurement_parts(value):
+        validated = _validated_measurement(part, require_zero_reason=require_zero_reason)
+        if _decimal(part.get("net_weight_kg"), "Нетто") != _decimal(validated["net_weight_kg"], "Нетто"):
+            raise OrderRecordError("Нетто взвешивания не согласовано с весами")
+        parts.append({"id": part["id"], **validated})
+    result = {"weighings": parts}
+    _refresh_loading_measurement(result)
+    for field in ("box_count", "gross_weight_kg", "total_tare_weight_kg", "net_weight_kg"):
+        if _decimal(value.get(field), field) != _decimal(result[field], field):
+            raise OrderRecordError("Итог взвешиваний не согласован с отдельными порциями")
+    return result
+
+
+def _loading_measurement_complete(value: object) -> bool:
+    if not isinstance(value, dict) or "weighings" not in value:
+        return _measurement_complete(value)
+    try:
+        _validated_loading_measurement(value, require_zero_reason=True)
+        return True
+    except OrderRecordError:
+        return False
+
+
 def _validated_shipment_measurement(value: object) -> dict:
     if isinstance(value, dict) and "legacy_net_weight_kg" in value:
         net_weight = _quantity(value.get("legacy_net_weight_kg", ""), "Фактическое количество")
@@ -200,6 +284,9 @@ def _line_key(name: object, unit: object) -> tuple[str, str]:
 def _normalize_measurement(line: dict) -> None:
     measurement = line.get("measurement")
     if isinstance(measurement, dict):
+        if "weighings" in measurement:
+            for part in loading_measurement_parts(measurement):
+                _normalize_measurement({"measurement": part})
         for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason"):
             measurement[key] = str(measurement.get(key, ""))
         if measurement["zero_reason"] not in ZERO_REASON_OPTIONS:
@@ -286,7 +373,7 @@ def _legacy_loading_ready(record: dict) -> bool:
     return (
         (record.get("loading") or {}).get("status") == "loaded"
         and bool(record.get("loading_lines"))
-        and all(_measurement_complete(line.get("measurement")) for line in record["loading_lines"])
+        and all(_loading_measurement_complete(line.get("measurement")) for line in record["loading_lines"])
     )
 
 
@@ -352,18 +439,18 @@ def loading_line_net_weight(record: dict, line: dict) -> Decimal:
         with localcontext() as arithmetic:
             arithmetic.prec = 60
             return sum((
-                _decimal(_validated_measurement(measurement, require_zero_reason=True)["net_weight_kg"], "Нетто")
+                _decimal(_validated_loading_measurement(measurement, require_zero_reason=True)["net_weight_kg"], "Нетто")
                 for measurement in store_loading_measurements(record, route_key, str(line["id"]))
             ), Decimal(0))
     measurement = line.get("measurement") or {}
-    return _decimal(measurement["net_weight_kg"], "Нетто") if _measurement_complete(measurement) else Decimal(0)
+    return _decimal(measurement["net_weight_kg"], "Нетто") if _loading_measurement_complete(measurement) else Decimal(0)
 
 
 def _store_measurement_ready(measurement: object) -> bool:
-    if not _measurement_complete(measurement):
+    if not _loading_measurement_complete(measurement):
         return False
     try:
-        validated = _validated_measurement(measurement, require_zero_reason=True)
+        validated = _validated_loading_measurement(measurement, require_zero_reason=True)
         return _decimal(measurement["net_weight_kg"], "Нетто") == _decimal(validated["net_weight_kg"], "Нетто")
     except OrderRecordError:
         return False
@@ -385,7 +472,7 @@ def route_loading_ready(record: dict, route_key: str) -> bool:
             for destination in destinations
         )
     return state.get("status") == "loaded" and all(
-        _measurement_complete(line.get("measurement")) for line in lines
+        _loading_measurement_complete(line.get("measurement")) for line in lines
     )
 
 
@@ -407,6 +494,9 @@ def route_return_balance(record: dict, route_key: str) -> dict:
         return result
 
     def net(measurement, legacy=False):
+        if isinstance(measurement, dict) and "weighings" in measurement and not legacy:
+            validated = _validated_loading_measurement(measurement, require_zero_reason=True)
+            return sum((net(part) for part in validated["weighings"]), Decimal(0))
         if not isinstance(measurement, dict):
             raise OrderRecordError("Отсутствует подтверждённое измерение нетто")
         result = number(measurement.get("net_weight_kg"), "Нетто")
@@ -1125,9 +1215,89 @@ def set_route_loading_mode(order_record_id: str, revision: int, route_key: str, 
         return deepcopy(record)
 
 
+def _loading_part(measurement: dict, weighing_id: str) -> dict:
+    if "weighings" not in measurement:
+        if weighing_id:
+            raise OrderRecordConflict("Взвешивание больше не существует")
+        return measurement
+    if not weighing_id:
+        raise OrderRecordConflict("Обновите форму: у товара несколько взвешиваний")
+    part = next((item for item in loading_measurement_parts(measurement) if item["id"] == weighing_id), None)
+    if part is None:
+        raise OrderRecordConflict("Взвешивание больше не существует")
+    return part
+
+
+def _edit_loading_measurement(source: dict, field: str, value: object, weighing_id: str) -> dict:
+    measurement = deepcopy(source) if source else _empty_measurement()
+    part = _loading_part(measurement, weighing_id)
+    part[field] = _draft_value(value, field)
+    if field == "zero_reason" and not is_zero_measurement(part):
+        raise OrderRecordError("Причину можно указать только для нулевой позиции")
+    if not is_zero_measurement(part):
+        part["zero_reason"] = ""
+    _refresh_loading_measurement(measurement)
+    return measurement
+
+
+def change_loading_weighing(order_record_id: str, revision: int, route_key: str,
+                           destination_id: str, position_id: str, actor: dict,
+                           remove_id: str | None = None) -> dict:
+    """Atomically add or remove a portion in the exact loading context."""
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        _check_loading_revision(record, revision)
+        state = _route_state(record, route_key)
+        if state["status"] == "loaded":
+            raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
+        store_state = None
+        if destination_id:
+            if route_loading_mode(record, route_key) != "stores":
+                raise OrderRecordConflict("Не выбран режим загрузки по магазинам")
+            _store_loading_destinations(record, route_key)
+            _, destination = _find_destination(record, route_key, destination_id)
+            store_state = destination.setdefault("loading", _empty_route_loading())
+            if store_state.get("status") == "loaded":
+                raise OrderRecordConflict("Загрузка магазина уже подтверждена")
+            position = next((item for item in destination["positions"] if item["id"] == position_id), None)
+            if position is None:
+                raise OrderRecordNotFound("Позиция не найдена в магазине")
+            target = position.setdefault("loading", {})
+        else:
+            if route_loading_mode(record, route_key) == "stores":
+                raise OrderRecordConflict("Выберите магазин")
+            target = next((item for item in _route_lines(record, route_key) if item["id"] == position_id), None)
+            if target is None:
+                raise OrderRecordNotFound("Позиция не найдена в маршруте")
+        measurement = deepcopy(target.get("measurement") or _empty_measurement())
+        parts = loading_measurement_parts(measurement)
+        if remove_id is not None:
+            if "weighings" not in measurement or len(parts) == 1:
+                raise OrderRecordError("Последнее взвешивание нельзя удалить")
+            _loading_part(measurement, remove_id)
+            measurement["weighings"] = [item for item in parts if item["id"] != remove_id]
+        else:
+            if len(parts) >= 100:
+                raise OrderRecordError("Максимум 100 взвешиваний для товара")
+            if "weighings" not in measurement:
+                measurement = {"weighings": [{**measurement, "id": uuid.uuid4().hex}]}
+            measurement["weighings"].append({**_empty_measurement(), "id": uuid.uuid4().hex})
+        _refresh_loading_measurement(measurement)
+        target["measurement"] = measurement
+        stamp = {"status": "draft", "last_saved_at": _now(), "last_saved_by": _actor(actor)}
+        state.update(stamp)
+        if store_state is not None:
+            store_state.update(stamp)
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
 def save_store_loading_draft(
     order_record_id: str, route_key: str, destination_id: str,
-    position_id: str, field: str, value: object, actor: dict,
+    position_id: str, field: str, value: object, actor: dict, weighing_id: str = "",
 ) -> dict:
     if field not in {"box_count", "tare_weight_per_box_kg", "gross_weight_kg", "zero_reason"}:
         raise OrderRecordError("Некорректное поле загрузки")
@@ -1146,15 +1316,7 @@ def save_store_loading_draft(
         if position is None:
             raise OrderRecordNotFound("Позиция не найдена в магазине")
         source = (position.get("loading") or {}).get("measurement") or {}
-        measurement = {key: str(source.get(key, "")) for key in (
-            "box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason",
-        )}
-        measurement[field] = _draft_value(value, field)
-        if field == "zero_reason" and not is_zero_measurement(measurement):
-            raise OrderRecordError("Причину можно указать только для нулевой позиции")
-        _refresh_draft_net_weight(measurement)
-        if not is_zero_measurement(measurement):
-            measurement["zero_reason"] = ""
+        measurement = _edit_loading_measurement(source, field, value, weighing_id)
         position["loading"] = {"measurement": measurement}
         stamp = {"status": "draft", "last_saved_at": _now(), "last_saved_by": _actor(actor)}
         store_state.update(stamp)
@@ -1181,7 +1343,7 @@ def confirm_store_loading(
         if state["status"] == "loaded" or store_state.get("status") == "loaded":
             raise OrderRecordConflict("Загрузка магазина уже подтверждена")
         for position in destination["positions"]:
-            measurement = _validated_measurement((position.get("loading") or {}).get("measurement"), require_zero_reason=True)
+            measurement = _validated_loading_measurement((position.get("loading") or {}).get("measurement"), require_zero_reason=True)
             position["loading"] = {"measurement": measurement}
         stamp = {"last_saved_at": _now(), "last_saved_by": _actor(actor)}
         store_state.update({**stamp, "status": "loaded", "confirmed_at": stamp["last_saved_at"], "confirmed_by": _actor(actor)})
@@ -1202,6 +1364,7 @@ def save_loading_draft(
     field: str,
     value: object,
     actor: dict,
+    weighing_id: str = "",
 ) -> dict:
     if field not in {"box_count", "tare_weight_per_box_kg", "gross_weight_kg", "zero_reason"}:
         raise OrderRecordError("Некорректное поле загрузки")
@@ -1222,16 +1385,7 @@ def save_loading_draft(
             raise OrderRecordNotFound("Позиция не найдена в маршруте")
 
         source_measurement = line.get("measurement") if isinstance(line.get("measurement"), dict) else {}
-        measurement = {
-            key: str(source_measurement.get(key, ""))
-            for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason")
-        }
-        measurement[field] = _draft_value(value, field)
-        if field == "zero_reason" and not is_zero_measurement(measurement):
-            raise OrderRecordError("Причину можно указать только для нулевой позиции")
-        _refresh_draft_net_weight(measurement)
-        if not is_zero_measurement(measurement):
-            measurement["zero_reason"] = ""
+        measurement = _edit_loading_measurement(source_measurement, field, value, weighing_id)
         line["measurement"] = measurement
         route_state.update(
             {
@@ -1270,7 +1424,7 @@ def confirm_route_loading(
             raise OrderRecordNotFound("В маршруте отсутствуют позиции загрузки")
 
         for line in lines:
-            line["measurement"] = _validated_measurement(
+            line["measurement"] = _validated_loading_measurement(
                 line.get("measurement"), require_zero_reason=True
             )
 

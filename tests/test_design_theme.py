@@ -52,9 +52,20 @@ def test_navigation_back_to_operations_preserves_template_guard():
 def test_warehouse_measurement_has_one_native_string_input():
     import orders_dashboard.loading_page as loading
 
-    row = dashboard.rx.Var.create({'id': 'line', 'name': 'Яблоки', 'box_count': '2'})
+    row = dashboard.rx.Var.create({'id': 'line', 'order_id': 'order', 'route_key': 'route_4', 'destination_id': 'store', 'name': 'Яблоки', 'box_count': '2', 'weighing_id': 'portion'})
     control = loading._measurement_control(row, 'box_count', 'Ящики')
     field = control.children[1]
-    assert field.tag == 'input'
-    assert str(field.type) == '"text"'
-    assert str(field.input_mode) == '"numeric"'
+    assert field.tag == 'DebounceInput'
+    assert str(field.element) == '"input"'
+    assert str(field.debounce_timeout) == '350'
+    assert str(field.force_notify_on_blur) == 'true'
+    assert str(field.force_notify_by_enter) == 'true'
+    for key in ('order_id', 'route_key', 'destination_id', 'id', 'weighing_id'):
+        assert f'["{key}"]' in str(field.key)
+    assert '"box_count"' in str(field.key)
+    assert str(field.custom_attrs['type']) == '"text"'
+    assert str(field.custom_attrs['input_mode']) == '"numeric"'
+    for name in ('tare_weight_per_box_kg', 'gross_weight_kg'):
+        weight = loading._measurement_control(row, name, 'Вес').children[1]
+        assert str(weight.custom_attrs['type']) == '"text"'
+        assert str(weight.custom_attrs['input_mode']) == '"decimal"'
