@@ -244,6 +244,7 @@ def _normalize_shipment(position: dict) -> None:
 
 def _empty_route_loading() -> dict:
     return {
+        "mode": "route",
         "status": "new",
         "last_saved_at": "",
         "last_saved_by": _actor({}),
@@ -256,6 +257,7 @@ def _normalize_route_loading(value: object) -> dict:
     value = value if isinstance(value, dict) else {}
     status = str(value.get("status", "new"))
     return {
+        "mode": "stores" if value.get("mode") == "stores" else "route",
         "status": status if status in {"new", "draft", "loaded"} else "new",
         "last_saved_at": str(value.get("last_saved_at", "")),
         "last_saved_by": _actor(value.get("last_saved_by")),
@@ -288,11 +290,100 @@ def _legacy_loading_ready(record: dict) -> bool:
     )
 
 
+def route_loading_mode(record: dict, route_key: str) -> str:
+    state = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {})
+    return "stores" if state.get("mode") == "stores" else "route"
+
+
+def _store_loading_destinations(record: dict, route_key: str) -> list[dict]:
+    routes = [route for route in record.get("routes", []) if route.get("route_key") == route_key]
+    lines = _route_lines(record, route_key)
+    line_ids = {str(line.get("id", "")) for line in lines}
+    if len(routes) != 1 or not lines or "" in line_ids or len(line_ids) != len(lines):
+        raise OrderRecordError("Нет надёжной связи товаров с маршрутом для раздельной загрузки")
+    destinations = routes[0].get("destinations", [])
+    lines_by_id = {str(line["id"]): line for line in lines}
+    destination_ids, position_ids, used_lines = set(), set(), set()
+    if not destinations:
+        raise OrderRecordError("В маршруте отсутствуют магазины")
+    for destination in destinations:
+        destination_id = str(destination.get("id", ""))
+        positions = destination.get("positions", [])
+        if not destination_id or destination_id in destination_ids or not positions:
+            raise OrderRecordError("Некорректные связи магазинов маршрута")
+        destination_ids.add(destination_id)
+        for position in positions:
+            position_id = str(position.get("id", ""))
+            line_id = str(position.get("loading_line_id", ""))
+            if not position_id or position_id in position_ids or line_id not in line_ids:
+                raise OrderRecordError("Нет точной связи позиции магазина с загрузкой маршрута")
+            if _line_key(position.get("name"), position.get("unit")) != _line_key(lines_by_id[line_id].get("name"), lines_by_id[line_id].get("unit")):
+                raise OrderRecordError("Товар магазина не соответствует связанной позиции маршрута")
+            position_ids.add(position_id)
+            used_lines.add(line_id)
+    if used_lines != line_ids:
+        raise OrderRecordError("Не все товары маршрута связаны с магазинами")
+    return destinations
+
+
+def store_loading_available(record: dict, route_key: str) -> bool:
+    try:
+        _store_loading_destinations(record, route_key)
+    except OrderRecordError:
+        return False
+    return True
+
+
+def store_loading_measurements(record: dict, route_key: str, line_id: str) -> list[dict]:
+    return [
+        (position.get("loading") or {}).get("measurement") or {}
+        for destination in _store_loading_destinations(record, route_key)
+        for position in destination.get("positions", [])
+        if position.get("loading_line_id") == line_id
+    ]
+
+
+def loading_line_net_weight(record: dict, line: dict) -> Decimal:
+    """Confirmed route totals share the original loading-line identity in both modes."""
+    route_key = str(line.get("route_key", ""))
+    if not (route_loading_ready(record, route_key) if route_key else _legacy_loading_ready(record)):
+        return Decimal(0)
+    if route_loading_mode(record, route_key) == "stores":
+        with localcontext() as arithmetic:
+            arithmetic.prec = 60
+            return sum((
+                _decimal(_validated_measurement(measurement, require_zero_reason=True)["net_weight_kg"], "Нетто")
+                for measurement in store_loading_measurements(record, route_key, str(line["id"]))
+            ), Decimal(0))
+    measurement = line.get("measurement") or {}
+    return _decimal(measurement["net_weight_kg"], "Нетто") if _measurement_complete(measurement) else Decimal(0)
+
+
+def _store_measurement_ready(measurement: object) -> bool:
+    if not _measurement_complete(measurement):
+        return False
+    try:
+        validated = _validated_measurement(measurement, require_zero_reason=True)
+        return _decimal(measurement["net_weight_kg"], "Нетто") == _decimal(validated["net_weight_kg"], "Нетто")
+    except OrderRecordError:
+        return False
+
+
 def route_loading_ready(record: dict, route_key: str) -> bool:
     lines = _route_lines(record, route_key)
     if not lines:
         return _legacy_loading_ready(record)
     state = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {})
+    if route_loading_mode(record, route_key) == "stores":
+        try:
+            destinations = _store_loading_destinations(record, route_key)
+        except OrderRecordError:
+            return False
+        return state.get("status") == "loaded" and all(
+            (destination.get("loading") or {}).get("status") == "loaded"
+            and all(_store_measurement_ready((position.get("loading") or {}).get("measurement")) for position in destination.get("positions", []))
+            for destination in destinations
+        )
     return state.get("status") == "loaded" and all(
         _measurement_complete(line.get("measurement")) for line in lines
     )
@@ -342,7 +433,9 @@ def route_return_balance(record: dict, route_key: str) -> dict:
             balances[line_id] = {
                 "loading_line_id": line_id, "name": str(line.get("name", "")),
                 "planned": number(line.get("planned_amount"), "Заказано"),
-                "loaded": net(line.get("measurement")), "shipped": Decimal("0"),
+                "loaded": sum((net(measurement) for measurement in store_loading_measurements(record, route_key, line_id)), Decimal(0))
+                if route_loading_mode(record, route_key) == "stores" else net(line.get("measurement")),
+                "shipped": Decimal("0"),
             }
         destination_facts = []
         destination_ids, position_ids, used_lines = set(), set(), set()
@@ -770,11 +863,10 @@ def logistics_summary(record: dict) -> dict:
             line["planned"] += _decimal(loading_line.get("planned_amount", "0"), "Заказано")
         except OrderRecordError:
             continue
-        measurement = loading_line.get("measurement") or {}
         route_key = str(loading_line.get("route_key", ""))
         ready = route_loading_ready(record, route_key) if route_key else _legacy_loading_ready(record)
-        if ready and _measurement_complete(measurement):
-            line["loaded"] += _decimal(measurement["net_weight_kg"], "Чистый вес")
+        if ready:
+            line["loaded"] += loading_line_net_weight(record, loading_line)
 
     for _, destination in _destinations(record):
         for position in destination.get("positions", []):
@@ -884,7 +976,7 @@ def list_route_trip_summaries(processed_date: str, mode: str) -> list[dict]:
                 stage = "Загрузка начата"
             else:
                 stage = "Ожидает загрузки"
-            loaded = sum((_decimal(line["measurement"]["net_weight_kg"], "Загружено") for line in lines), Decimal(0)) if ready else None
+            loaded = sum((loading_line_net_weight(record, line) for line in lines), Decimal(0)) if ready else None
             trips.append({
                 "order_record_id": str(record["id"]), "order_number": str(record.get("order_number", "")),
                 "client_name": str(record.get("client_name", "")), "processed_at": processed_at.astimezone().isoformat(),
@@ -987,6 +1079,122 @@ def _route_state(record: dict, route_key: str) -> dict:
     return states[route_key]
 
 
+def _check_loading_revision(record: dict, revision: int) -> None:
+    if type(revision) is not int or revision < 0:
+        raise OrderRecordError("Некорректная версия заказа")
+    if record.get("revision") != revision:
+        raise OrderRecordConflict("Данные загрузки уже изменены другим пользователем")
+
+
+def loading_mode_locked(record: dict, route_key: str) -> bool:
+    state = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {})
+    if state.get("status", "new") != "new":
+        return True
+    if any(any(str(value) for value in (line.get("measurement") or {}).values()) for line in _route_lines(record, route_key)):
+        return True
+    for route, destination in _destinations(record):
+        if route.get("route_key") != route_key:
+            continue
+        if (destination.get("loading") or {}).get("status", "new") != "new":
+            return True
+        for position in destination.get("positions", []):
+            if (position.get("shipment") or {}).get("status", "pending") == "completed":
+                return True
+            if any(str(value) for value in ((position.get("loading") or {}).get("measurement") or {}).values()):
+                return True
+    return False
+
+
+def set_route_loading_mode(order_record_id: str, revision: int, route_key: str, mode: str) -> dict:
+    if mode not in {"route", "stores"}:
+        raise OrderRecordError("Некорректный режим загрузки")
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        _check_loading_revision(record, revision)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) == mode:
+            return deepcopy(record)
+        if loading_mode_locked(record, route_key):
+            raise OrderRecordConflict("Режим нельзя изменить после начала ввода или подтверждения загрузки")
+        if mode == "stores":
+            _store_loading_destinations(record, route_key)
+        state["mode"] = mode
+        record["revision"] += 1
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def save_store_loading_draft(
+    order_record_id: str, route_key: str, destination_id: str,
+    position_id: str, field: str, value: object, actor: dict,
+) -> dict:
+    if field not in {"box_count", "tare_weight_per_box_kg", "gross_weight_kg", "zero_reason"}:
+        raise OrderRecordError("Некорректное поле загрузки")
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) != "stores":
+            raise OrderRecordConflict("Для маршрута не выбран режим загрузки по магазинам")
+        _store_loading_destinations(record, route_key)
+        _, destination = _find_destination(record, route_key, destination_id)
+        store_state = destination.setdefault("loading", _empty_route_loading())
+        if state["status"] == "loaded" or store_state.get("status") == "loaded":
+            raise OrderRecordConflict("Загрузка магазина уже подтверждена")
+        position = next((item for item in destination["positions"] if item.get("id") == position_id), None)
+        if position is None:
+            raise OrderRecordNotFound("Позиция не найдена в магазине")
+        source = (position.get("loading") or {}).get("measurement") or {}
+        measurement = {key: str(source.get(key, "")) for key in (
+            "box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg", "zero_reason",
+        )}
+        measurement[field] = _draft_value(value, field)
+        if field == "zero_reason" and not is_zero_measurement(measurement):
+            raise OrderRecordError("Причину можно указать только для нулевой позиции")
+        _refresh_draft_net_weight(measurement)
+        if not is_zero_measurement(measurement):
+            measurement["zero_reason"] = ""
+        position["loading"] = {"measurement": measurement}
+        stamp = {"status": "draft", "last_saved_at": _now(), "last_saved_by": _actor(actor)}
+        store_state.update(stamp)
+        state.update(stamp)
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def confirm_store_loading(
+    order_record_id: str, revision: int, route_key: str, destination_id: str, actor: dict,
+) -> dict:
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        _check_loading_revision(record, revision)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) != "stores":
+            raise OrderRecordConflict("Для маршрута не выбран режим загрузки по магазинам")
+        destinations = _store_loading_destinations(record, route_key)
+        _, destination = _find_destination(record, route_key, destination_id)
+        store_state = destination.setdefault("loading", _empty_route_loading())
+        if state["status"] == "loaded" or store_state.get("status") == "loaded":
+            raise OrderRecordConflict("Загрузка магазина уже подтверждена")
+        for position in destination["positions"]:
+            measurement = _validated_measurement((position.get("loading") or {}).get("measurement"), require_zero_reason=True)
+            position["loading"] = {"measurement": measurement}
+        stamp = {"last_saved_at": _now(), "last_saved_by": _actor(actor)}
+        store_state.update({**stamp, "status": "loaded", "confirmed_at": stamp["last_saved_at"], "confirmed_by": _actor(actor)})
+        if all((item.get("loading") or {}).get("status") == "loaded" for item in destinations):
+            state.update({**stamp, "status": "loaded", "confirmed_at": stamp["last_saved_at"], "confirmed_by": _actor(actor)})
+        else:
+            state.update({**stamp, "status": "draft"})
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
 def save_loading_draft(
     order_record_id: str,
     route_key: str,
@@ -1002,6 +1210,8 @@ def save_loading_draft(
         payload = _read_payload()
         record = _find_record(payload, order_record_id)
         route_state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) == "stores":
+            raise OrderRecordConflict("В этом режиме загрузка подтверждается отдельно по магазинам")
         if route_state["status"] == "loaded":
             raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
         line = next(
@@ -1051,6 +1261,8 @@ def confirm_route_loading(
         if record.get("revision") != revision:
             raise OrderRecordConflict("Данные загрузки уже изменены другим пользователем")
         route_state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) == "stores":
+            raise OrderRecordConflict("В этом режиме загрузка подтверждается отдельно по магазинам")
         if route_state["status"] == "loaded":
             raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
         lines = _route_lines(record, route_key)

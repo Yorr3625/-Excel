@@ -19,6 +19,13 @@ from modules.order_records import (
     ZERO_REASON_OPTIONS,
     calculate_net_weight,
     confirm_route_loading,
+    confirm_store_loading,
+    loading_line_net_weight,
+    loading_mode_locked,
+    route_loading_mode,
+    save_store_loading_draft,
+    set_route_loading_mode,
+    store_loading_available,
     list_order_record_summaries,
     load_order_record,
     is_zero_measurement,
@@ -134,6 +141,9 @@ def _loading_rows(
         rows.append(
             {
                 "id": line_id,
+                "order_id": str(record["id"]),
+                "route_key": route_key,
+                "destination_id": "",
                 "name": str(line.get("name", "")),
                 "planned_kg": str(line.get("planned_amount", "0")),
                 **measurement,
@@ -142,6 +152,39 @@ def _loading_rows(
             }
         )
     return rows
+
+
+def _store_loading_rows(record: dict, route_key: str, destination: dict) -> list[dict]:
+    rows = []
+    for position in destination.get("positions", []):
+        measurement = _measurement((position.get("loading") or {}).get("measurement"))
+        shipment = position.get("shipment") or {}
+        shipped = str((shipment.get("measurement") or {}).get("net_weight_kg", "")) if shipment.get("status") == "completed" else ""
+        rows.append({
+            "id": str(position["id"]), "order_id": str(record["id"]),
+            "route_key": route_key, "destination_id": str(destination["id"]),
+            "name": str(position.get("name", "")), "planned_kg": str(position.get("planned_amount", "0")),
+            **measurement, "needs_zero_reason": is_zero_measurement(measurement),
+            "preview_net_weight_kg": _preview_net(measurement), "shipped_net_kg": shipped,
+        })
+    return rows
+
+
+def _store_loading_cards(record: dict, route_key: str) -> list[dict]:
+    cards = []
+    for route in record.get("routes", []):
+        if route.get("route_key") != route_key:
+            continue
+        for destination in route.get("destinations", []):
+            rows = _store_loading_rows(record, route_key, destination)
+            ordered, loaded = _loading_totals(rows)
+            status = str((destination.get("loading") or {}).get("status", "new"))
+            cards.append({
+                "id": str(destination["id"]), "name": str(destination.get("name", "")),
+                "planned_kg": ordered, "loaded_net_kg": loaded if status == "loaded" else "",
+                "status": status, "status_label": {"new": "Не начата", "draft": "Черновик", "loaded": "Подтверждена"}.get(status, "Не начата"),
+            })
+    return cards
 
 
 def _loading_totals(rows: list[dict]) -> tuple[str, str]:
@@ -194,8 +237,7 @@ def _return_reconciliation(record: dict) -> dict:
         key = (str(line.get("name", "")).strip().casefold(), str(line.get("unit", "kg")).strip().casefold())
         values = by_product.setdefault(key, {"returned": Decimal(0), "unexplained": Decimal(0), "excess": Decimal(0)})
         returned = Decimal(accepted.get(str(line["id"]), "0"))
-        measurement = line.get("measurement") or {}
-        loaded = Decimal(measurement.get("net_weight_kg") or "0") if route_loading_ready(record, str(line.get("route_key", ""))) else Decimal(0)
+        loaded = loading_line_net_weight(record, line)
         shipped = sum((
             Decimal((position["shipment"].get("measurement") or {}).get("net_weight_kg") or "0")
             for route in record.get("routes", [])
@@ -257,6 +299,74 @@ class LoadingState(rx.State):
     status: str = ""
     order_not_found: bool = False
     save_completed: bool = False
+    loading_mode: str = "route"
+    mode_locked: bool = False
+    stores_available: bool = False
+    store_cards: list[dict] = []
+    store_search: str = ""
+    selected_store_id: str = ""
+    selected_store_name: str = ""
+    store_confirmed_count: int = 0
+    store_confirmed_net_kg: str = "0"
+    route_is_ready: bool = False
+
+    @rx.var
+    def filtered_store_cards(self) -> list[dict]:
+        query = self.store_search.strip().casefold()
+        return [item for item in self.store_cards if not query or query in item["name"].casefold()]
+
+    def set_store_search(self, value: str):
+        self.store_search = value
+
+    def select_store(self, destination_id: str):
+        if destination_id not in {item["id"] for item in self.store_cards}:
+            return
+        self.selected_store_id = destination_id
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+
+    def next_store(self):
+        ids = [item["id"] for item in self.store_cards]
+        if self.selected_store_id in ids and len(ids) > 1:
+            self.select_store(ids[(ids.index(self.selected_store_id) + 1) % len(ids)])
+
+    def choose_loading_mode(self, label: str):
+        mode = {"Общая загрузка": "route", "По магазинам": "stores"}.get(label)
+        if mode is None or not self.selected_order_id:
+            return
+        try:
+            set_route_loading_mode(self.selected_order_id, int(self.selected_record["revision"]), self.selected_route_key, mode)
+        except OrderRecordError as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.status = str(error)
+            return
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+
+    def set_context_measurement_field(self, order_id: str, route_key: str, destination_id: str, position_id: str, field: str, value: str):
+        try:
+            if destination_id:
+                save_store_loading_draft(order_id, route_key, destination_id, position_id, field, value, self.principal)
+            else:
+                save_loading_draft(order_id, route_key, position_id, field, value, self.principal)
+        except OrderRecordError as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.status = str(error)
+            return
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.status = "Черновик сохранён"
+
+    def confirm_selected_store(self):
+        if not self.selected_store_id or self.is_read_only:
+            return
+        try:
+            confirm_store_loading(self.selected_order_id, int(self.selected_record["revision"]), self.selected_route_key, self.selected_store_id, self.principal)
+        except OrderRecordError as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.status = str(error)
+            return
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.status = "Загрузка маршрута подтверждена. Водитель может начать отгрузку." if self.route_is_ready else "Загрузка магазина подтверждена. Выберите любой следующий магазин."
+        self.save_completed = self.route_is_ready
+        self._refresh_options()
 
     def _refresh_options(self):
         self.order_options = [
@@ -296,6 +406,16 @@ class LoadingState(rx.State):
         self.reconciliation_rows = []
         self.reconciliation = {}
         self.is_read_only = False
+        self.loading_mode = "route"
+        self.mode_locked = False
+        self.stores_available = False
+        self.store_cards = []
+        self.store_search = ""
+        self.selected_store_id = ""
+        self.selected_store_name = ""
+        self.store_confirmed_count = 0
+        self.store_confirmed_net_kg = "0"
+        self.route_is_ready = False
 
     def _apply_record(self, order_record_id: str, route_key: str = "") -> bool:
         if not order_record_id:
@@ -322,6 +442,9 @@ class LoadingState(rx.State):
             selected_route_key = route_options[0]["route_key"]
         selected_route = next(item for item in route_options if item["route_key"] == selected_route_key)
 
+        if self.selected_order_id != order_record_id or self.selected_route_key != selected_route_key:
+            self.selected_store_id = ""
+            self.store_search = ""
         self.selected_order_id = order_record_id
         self.selected_order_label = next(
             (item["label"] for item in self.order_options if item["id"] == order_record_id),
@@ -348,14 +471,29 @@ class LoadingState(rx.State):
             for line in record.get("loading_lines", [])
             if str(line.get("route_key", "")) == selected_route_key
         }
+        self.loading_mode = route_loading_mode(record, selected_route_key)
+        self.mode_locked = loading_mode_locked(record, selected_route_key)
+        self.stores_available = store_loading_available(record, selected_route_key)
+        self.store_cards = _store_loading_cards(record, selected_route_key) if self.loading_mode == "stores" else []
+        self.store_confirmed_count = sum(item["status"] == "loaded" for item in self.store_cards)
+        self.store_confirmed_net_kg = _format_number(sum((Decimal(item["loaded_net_kg"] or "0") for item in self.store_cards), Decimal(0)))
+        self.selected_store_name = ""
         self.loading_rows = _loading_rows(record, selected_route_key, self.draft_measurements)
+        if self.store_cards:
+            if self.selected_store_id not in {item["id"] for item in self.store_cards}:
+                self.selected_store_id = self.store_cards[0]["id"]
+            route = next(item for item in record["routes"] if item["route_key"] == selected_route_key)
+            destination = next(item for item in route["destinations"] if item["id"] == self.selected_store_id)
+            self.selected_store_name = str(destination.get("name", ""))
+            self.loading_rows = _store_loading_rows(record, selected_route_key, destination)
         self.summary_position_count = len(self.loading_rows)
         self.total_ordered_kg, self.total_loaded_net_kg = _loading_totals(self.loading_rows)
         self.reconciliation = _return_reconciliation(record)
         self.reconciliation_rows = self.reconciliation["items"]
         self.shipment_status = self.reconciliation["shipment_status"]
         self.shipment_rows, self.shipment_completed_count, self.shipment_total_count = _shipment_rows(record)
-        self.is_read_only = bool(selected_route["ready"])
+        self.route_is_ready = bool(selected_route["ready"])
+        self.is_read_only = self.route_is_ready or any(item["id"] == self.selected_store_id and item["status"] == "loaded" for item in self.store_cards)
         self.order_not_found = False
         self.save_completed = False
         self.status = ""
@@ -576,7 +714,7 @@ def _loading_context():
 def _measurement_control(row, field: str, label: str):
     return rx.el.label(
         rx.text(label, class_name="loading-mobile-label"),
-        rx.el.input(value=row[field], on_change=LoadingState.set_measurement_field(row["id"], field),
+        rx.el.input(value=row[field], on_change=LoadingState.set_context_measurement_field(row["order_id"], row["route_key"], row["destination_id"], row["id"], field),
                  type="text", input_mode="numeric" if field == "box_count" else "decimal",
                  disabled=LoadingState.is_read_only, aria_label=row["name"].to(str) + ": " + label,
                  class_name="loading-amount-input"),
@@ -589,7 +727,7 @@ def _loading_table():
         rx.hstack(
             rx.vstack(
                 rx.heading("Загрузка", size="3"),
-                rx.text("Фактические веса маршрута «", LoadingState.selected_route_label, "»", class_name="loading-panel-description"),
+                rx.text(rx.cond(LoadingState.loading_mode == "stores", "Магазин: " + LoadingState.selected_store_name, "Фактические веса маршрута «" + LoadingState.selected_route_label + "»"), class_name="loading-panel-description"),
                 align="start", spacing="1",
             ),
             rx.text(LoadingState.summary_position_count, " поз.", class_name="loading-count"),
@@ -631,7 +769,7 @@ def _loading_table():
                                     rx.select(
                                         list(ZERO_REASON_OPTIONS),
                                         value=row["zero_reason"],
-                                        on_change=LoadingState.set_measurement_field(row["id"], "zero_reason"),
+                                        on_change=LoadingState.set_context_measurement_field(row["order_id"], row["route_key"], row["destination_id"], row["id"], "zero_reason"),
                                         placeholder="Укажите причину",
                                         width="min(100%, 360px)",
                                         class_name="loading-zero-reason-select",
@@ -752,6 +890,69 @@ def _reconciliation():
     )
 
 
+def _loading_mode_control():
+    return rx.vstack(
+        rx.hstack(
+            rx.text("Режим загрузки", font_weight="500"),
+            rx.el.select(
+                rx.el.option("Общая загрузка", value="Общая загрузка"),
+                rx.el.option("По магазинам", value="По магазинам", disabled=~LoadingState.stores_available),
+                value=rx.cond(LoadingState.loading_mode == "stores", "По магазинам", "Общая загрузка"),
+                on_change=LoadingState.choose_loading_mode, disabled=LoadingState.mode_locked,
+                aria_label="Режим загрузки", class_name="loading-store-mode",
+            ),
+            align="center", wrap="wrap", spacing="3", width="100%",
+        ),
+        rx.cond(LoadingState.mode_locked, rx.text("Режим зафиксирован: загрузка уже начата.", class_name="loading-panel-description"), rx.box()),
+        rx.cond(~LoadingState.stores_available, rx.text("Для этого заказа нет точных связей товаров с магазинами. Доступна общая загрузка.", class_name="loading-panel-description"), rx.box()),
+        align="start", spacing="2", width="100%",
+    )
+
+
+def _store_loading_tile(store):
+    return rx.button(
+        rx.text(store["name"], font_weight="600"),
+        rx.text("Заказано: ", store["planned_kg"], " кг"),
+        rx.text(store["status_label"], class_name="loading-store-status"),
+        rx.cond(store["status"] == "loaded", rx.text("Загружено: ", store["loaded_net_kg"], " кг"), rx.box()),
+        on_click=LoadingState.select_store(store["id"]),
+        aria_pressed=LoadingState.selected_store_id == store["id"],
+        class_name=rx.cond(LoadingState.selected_store_id == store["id"], "loading-store-tile is-selected", "loading-store-tile"),
+    )
+
+
+def _store_loading_selector():
+    return rx.vstack(
+        rx.hstack(
+            rx.text("Подтверждено магазинов: ", LoadingState.store_confirmed_count, " из ", LoadingState.store_cards.length()),
+            rx.text("Подтверждённое нетто сборки: ", LoadingState.store_confirmed_net_kg, " кг"),
+            width="100%", wrap="wrap", spacing="3",
+        ),
+        rx.text("Выберите любой магазин. Маршрут готов к отгрузке после подтверждения всех магазинов.", class_name="loading-panel-description"),
+        rx.input(value=LoadingState.store_search, on_change=LoadingState.set_store_search, placeholder="Найти магазин", aria_label="Поиск магазина для загрузки", width="100%"),
+        rx.cond(
+            LoadingState.filtered_store_cards.length() > 0,
+            rx.box(rx.foreach(LoadingState.filtered_store_cards, _store_loading_tile), class_name="loading-store-grid"),
+            rx.text("Магазины по запросу не найдены. Измените поиск; выбранный магазин остаётся открытым."),
+        ),
+        width="100%", align="start", spacing="3",
+    )
+
+
+def _store_loading_reconciliation():
+    return rx.vstack(
+        rx.heading("Сверка выбранного магазина", size="3"),
+        rx.text("Загрузка ниже — подтверждённые измерения. Отгрузку вводит водитель. Возвраты учитываются отдельно по маршруту.", class_name="loading-panel-description"),
+        rx.foreach(LoadingState.loading_rows, lambda row: rx.box(
+            rx.text(row["name"], font_weight="500"),
+            rx.text("Заказано: ", row["planned_kg"], " кг · Загружено: ", rx.cond(LoadingState.is_read_only, row["preview_net_weight_kg"].to(str) + " кг", "не подтверждено"),
+                    " · Отгружено: ", rx.cond(row["shipped_net_kg"] != "", row["shipped_net_kg"].to(str) + " кг", "не подтверждено")),
+            class_name="loading-store-reconciliation-row",
+        )),
+        align="start", width="100%", spacing="2",
+    )
+
+
 def loading_page():
     return rx.cond(
         LoadingState.is_authorized,
@@ -799,15 +1000,25 @@ def loading_page():
                     LoadingState.selected_order_id != "",
                     rx.vstack(
                         rx.vstack(
+                            _loading_mode_control(),
+                            rx.cond(LoadingState.loading_mode == "stores", _store_loading_selector(), rx.box()),
                             _loading_table(),
                             rx.cond(
-                                LoadingState.is_read_only,
-                                rx.text(
-                                    "Загрузка маршрута подтверждена. Отгрузку по магазинам вводит водитель этого маршрута.",
-                                    class_name="loading-message loading-message-success",
+                                LoadingState.loading_mode == "stores",
+                                rx.hstack(
+                                    rx.cond(LoadingState.is_read_only,
+                                            rx.text("Загрузка магазина подтверждена — доступен просмотр.", class_name="loading-message loading-message-success"),
+                                            rx.button("Подтвердить загрузку магазина", on_click=LoadingState.confirm_selected_store, class_name="loading-primary")),
+                                    rx.button("Следующий магазин", on_click=LoadingState.next_store, disabled=LoadingState.store_cards.length() < 2, class_name="loading-secondary"),
+                                    align="center", width="100%", wrap="wrap", spacing="3",
                                 ),
-                                rx.button("Подтвердить загрузку маршрута", on_click=LoadingState.save_loading, class_name="loading-primary"),
+                                rx.cond(
+                                    LoadingState.is_read_only,
+                                    rx.text("Загрузка маршрута подтверждена. Отгрузку по магазинам вводит водитель этого маршрута.", class_name="loading-message loading-message-success"),
+                                    rx.button("Подтвердить загрузку маршрута", on_click=LoadingState.save_loading, class_name="loading-primary"),
+                                ),
                             ),
+                            rx.cond(LoadingState.loading_mode == "stores", _store_loading_reconciliation(), rx.box()),
                             rx.cond(LoadingState.status != "", rx.text(LoadingState.status, class_name="loading-message", aria_live="polite"), rx.box()),
                             rx.cond(
                                 LoadingState.save_completed,
@@ -829,7 +1040,7 @@ def loading_page():
                         align="start", spacing="3", width="100%", class_name="loading-empty-workspace",
                     ),
                 ),
-                rx.cond(LoadingState.is_read_only, _shipment_progress(), rx.box()),
+                rx.cond(LoadingState.route_is_ready, _shipment_progress(), rx.box()),
                 rx.cond(LoadingState.shipment_status == "shipment_completed", _reconciliation(), rx.box()),
                 align="start", spacing="4", width="100%", class_name="loading-shell",
             ),

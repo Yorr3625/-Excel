@@ -496,11 +496,12 @@ def test_add_route_increments_count_and_selects_new_route(monkeypatch):
         routes_status="",
     )
 
+    state.reset_template_selection = dashboard.State.reset_template_selection.fn.__get__(state)
     dashboard.State.add_route.fn(state)
 
+    assert state.template_selected_stores == []
     assert state.active_route_count == 5
     assert state.selected_route_index == 4
-    assert state.route_add_index == 4
     assert saved_counts == [5]
     assert "Маршрут №5" in state.routes_status
 
@@ -546,73 +547,16 @@ def test_add_store_and_remove_store_operate_on_selected_route():
     assert state.route_stores == [["фм 1"], ["Новый магазин"]]
 
 
-def test_route_templates_ignore_delivery_statuses_and_filter():
+def test_indexed_template_store_removal():
     state = SimpleNamespace(
-        active_route_count=2,
-        route_stores=[["фм 10", "фм 14"], ["магазин 21"]],
-        route_driver_names=["Азер", "----"],
-        real_vehicles=[
-            {
-                "route_index": 0,
-                "stops": [
-                    {"name": "фм 10", "status": "done"},
-                    {"name": "фм 14", "status": "pending"},
-                ],
-            }
-        ],
-        search_query="",
-        collapsed_route_indices=[1],
-        route_add_index=0,
-    )
-
-    route_groups = dashboard.State.__dict__["route_groups"].fget
-    groups = route_groups(state)
-
-    assert [group["title"] for group in groups] == [
-        f"Маршрут №{index + 1} — {dashboard.ROUTE_AREAS[index]}"
-        for index in range(2)
-    ]
-    assert groups[0]["driver_initials"] == "АЗ"
-    assert groups[0]["stores"][0]["status"] == "Шаблон"
-    assert groups[0]["stores"][1]["status"] == "Шаблон"
-    assert not any(store["done"] for group in groups for store in group["stores"])
-    assert groups[0]["adding"] is True
-    assert groups[1]["driver"] == "Водитель не назначен"
-    assert groups[1]["collapsed"] is True
-
-    state.search_query = "магазин 21"
-    filtered = route_groups(state)
-    assert len(filtered) == 1
-    assert filtered[0]["index"] == 1
-    assert [store["name"] for store in filtered[0]["stores"]] == ["магазин 21"]
-
-
-def test_route_group_ui_state_and_indexed_removal():
-    state = SimpleNamespace(
-        active_route_count=2,
-        selected_route_index=0,
-        collapsed_route_indices=[],
-        route_add_index=-1,
-        new_store_input="старое",
+        active_route_count=2, selected_route_index=0,
         route_stores=[["фм 1"], ["фм 2", "фм 3"]],
+        template_selected_stores=["фм 2"], template_move_stores=[],
     )
     state.remove_store = dashboard.State.remove_store.fn.__get__(state)
-
-    dashboard.State.toggle_route_group.fn(state, 1)
-    assert state.collapsed_route_indices == [1]
-    dashboard.State.toggle_route_group.fn(state, 1)
-    assert state.collapsed_route_indices == []
-
-    dashboard.State.start_route_store_add.fn(state, 1)
-    assert state.selected_route_index == 1
-    assert state.route_add_index == 1
-    assert state.new_store_input == ""
-
     dashboard.State.remove_route_store.fn(state, 1, "фм 2")
     assert state.route_stores == [["фм 1"], ["фм 3"]]
-
-    dashboard.State.cancel_route_store_add.fn(state)
-    assert state.route_add_index == -1
+    assert state.template_selected_stores == []
 
 
 def test_invoice_ocr_store_number_updates_all_rows():

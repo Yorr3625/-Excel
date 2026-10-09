@@ -11,6 +11,7 @@ import traceback
 import uuid
 
 import reflex as rx
+from reflex.components.radix.themes.layout.box import Box
 from reflex.config import get_config
 from reflex.state import StateUpdate
 from reflex_base.event import Event
@@ -1112,25 +1113,29 @@ GROUP_TABS = {
 
 
 
-class RouteStoreView(TypedDict):
-    name: str
-    status: str
-    done: bool
+class RouteDropTarget(Box):
+
+    def get_event_triggers(self):
+        return {
+            **super().get_event_triggers(),
+            "on_drop": lambda event: [rx.Var(
+                _js_expr=f"{event}.dataTransfer.getData('text/plain')",
+                _var_type=str,
+            )],
+        }
 
 
-class RouteGroupView(TypedDict):
+class TemplateRouteView(TypedDict):
     index: int
     label: str
     area: str
-    title: str
-    point_count: int
-    point_count_label: str
-    driver: str
-    driver_initials: str
-    driver_assigned: bool
-    stores: list[RouteStoreView]
-    collapsed: bool
-    adding: bool
+    count: int
+    matches: int
+
+
+class TemplateStoreView(TypedDict):
+    name: str
+    selected: bool
 
 
 DISPATCH_STAGES = ["Все", "Ожидает загрузки", "Загрузка начата", "Готов к отгрузке", "Отгрузка идёт", "Отгрузка завершена"]
@@ -1612,12 +1617,16 @@ class State(rx.State):
     route_stores: list[list[str]] = [[] for _ in range(MAX_ROUTES)]
     active_route_count: int = DEFAULT_ROUTE_COUNT
     selected_route_index: int = 0
-    collapsed_route_indices: list[int] = []
-    route_add_index: int = -1
     new_store_input: str = ""
     routes_status: str = ""
     route_backup_labels: list[str] = []
     selected_route_backup: str = ""
+    template_selected_stores: list[str] = []
+    template_move_stores: list[str] = []
+    template_move_source: int = -1
+    template_move_target: str = ""
+    template_move_error: str = ""
+    template_discard_open: bool = False
 
     backup_directory: str = ""
     backup_items: list[dict] = []
@@ -2764,6 +2773,7 @@ class State(rx.State):
             self.load_dispatch()
 
     def load_routes(self):
+        self.reset_template_selection()
         data = load_stores(self.stores_file)
         self.route_stores = [list(data.get(key, [])) for key in ROUTE_KEYS]
         self.route_editor_baseline = [list(names) for names in self.route_stores]
@@ -2773,9 +2783,150 @@ class State(rx.State):
         self.search_query = ""
         if self.selected_route_index >= self.active_route_count:
             self.selected_route_index = 0
-        self.route_add_index = -1
         self.routes_status = ""
         self.refresh_route_backups()
+
+    def reset_template_selection(self):
+        self.template_selected_stores = []
+        self.template_move_stores = []
+        self.template_move_source = -1
+        self.template_move_target = ""
+        self.template_move_error = ""
+        self.template_discard_open = False
+
+    @rx.var
+    def template_dirty(self) -> bool:
+        return self.route_stores != self.route_editor_baseline
+
+    @rx.var
+    def template_routes(self) -> list[TemplateRouteView]:
+        query = self.search_query.strip().lower()
+        return [
+            {
+                "index": index,
+                "label": f"Маршрут №{index + 1}",
+                "area": ROUTE_AREAS[index] if index < len(ROUTE_AREAS) else "",
+                "count": len(self.route_stores[index]),
+                "matches": len(self.template_filtered_names(index, query)),
+            }
+            for index in range(self.active_route_count)
+        ]
+
+    def template_filtered_names(self, index: int, query: str) -> list[str]:
+        title = f"Маршрут №{index + 1} " + (ROUTE_AREAS[index] if index < len(ROUTE_AREAS) else "")
+        return [name for name in self.route_stores[index] if not query or query in title.lower() or query in name.lower()]
+
+    @rx.var
+    def template_stores(self) -> list[TemplateStoreView]:
+        return [
+            {"name": name, "selected": name in self.template_selected_stores}
+            for name in self.template_filtered_names(self.selected_route_index, self.search_query.strip().lower())
+        ]
+
+    @rx.var
+    def template_store_count(self) -> int:
+        return len(self.route_stores[self.selected_route_index])
+
+    @rx.var
+    def template_move_options(self) -> list[str]:
+        return [f"Маршрут №{index + 1}" for index in range(self.active_route_count) if index != self.template_move_source]
+
+    def select_template_route(self, index: int):
+        if 0 <= index < self.active_route_count and index != self.selected_route_index:
+            self.reset_template_selection()
+            self.selected_route_index = index
+            self.new_store_input = ""
+
+    def toggle_template_store(self, name: str):
+        if name not in self.route_stores[self.selected_route_index]:
+            return
+        selected = list(self.template_selected_stores)
+        if name in selected:
+            selected.remove(name)
+        else:
+            selected.append(name)
+        self.template_selected_stores = selected
+
+    def select_template_matches(self):
+        names = self.template_filtered_names(self.selected_route_index, self.search_query.strip().lower())
+        self.template_selected_stores = list(dict.fromkeys([*self.template_selected_stores, *names]))
+
+    def clear_template_selection(self):
+        self.template_selected_stores = []
+
+    def open_template_move(self, name: str):
+        names = [name] if name else list(self.template_selected_stores)
+        if not names or any(item not in self.route_stores[self.selected_route_index] for item in names):
+            return
+        self.template_move_source = self.selected_route_index
+        self.template_move_stores = names
+        self.template_move_target = ""
+        self.template_move_error = ""
+
+    def set_template_move_open(self, opened: bool):
+        if not opened:
+            self.close_template_move()
+
+    def close_template_move(self):
+        self.template_move_source = -1
+        self.template_move_stores = []
+        self.template_move_target = ""
+        self.template_move_error = ""
+
+    def set_template_move_target(self, value: str):
+        self.template_move_target = value
+        self.template_move_error = ""
+
+    def move_template_stores(self, source: int, target: int, names: list[str]) -> bool:
+        if not (0 <= source < self.active_route_count and 0 <= target < self.active_route_count) or source == target:
+            self.template_move_error = "Выберите другой действующий маршрут."
+            return False
+        if not names or any(name not in self.route_stores[source] for name in names):
+            self.template_move_error = "Состав исходного маршрута изменился. Выберите магазины заново."
+            return False
+        conflicts = [name for name in names if name in self.route_stores[target]]
+        if conflicts:
+            self.template_move_error = "В целевом маршруте уже есть: " + ", ".join(conflicts)
+            return False
+        routes = [list(items) for items in self.route_stores]
+        moving = [name for name in routes[source] if name in names]
+        routes[source] = [name for name in routes[source] if name not in names]
+        routes[target].extend(moving)
+        self.route_stores = routes
+        self.template_selected_stores = [name for name in self.template_selected_stores if name not in moving]
+        self.routes_status = f"Перемещено магазинов: {len(moving)} → Маршрут №{target + 1}. Сохраните изменения."
+        self.template_move_error = ""
+        return True
+
+    def confirm_template_move(self):
+        target = route_index_from_name(self.template_move_target)
+        if target is None:
+            self.template_move_error = "Выберите целевой маршрут."
+            return
+        if self.move_template_stores(self.template_move_source, target, self.template_move_stores):
+            self.close_template_move()
+
+    def drop_template_store(self, target: int, payload: str):
+        try:
+            data = json.loads(payload)
+            source, name = data["source"], data["name"]
+            if type(source) is not int or not isinstance(name, str):
+                return
+        except (ValueError, TypeError, KeyError):
+            return
+        if not self.move_template_stores(source, target, [name]):
+            self.routes_status = self.template_move_error
+
+    def request_template_discard(self):
+        self.template_discard_open = True
+
+    def cancel_template_discard(self):
+        self.template_discard_open = False
+
+    def discard_template_changes(self):
+        self.route_stores = [list(names) for names in self.route_editor_baseline]
+        self.reset_template_selection()
+        self.routes_status = "Несохранённые изменения отменены."
 
     @rx.var
     def route_name_options(self) -> list[str]:
@@ -2784,82 +2935,6 @@ class State(rx.State):
     @rx.var
     def selected_route_label(self) -> str:
         return f"Маршрут №{self.selected_route_index + 1}"
-
-    @rx.var
-    def route_groups(self) -> list[RouteGroupView]:
-        query = self.search_query.strip().lower()
-        groups = []
-
-        for index in range(self.active_route_count):
-            route_label = f"Маршрут №{index + 1}"
-            area = ROUTE_AREAS[index] if index < len(ROUTE_AREAS) else ""
-            driver = self.route_driver_names[index] if index < len(self.route_driver_names) else "----"
-            driver_assigned = bool(driver and driver != "----")
-            parts = [part for part in driver.split() if part]
-            if len(parts) > 1:
-                driver_initials = "".join(part[0] for part in parts[:2]).upper()
-            elif parts:
-                driver_initials = parts[0][:2].upper()
-            else:
-                driver_initials = ""
-
-            source_stores = self.route_stores[index] if index < len(self.route_stores) else []
-            group_matches = query in " ".join((route_label, area, driver)).lower()
-            stores = []
-            for name in source_stores:
-                if query and not group_matches and query not in name.lower():
-                    continue
-                stores.append({"name": name, "status": "Шаблон", "done": False})
-
-            if query and not group_matches and not stores:
-                continue
-
-            point_count = len(source_stores)
-            last_two = point_count % 100
-            last_digit = point_count % 10
-            if 11 <= last_two <= 14:
-                point_word = "точек"
-            elif last_digit == 1:
-                point_word = "точка"
-            elif 2 <= last_digit <= 4:
-                point_word = "точки"
-            else:
-                point_word = "точек"
-
-            groups.append({
-                "index": index,
-                "label": route_label,
-                "area": area,
-                "title": f"{route_label} — {area}" if area else route_label,
-                "point_count": point_count,
-                "point_count_label": f"{point_count} {point_word}",
-                "driver": driver if driver_assigned else "Водитель не назначен",
-                "driver_initials": driver_initials,
-                "driver_assigned": driver_assigned,
-                "stores": stores,
-                "collapsed": index in self.collapsed_route_indices,
-                "adding": self.route_add_index == index,
-            })
-
-        return groups
-
-    def toggle_route_group(self, index: int):
-        collapsed = list(self.collapsed_route_indices)
-        if index in collapsed:
-            collapsed.remove(index)
-        else:
-            collapsed.append(index)
-        self.collapsed_route_indices = collapsed
-
-    def start_route_store_add(self, index: int):
-        if 0 <= index < self.active_route_count:
-            self.selected_route_index = index
-            self.route_add_index = index
-            self.new_store_input = ""
-
-    def cancel_route_store_add(self):
-        self.route_add_index = -1
-        self.new_store_input = ""
 
     def remove_route_store(self, index: int, name: str):
         if 0 <= index < self.active_route_count:
@@ -2876,15 +2951,11 @@ class State(rx.State):
             self.routes_status = f"Достигнут предел — не больше {MAX_ROUTES} маршрутов"
             return
 
+        self.reset_template_selection()
+        self.new_store_input = ""
         self.active_route_count += 1
         save_route_count(self.active_route_count)
         self.selected_route_index = self.active_route_count - 1
-        self.route_add_index = self.selected_route_index
-        self.collapsed_route_indices = [
-            index
-            for index in getattr(self, "collapsed_route_indices", [])
-            if index != self.selected_route_index
-        ]
         self.routes_status = (
             f"Добавлен «Маршрут №{self.active_route_count}» — впишите магазины и сохраните"
         )
@@ -2925,6 +2996,7 @@ class State(rx.State):
 
             routes = item.get("routes", {})
             self.route_stores = [list(routes.get(key, [])) for key in ROUTE_KEYS]
+            self.reset_template_selection()
             self.routes_status = (
                 f"Загружена копия «{self.selected_route_backup}». "
                 "Нажмите «Сохранить маршруты», чтобы применить её."
@@ -2963,6 +3035,9 @@ class State(rx.State):
         index = self.selected_route_index
         routes[index] = [item for item in routes[index] if item != name]
         self.route_stores = routes
+        self.template_selected_stores = [item for item in getattr(self, "template_selected_stores", []) if item != name]
+        if name in getattr(self, "template_move_stores", []):
+            self.close_template_move()
 
     def save_routes(self):
         stores_file = self.stores_file
@@ -7010,112 +7085,6 @@ def mail_page():
     )
 
 
-def route_store_row(group, store):
-    return rx.hstack(
-        fa_icon(tag="store", size=16, color=ui.INK_2),
-        rx.text(store["name"], color=ui.INK, overflow_wrap="anywhere"),
-        rx.spacer(),
-        icon_button("x", on_click=State.remove_route_store(group["index"], store["name"]), label="Удалить точку"),
-        width="100%", align="center", spacing="2", min_height="40px", padding="7px 12px",
-        border_bottom=f"1px solid {ui.LINE_SOFT}",
-    )
-
-
-def route_add_row(group):
-    return rx.cond(
-        group["adding"],
-        rx.hstack(
-            rx.input(
-                placeholder="Название магазина",
-                value=State.new_store_input,
-                on_change=State.set_new_store,
-                width="100%",
-                height="32px",
-                background=ui.PANEL,
-            ),
-            secondary_button("Добавить", on_click=State.add_store, width="110px"),
-            icon_button("x", on_click=State.cancel_route_store_add, label="Отменить"),
-            width="100%",
-            padding="10px 12px",
-            spacing="2",
-            align="center",
-        ),
-        rx.button(
-            fa_icon(tag="plus", size=16),
-            "Добавить точку",
-            on_click=State.start_route_store_add(group["index"]),
-            width="calc(100% - 24px)",
-            height="32px",
-            margin="8px 12px",
-            justify_content="flex-start",
-            color=ui.INK_3,
-            background=ui.PANEL,
-            border=f"1px solid {ui.LINE}",
-            border_radius=ui.RADIUS_CONTROL,
-            font_weight=ui.FONT_WEIGHT_REGULAR,
-            _hover={"color": ui.INK, "background": ui.STATUS_GRAY_BG},
-            class_name="prototype-interactive",
-        ),
-    )
-
-
-def route_group(group):
-    return rx.vstack(
-        rx.button(
-            fa_icon(
-                tag="chevron_down",
-                size=16,
-                color=ui.INK_2,
-                transform=rx.cond(group["collapsed"], "rotate(-90deg)", "rotate(0deg)"),
-                class_name="prototype-chevron",
-            ),
-            rx.text(
-                group["title"],
-                color=ui.INK,
-                background=ui.STATUS_GRAY_BG,
-                border_radius=ui.RADIUS_PILL,
-                padding="3px 10px",
-                font_size=ui.FONT_SIZE_LABEL,
-                font_weight=ui.FONT_WEIGHT_MEDIUM,
-                white_space="nowrap",
-            ),
-            rx.text(group["point_count_label"], color=ui.INK_3, font_size=ui.FONT_SIZE_LABEL),
-            rx.text("·", color=ui.INK_3, class_name="responsive-secondary-column"),
-            rx.text(
-                "По умолчанию: ", group["driver"],
-                color=ui.INK_3,
-                font_size=ui.FONT_SIZE_LABEL,
-                class_name="responsive-secondary-column",
-            ),
-            on_click=State.toggle_route_group(group["index"]),
-            width="100%",
-            min_height="34px",
-            padding="4px 2px 8px",
-            justify_content="flex-start",
-            gap="8px",
-            color=ui.INK,
-            background=ui.TRANSPARENT,
-            border="0",
-            border_radius="0",
-            font_weight=ui.FONT_WEIGHT_REGULAR,
-            _hover={"background": ui.TRANSPARENT},
-            text_align="left",
-        ),
-        rx.cond(
-            group["collapsed"],
-            rx.box(),
-            table_container(
-                rx.text("Магазины шаблона", padding="7px 12px", color=ui.INK_3, font_size=ui.FONT_SIZE_CAPTION),
-                rx.foreach(group["stores"], lambda store: route_store_row(group, store)),
-                route_add_row(group),
-            ),
-        ),
-        align="start",
-        spacing="0",
-        width="100%",
-    )
-
-
 def routes_backup_bar():
     return rx.hstack(
         secondary_button("Сохранить маршруты", on_click=State.save_routes, width="190px"),
@@ -7312,6 +7281,74 @@ def _dispatch_overview():
     )
 
 
+def _template_route_tile(route):
+    return RouteDropTarget.create(
+        rx.button(
+            rx.text(route["label"], font_weight="600"),
+            rx.text(route["area"], class_name="route-template-caption"),
+            rx.text("Магазинов: ", route["count"]),
+            rx.cond(State.search_query != "", rx.text("Найдено: ", route["matches"], class_name="route-template-caption"), rx.box()),
+            on_click=State.select_template_route(route["index"]),
+            aria_pressed=State.selected_route_index == route["index"],
+            class_name="route-template-route-button",
+        ),
+        on_drop=State.drop_template_store(route["index"]),
+        custom_attrs={"data-route-drop": route["index"]},
+        class_name=rx.cond(State.selected_route_index == route["index"], "route-template-route is-selected", "route-template-route"),
+    )
+
+
+def _template_store_tile(store):
+    return rx.box(
+        rx.hstack(
+            rx.checkbox(checked=store["selected"], on_change=lambda _: State.toggle_template_store(store["name"]), aria_label="Выбрать " + store["name"].to(str)),
+            rx.text(store["name"], class_name="route-template-store-name"),
+            rx.el.span("⠿", draggable=True, title="Перетащите на плитку другого маршрута", aria_hidden=True,
+                       custom_attrs={"data-route-drag": "true", "data-source": State.selected_route_index, "data-name": store["name"]},
+                       class_name="route-template-drag-handle"),
+            width="100%", align="start", spacing="2",
+        ),
+        rx.hstack(
+            rx.button("Переместить в…", on_click=State.open_template_move(store["name"]), class_name="route-template-action"),
+            rx.spacer(),
+            icon_button("x", on_click=State.remove_route_store(State.selected_route_index, store["name"]), label="Удалить " + store["name"].to(str)),
+            width="100%", align="center",
+        ),
+        class_name=rx.cond(store["selected"], "route-template-store is-selected", "route-template-store"),
+    )
+
+
+def _template_dialogs():
+    return rx.fragment(
+        rx.dialog.root(
+            rx.dialog.content(
+                rx.dialog.title("Переместить магазины"),
+                rx.dialog.description("Перенос меняет только шаблоны будущих заказов. После переноса сохраните маршруты."),
+                rx.text("Из: Маршрут №", State.template_move_source + 1, margin_top="12px"),
+                rx.text("Магазинов: ", State.template_move_stores.length()),
+                rx.box(rx.foreach(State.template_move_stores, lambda name: rx.text(name)), class_name="route-template-move-names"),
+                rx.select(State.template_move_options, value=State.template_move_target, on_change=State.set_template_move_target,
+                          placeholder="Выберите маршрут", aria_label="Целевой маршрут", width="100%"),
+                rx.cond(State.template_move_error != "", rx.text(State.template_move_error, role="alert"), rx.box()),
+                rx.hstack(secondary_button("Отмена", on_click=State.close_template_move), primary_button("Переместить", on_click=State.confirm_template_move),
+                          justify="end", wrap="wrap", margin_top="16px"),
+                max_width="480px",
+            ),
+            open=State.template_move_source >= 0,
+            on_open_change=State.set_template_move_open,
+        ),
+        rx.alert_dialog.root(
+            rx.alert_dialog.content(
+                rx.alert_dialog.title("Отменить изменения шаблонов?"),
+                rx.alert_dialog.description("Все несохранённые добавления, удаления и переносы магазинов будут отменены."),
+                rx.hstack(secondary_button("Оставить изменения", on_click=State.cancel_template_discard), primary_button("Отменить изменения", on_click=State.discard_template_changes),
+                          wrap="wrap", justify="end", margin_top="16px"),
+            ),
+            open=State.template_discard_open,
+        ),
+    )
+
+
 def _routes_editor():
     return rx.vstack(
         rx.hstack(
@@ -7325,12 +7362,41 @@ def _routes_editor():
             width="100%", align="center", wrap="wrap", spacing="3",
         ),
         segmented_control(["Город", "Область"], State.routes_source, State.set_routes_source),
-        rx.cond(
-            State.route_groups.length() > 0,
-            rx.vstack(rx.foreach(State.route_groups, route_group), spacing="4", width="100%"),
-            muted_text("По вашему запросу маршруты и магазины не найдены."),
+        rx.box(
+            rx.foreach(State.template_routes, _template_route_tile),
+            rx.cond(State.active_route_count < MAX_ROUTES, rx.button("+ Новый маршрут", on_click=State.add_route, class_name="route-template-new-route"), rx.box()),
+            class_name="route-template-routes",
+        ),
+        rx.vstack(
+            rx.hstack(rx.heading(State.selected_route_label, size="3"), rx.spacer(), muted_text("Всего магазинов: ", State.template_store_count), width="100%", wrap="wrap"),
+            muted_text("Перетащите магазин на плитку маршрута или нажмите «Переместить в…»."),
+            rx.hstack(
+                rx.text("Выбрано: ", State.template_selected_stores.length()),
+                rx.button("Выбрать найденные", on_click=State.select_template_matches, class_name="route-template-action"),
+                rx.button("Снять выделение", on_click=State.clear_template_selection, class_name="route-template-action"),
+                rx.button("Переместить выбранные", on_click=State.open_template_move(""), disabled=State.template_selected_stores.length() == 0, class_name="route-template-action"),
+                width="100%", wrap="wrap", align="center", spacing="3",
+            ),
+            rx.cond(
+                State.template_stores.length() > 0,
+                rx.box(rx.foreach(State.template_stores, _template_store_tile), class_name="route-template-stores"),
+                rx.text(rx.cond(State.template_store_count == 0, "В этом маршруте пока нет магазинов. Добавьте новый или перенесите из другого маршрута.", "По запросу магазины не найдены. Измените поиск или выберите другой маршрут.")),
+            ),
+            rx.hstack(
+                rx.input(placeholder="Название нового магазина", value=State.new_store_input, on_change=State.set_new_store, aria_label="Название нового магазина", width="100%"),
+                secondary_button("Добавить", on_click=State.add_store),
+                width="100%", align="center", spacing="2",
+            ),
+            width="100%", align="start", spacing="3", class_name="route-template-detail",
+        ),
+        rx.hstack(
+            rx.cond(State.template_dirty, rx.text("Есть несохранённые изменения", role="status"), muted_text("Все изменения сохранены")),
+            rx.spacer(),
+            rx.button("Отменить изменения", on_click=State.request_template_discard, disabled=~State.template_dirty, class_name="route-template-action"),
+            width="100%", wrap="wrap", align="center",
         ),
         routes_backup_bar(),
+        _template_dialogs(),
         rx.cond(State.routes_status != "", rx.text(State.routes_status, role="status"), rx.box()),
         width="100%", align="start", spacing="4",
     )
@@ -9163,7 +9229,7 @@ PWA_META = [
 app = rx.App(
     api_transformer=custom_api,
     html_lang="ru",
-    head_components=[rx.el.script(src="/theme-preference.js"), rx.el.script(src="/workspace-bootstrap.js")],
+    head_components=[rx.el.script(src="/theme-preference.js"), rx.el.script(src="/workspace-bootstrap.js"), rx.el.script(src="/route-template-dnd.js")],
     stylesheets=[
         "/theme.css",
         "/scrollbar.css",
