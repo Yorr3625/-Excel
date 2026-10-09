@@ -10,21 +10,30 @@ function worker(offline = false) {
   const handlers = {};
   const writes = [];
   const waits = [];
+  const installed = [];
   const sandbox = {
     URL,
-    self: {location: {origin: 'https://driver.test'}, addEventListener: (name, handler) => {handlers[name] = handler;}},
+    self: {location: {origin: 'https://driver.test'}, addEventListener: (name, handler) => {handlers[name] = handler;}, skipWaiting() {}},
     fetch: async () => {
       if (offline) throw new Error('Offline');
       return new Response('fresh');
     },
     caches: {
-      match: async () => new Response('cached'),
-      open: async () => ({put: async (request, response) => writes.push([request.url, await response.text()])}),
+      match: async request => request?.url?.endsWith('/driver') ? null : new Response('cached'),
+      open: async () => ({
+        addAll: async assets => installed.push(...assets),
+        put: async (request, response) => writes.push([request.url, await response.text()]),
+      }),
     },
   };
   vm.runInNewContext(source, sandbox);
   return {
     writes,
+    installed,
+    async install() {
+      handlers.install({waitUntil: promise => waits.push(promise)});
+      await Promise.all(waits);
+    },
     async get(url, destination = 'document') {
       let response;
       handlers.fetch({
@@ -39,6 +48,14 @@ function worker(offline = false) {
     },
   };
 }
+
+test('install preloads the canonical HTTPS driver path instead of a redirect', async () => {
+  const w = worker();
+  await w.install();
+  assert.ok(w.installed.includes('/driver/'));
+  assert.ok(!w.installed.includes('/driver'));
+  assert.ok(w.installed.includes('/workspace-bootstrap.js'));
+});
 
 test('online driver shell and bootstrap scripts prefer the network over stale cache', async () => {
   const w = worker();

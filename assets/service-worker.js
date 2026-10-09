@@ -1,6 +1,6 @@
-const CACHE_NAME = "logistics-static-v5";
+const CACHE_NAME = "logistics-static-v6";
 const STATIC_ASSETS = [
-  "/driver",
+  "/driver/",
   "/manifest.webmanifest",
   "/icon-192.svg",
   "/icon-512.svg",
@@ -54,7 +54,8 @@ self.addEventListener("fetch", (event) => {
     }
     return response;
   }).catch(async (error) => {
-    const cached = await caches.match(request);
+    const cached = await caches.match(request)
+      || (url.pathname === "/driver" ? await caches.match("/driver/") : null);
     if (cached) return cached;
     throw error;
   }));
