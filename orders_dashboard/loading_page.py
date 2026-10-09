@@ -582,7 +582,7 @@ class LoadingState(rx.State):
     def load_loading_page(self):
         principal = loading_principal_for_router(self.router)
         if principal is None:
-            return rx.redirect("/loader", replace=True)
+            return rx.call_script("window.location.replace('/loader/')")
         self.is_authorized = True
         self.principal = principal
         self.back_target = "/?page=history" if _query_param(self.router, "from") == "history" else "/"
@@ -1140,7 +1140,7 @@ class LoadingAuthMiddleware(rx.Middleware):
             return None
         return StateUpdate(
             events=Event.from_event_type(
-                rx.redirect("/loader", replace=True),
+                rx.call_script("window.location.replace('/loader/')"),
                 router_data=event.router_data,
             )
         )
