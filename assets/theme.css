@@ -763,6 +763,8 @@ body {
   font-weight: 400;
 }
 .driver-line input { text-align: right; }
+.driver-line .driver-line-net-only { grid-template-columns: minmax(130px, 220px); justify-content: end; }
+.driver-line .driver-line-net-only label { font-size: 12px; }
 .driver-line-measurements {
   display: grid;
   grid-template-columns: repeat(3, minmax(88px, 1fr)) minmax(88px, auto);

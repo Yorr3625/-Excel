@@ -74,6 +74,12 @@ def _optional_quantity(value: Any) -> str:
 def _measurement(value: Any) -> dict:
     if not isinstance(value, dict):
         raise DriverOrderError("Некорректные данные отгрузки")
+    if value.get("kind") == "net":
+        if set(value) != {"kind", "net_weight_kg"}:
+            raise DriverOrderError("Для чистого веса передайте только нетто")
+        return {"kind": "net", "net_weight_kg": _quantity(value.get("net_weight_kg", ""))}
+    if "kind" in value:
+        raise DriverOrderError("Некорректный тип измерения отгрузки")
     try:
         box_count = _quantity(value.get("box_count", ""))
         boxes = _decimal(box_count, "количество ящиков")

@@ -123,7 +123,7 @@ test('legacy unbound shipment queue is never silently retargeted or deleted', as
   const t = app();
   await t.run(`dbPut(QUEUE_STORE, 'old', {driver_id: driverId, store_id: 'store', payload: {operation_id: 'old'}})`);
   t.run(`api = async () => { calls.push('unexpected'); };`);
-  assert.equal(await t.run(`flushQueue()`), false);
+  await assert.rejects(t.run(`flushQueue()`));
   assert.equal(t.run(`calls.length`), 0);
   assert.equal(await t.run(`dbAll(QUEUE_STORE).then(entries => entries.length)`), 1);
 });
@@ -132,7 +132,7 @@ test('shipment conflict stops following operations and returns without deleting 
   const t = app();
   await t.run(`Promise.all([1, 2].map(n => dbPut(QUEUE_STORE, 'op-' + n, {driver_id: driverId, assignment_id: 'route-a', store_id: 'store-' + n, payload: {assignment_id: 'route-a', operation_id: 'op-' + n, base_revision: n}})))`);
   t.run(`api = async () => { calls.push('post'); throw Object.assign(new Error('Route changed'), {status: 409}); };`);
-  assert.equal(await t.run(`flushQueue()`), false);
+  await assert.rejects(t.run(`flushQueue()`));
   assert.equal(t.run(`calls.length`), 1);
   assert.equal(await t.run(`dbAll(QUEUE_STORE).then(entries => entries.length)`), 2);
   await assert.rejects(t.run(`flushReturnQueue()`));
@@ -143,7 +143,8 @@ test('historical return bypasses current mileage gate but never queued shipments
   t.run(`mileage = {required: true}; view = 'returns'; render = () => {};
     flushMileageQueue = async () => {calls.push('mileage'); return false;};
     flushQueue = async () => {calls.push('stores'); return true;};
-    flushReturnQueue = async () => {calls.push('returns');}; loadReturnIndex = async () => {};`);
+    flushReturnQueue = async () => {calls.push('returns');}; loadReturnIndex = async () => {};
+    api = async () => ({driver: {id: driverId}, csrf_token: 'fresh', mileage: {required: true}, assignment: null});`);
   await t.run(`syncOrder()`);
   assert.equal(t.run(`calls.join(',')`), 'mileage,returns');
   await t.run(`dbPut(QUEUE_STORE, 'pending', {driver_id: driverId})`);
@@ -157,9 +158,9 @@ test('synchronization order is mileage, store completions, then returns', async 
   await t.run(`dbPut(QUEUE_STORE, 'pending', {driver_id: driverId})`);
   t.run(`render = () => {}; view = 'order';
     flushMileageQueue = async () => {calls.push('mileage'); return true;};
-    flushQueue = async () => {calls.push('stores'); return true;};
+    flushQueue = async () => {calls.push('stores'); await dbDelete(QUEUE_STORE, 'pending'); return true;};
     flushReturnQueue = async () => {calls.push('returns');};
-    api = async () => ({assignment: null});`);
+    api = async () => ({driver: {id: driverId}, csrf_token: 'fresh', mileage: {required: false}, assignment: null});`);
   await t.run(`syncOrder()`);
   assert.equal(t.run(`calls.join(',')`), 'mileage,stores,returns');
 });
@@ -272,4 +273,104 @@ test('return history and server errors are escaped and accessible through mileag
   assert.ok(t.element.innerHTML.includes('&lt;img'));
   assert.ok(!t.element.innerHTML.includes('<script>'));
   assert.ok(!t.element.innerHTML.includes('data-mileage-form'));
+});
+
+function mockSession(t, required = false) {
+  t.run(`api = async (path) => ({driver: {id: driverId}, csrf_token: 'fresh', mileage: {required: ${required}}, assignment: null});`);
+}
+
+test('shipment net accepts comma, zero and decimals without treating blank as zero', () => {
+  const t = app();
+  for (const [value, expected] of [['1,5', '1.5'], ['0.4', '0.4'], ['0', '0']]) {
+    assert.equal(t.run(`shipmentNet({kind: 'net', net_weight_kg: '${value}'})`), expected);
+  }
+  for (const value of ['', ' ', '-1', 'NaN', 'Infinity', 'abc']) {
+    assert.equal(t.run(`shipmentNet({kind: 'net', net_weight_kg: '${value}'})`), '');
+  }
+  assert.equal(t.run(`shipmentNet({box_count: '2', tare_weight_per_box_kg: '0.5', gross_weight_kg: '9'})`), '8');
+});
+
+test('store net draft survives rerender and is isolated by assignment and driver', () => {
+  const t = app();
+  t.run(`assignment = {assignment_id: 'route-a', stores: [{store_id: 'store-a', lines: [{line_id: 'line-a', name: 'Product', required_qty: '2'}]}]};
+    selectedStoreId = 'store-a'; view = 'store';
+    shipmentDrafts[shipmentDraftKey('line-a')] = '1,5'; renderStore();`);
+  assert.ok(t.element.innerHTML.includes('value="1,5"'));
+  assert.ok(t.element.innerHTML.includes('data-field="net_weight_kg"'));
+  assert.ok(!t.element.innerHTML.includes('data-field="box_count"'));
+  t.run(`assignment.assignment_id = 'route-b'; renderStore();`);
+  assert.ok(!t.element.innerHTML.includes('value="1,5"'));
+  t.run(`assignment.assignment_id = 'route-a'; driverId = 'driver-b'; renderStore();`);
+  assert.ok(!t.element.innerHTML.includes('value="1,5"'));
+});
+
+test('sync recovers csrf and refreshes even with an empty queue', async () => {
+  const t = app();
+  t.run(`csrfToken = ''; view = 'order'; render = () => {};`);
+  mockSession(t);
+  await t.run(`syncOrder()`);
+  assert.equal(t.run(`csrfToken`), 'fresh');
+  assert.equal(t.run(`syncStatus`), 'Данные синхронизированы');
+  assert.equal(t.run(`syncing`), false);
+});
+
+test('sync never announces success when mileage is required', async () => {
+  const t = app();
+  t.run(`view = 'order'; render = () => {};`);
+  mockSession(t, true);
+  await t.run(`syncOrder()`);
+  assert.ok(t.run(`syncStatus.includes('пробег')`));
+  assert.notEqual(t.run(`syncStatus`), 'Данные синхронизированы');
+});
+
+test('sync duplicate awaits the active operation and exposes busy controls', async () => {
+  const t = app();
+  const button = {setAttribute() {}, disabled: false, textContent: ''};
+  t.element.querySelectorAll = selector => selector === '[data-sync]' ? [button] : [];
+  t.run(`render = () => {}; globalThis.release = null;
+    api = async (path) => {calls.push(path); if (path.endsWith('/me')) await new Promise(resolve => {release = resolve;});
+      return {driver: {id: driverId}, csrf_token: 'fresh', mileage: {required: false}, assignment: null};};`);
+  const first = t.run(`syncOrder()`);
+  const second = t.run(`syncOrder()`);
+  assert.equal(button.disabled, true);
+  assert.equal(button.textContent, 'Синхронизация…');
+  assert.equal(t.run(`calls.length`), 1);
+  t.run(`release()`);
+  await Promise.all([first, second]);
+  assert.equal(button.disabled, false);
+  assert.equal(t.run(`calls.length`), 2);
+});
+
+test('sync preserves queued data on expired session and offers login', async () => {
+  const t = app();
+  await t.run(`dbPut(QUEUE_STORE, 'pending', {driver_id: driverId});`);
+  t.run(`render = () => {}; api = async () => {throw Object.assign(new Error('Expired'), {status: 401});};`);
+  await t.run(`syncOrder()`);
+  assert.equal(t.run(`view`), 'login');
+  assert.equal(t.run(`csrfToken`), '');
+  assert.equal(await t.run(`dbAll(QUEUE_STORE).then(items => items.length)`), 1);
+  assert.notEqual(t.run(`syncStatus`), 'Данные синхронизированы');
+});
+
+test('sync shows the specific shipment conflict and keeps its queue', async () => {
+  const t = app();
+  await t.run(`dbPut(QUEUE_STORE, 'op', {driver_id: driverId, assignment_id: 'route-a', store_id: 'store-a', payload: {assignment_id: 'route-a', operation_id: 'op'}});`);
+  t.run(`render = () => {}; api = async (path) => {
+    if (path.endsWith('/me')) return {driver: {id: driverId}, csrf_token: 'fresh', mileage: {required: false}, assignment: null};
+    throw Object.assign(new Error('Exact conflict'), {status: 409});};`);
+  await t.run(`syncOrder()`);
+  assert.equal(t.run(`syncStatus`), 'Exact conflict');
+  assert.equal(await t.run(`dbAll(QUEUE_STORE).then(items => items.length)`), 1);
+});
+
+test('lost shipment response retries identical bytes and operation identity', async () => {
+  const t = app();
+  await t.run(`dbPut(QUEUE_STORE, 'op', {driver_id: driverId, assignment_id: 'route-a', store_id: 'store-a', payload: {
+    assignment_id: 'route-a', operation_id: 'op', base_revision: 0, measurements: {'line-a': {kind: 'net', net_weight_kg: '1,5'}}}});`);
+  t.run(`api = async (path, options) => {calls.push(options.body); throw new Error('Lost response');};`);
+  await assert.rejects(t.run(`flushQueue()`), /Lost response/);
+  t.run(`api = async (path, options) => {calls.push(options.body); return {ok: true, assignment: {assignment_id: 'route-a', stores: [{store_id: 'store-a', status: 'completed', lines: []}]}};};`);
+  await t.run(`flushQueue()`);
+  assert.equal(t.run(`calls[0]`), t.run(`calls[1]`));
+  assert.equal(await t.run(`dbAll(QUEUE_STORE).then(items => items.length)`), 0);
 });

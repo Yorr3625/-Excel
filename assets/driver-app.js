@@ -13,6 +13,13 @@ let returnDraft = null;
 let returnOperation = null;
 let returnSave = Promise.resolve();
 let syncing = false;
+let syncStatus = "Нажмите синхронизацию, чтобы обновить данные";
+const SHIPMENT_DRAFT_KEY = "logistics-driver-shipment-drafts";
+let shipmentDrafts = {};
+try {
+  const savedDrafts = JSON.parse(localStorage.getItem(SHIPMENT_DRAFT_KEY) || "{}");
+  if (savedDrafts && typeof savedDrafts === "object" && !Array.isArray(savedDrafts)) shipmentDrafts = savedDrafts;
+} catch (_) {}
 let loggingOut = false;
 let syncFinished = Promise.resolve();
 let csrfToken = "";
@@ -122,6 +129,9 @@ async function clearOfflineData() {
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
   });
+  shipmentDrafts = {};
+  try { localStorage.removeItem(SHIPMENT_DRAFT_KEY); } catch (_) {}
+  syncStatus = "Нажмите синхронизацию, чтобы обновить данные";
   assignment = null;
   returnContext = returnDraft = returnOperation = null;
   returnIndex = {returns: [], assignments: []};
@@ -179,6 +189,35 @@ function measurementNet(measurement) {
   if (!Number.isInteger(boxes) || boxes < 0 || !Number.isFinite(tare) || tare < 0 || !Number.isFinite(gross) || gross < 0) return "";
   const net = gross - boxes * tare;
   return net >= 0 ? String(net) : "";
+}
+
+function shipmentNet(measurement) {
+  if (measurement?.kind !== "net") return measurementNet(measurement);
+  const text = String(measurement.net_weight_kg ?? "").trim().replace(",", ".");
+  if (!/^\d+(?:\.\d+)?$/.test(text)) return "";
+  const value = Number(text);
+  return Number.isFinite(value) && value >= 0 ? text : "";
+}
+
+function shipmentDraftKey(lineId) {
+  return JSON.stringify([driverId, assignment?.assignment_id, selectedStoreId, lineId]);
+}
+
+function saveShipmentInputs() {
+  root().querySelectorAll("[data-measurement-input]").forEach((input) => {
+    shipmentDrafts[shipmentDraftKey(input.dataset.lineId)] = input.value;
+  });
+  try { localStorage.setItem(SHIPMENT_DRAFT_KEY, JSON.stringify(shipmentDrafts)); }
+  catch (_) { setMessage("Не удалось сохранить черновик. Не закрывайте страницу.", true); }
+}
+
+function updateSyncControls() {
+  root().querySelectorAll("[data-sync]").forEach((button) => {
+    button.disabled = syncing;
+    button.textContent = syncing ? "Синхронизация…" : "Синхронизировать";
+    button.setAttribute("aria-busy", String(syncing));
+  });
+  root().querySelectorAll("[data-sync-status]").forEach((note) => { note.textContent = syncStatus; });
 }
 
 function setMessage(message, error = false) {
@@ -263,6 +302,7 @@ function renderMileage() {
             <h1 id="mileage-title">Укажите пробег</h1>
             <p class="driver-muted">Перед началом работы зафиксируйте показание одометра.</p>
             <button data-return-history class="driver-secondary" type="button">История возвратов</button>
+            <button data-sync class="driver-secondary" type="button">Синхронизировать</button>
             <p class="driver-mileage-vehicle">${esc(vehicleLabel)}</p>
             ${isAvailable ? `<form data-mileage-form class="driver-form">
               <label>Пробег, км<input name="odometer_km" type="number" inputmode="numeric" min="0" max="9999999" step="1" required autofocus></label>
@@ -275,6 +315,8 @@ function renderMileage() {
     </div>`;
   bindFrameActions();
   root().querySelector("[data-return-history]").addEventListener("click", openReturns);
+  root().querySelector("[data-sync]").addEventListener("click", syncOrder);
+  updateSyncControls();
   const form = root().querySelector("[data-mileage-form]");
   if (form) form.addEventListener("submit", submitMileage);
 }
@@ -330,11 +372,11 @@ function renderOrder() {
           <section class="driver-panel driver-order-panel">
             <div class="driver-panel-heading"><div><h2>Весь заказ</h2><p class="driver-muted">Общий объём товаров по маршруту. Данные обновляются при синхронизации.</p></div><span class="driver-products-count">${(assignment?.summary || []).length} товаров</span></div>
             <div class="driver-table-wrap"><table class="driver-table"><thead><tr><th>Товар</th><th>Ед.</th><th>Заказ на маршрут</th><th>Необходимо на маршрут</th><th>Выполнено</th></tr></thead><tbody>${summaryRows()}</tbody></table></div>
-            <p class="driver-table-note">Для отгрузки магазина укажите ящики, тару одного ящика и грязный вес по каждой позиции.</p>
+            <p class="driver-table-note">Для отгрузки магазина укажите только чистый вес по каждой позиции.</p>
           </section>
           ${storesPanel(stores)}
         </div>
-        <footer class="driver-footer"><span class="${online ? "driver-online" : "driver-offline"}"><i aria-hidden="true"></i>${online ? "Онлайн" : "Офлайн"}<small>${online ? "Данные синхронизированы с сервером" : "Изменения будут отправлены после восстановления связи"}</small></span><button data-sync class="driver-primary driver-sync" type="button">Синхронизировать</button></footer>
+        <footer class="driver-footer"><span class="${online ? "driver-online" : "driver-offline"}"><i aria-hidden="true"></i>${online ? "Онлайн" : "Офлайн"}<small data-sync-status>${esc(syncStatus)}</small></span><button data-sync class="driver-primary driver-sync" type="button">Синхронизировать</button></footer>
       </main>
     </div>`;
   bindFrameActions();
@@ -344,6 +386,7 @@ function renderOrder() {
     render();
   }));
   root().querySelector("[data-sync]").addEventListener("click", syncOrder);
+  updateSyncControls();
   root().querySelector("[data-route-return]").addEventListener("click", () => assignment?.assignment_id ? openReturn(assignment.assignment_id) : openReturns());
 }
 
@@ -372,15 +415,11 @@ function renderStore() {
   const lines = (store.lines || []).map((line) => {
     const measurement = line.shipment_measurement || {};
     const saved = completed;
-    const savedDetails = measurement.legacy_net_weight_kg
-      ? `<span class="driver-line-net">Нетто: ${esc(numberText(measurement.net_weight_kg))} кг</span>`
-      : `<span class="driver-line-net">Ящики: ${esc(numberText(measurement.box_count))} · Тара: ${esc(numberText(measurement.tare_weight_per_box_kg))} кг/ящ. · Грязный: ${esc(numberText(measurement.gross_weight_kg))} кг · Нетто: ${esc(numberText(measurement.net_weight_kg))} кг</span>`;
-    return `<section class="driver-line"><span>${esc(line.name)} <small>${esc(line.unit)}</small><em>План: ${numberText(line.required_qty)} кг</em></span>
-      ${saved ? savedDetails : `<div class="driver-line-measurements">
-        <label>Ящики<input data-measurement-input data-line-id="${esc(line.line_id)}" data-field="box_count" type="number" inputmode="numeric" min="0" step="1" required></label>
-        <label>Тара, кг/ящ.<input data-measurement-input data-line-id="${esc(line.line_id)}" data-field="tare_weight_per_box_kg" type="number" inputmode="decimal" min="0" step="any" required></label>
-        <label>Грязный вес, кг<input data-measurement-input data-line-id="${esc(line.line_id)}" data-field="gross_weight_kg" type="number" inputmode="decimal" min="0" step="any" required></label>
-        <output data-net-line-id="${esc(line.line_id)}">—</output>
+    const savedDetails = `<span class="driver-line-net">Чистый вес: ${esc(numberText(measurement.net_weight_kg ?? line.actual_qty))} кг</span>`;
+    const draft = shipmentDrafts[shipmentDraftKey(line.line_id)] ?? "";
+    return `<section class="driver-line"><span>${esc(line.name)} <small>${esc(line.unit)}</small><em>План: ${esc(numberText(line.required_qty))} кг</em></span>
+      ${saved ? savedDetails : `<div class="driver-line-measurements driver-line-net-only">
+        <label>Чистый вес, кг<input data-measurement-input data-line-id="${esc(line.line_id)}" data-field="net_weight_kg" type="text" inputmode="decimal" value="${esc(draft)}" ${waitingForLoading ? "disabled" : ""} required></label>
       </div>`}
     </section>`;
   }).join("");
@@ -389,13 +428,13 @@ function renderStore() {
       ${appHeader(true)}
       <main class="driver-shell driver-store-shell">
         <p class="driver-breadcrumb">${esc(assignment?.route_label || "Назначенный заказ")}</p>
-        <header class="driver-header"><button data-back class="driver-secondary" type="button">Назад</button><div><h1>${esc(store.name)}</h1><p class="driver-muted">${completed ? "Магазин выполнен" : (waitingForLoading ? "Ожидается подтверждение загрузки на складе" : "Введите ящики, тару и грязный вес")}</p></div></header>
+        <header class="driver-header"><button data-back class="driver-secondary" type="button">Назад</button><div><h1>${esc(store.name)}</h1><p class="driver-muted">${completed ? "Магазин выполнен" : (waitingForLoading ? "Ожидается подтверждение загрузки на складе" : "Введите чистый вес по каждой позиции")}</p></div></header>
         <section class="driver-panel driver-store-detail"><div class="driver-lines">${lines}</div>${completed || waitingForLoading ? "" : '<button data-complete class="driver-primary" type="button">Подтвердить отгрузку</button>'}<p data-message class="driver-message">${waitingForLoading ? "Склад ещё не подтвердил загрузку." : ""}</p></section>
       </main>
     </div>`;
   bindFrameActions();
   root().querySelector("[data-back]").addEventListener("click", () => { view = "order"; render(); });
-  root().querySelectorAll("[data-measurement-input]").forEach((input) => input.addEventListener("input", refreshNetPreviews));
+  root().querySelectorAll("[data-measurement-input]").forEach((input) => input.addEventListener("input", saveShipmentInputs));
   refreshNetPreviews();
   const complete = root().querySelector("[data-complete]");
   if (complete) complete.addEventListener("click", completeStore);
@@ -404,7 +443,9 @@ function renderStore() {
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
   if (options.method && options.method !== "GET") headers["X-Driver-CSRF"] = csrfToken;
-  const response = await fetch(await apiUrl(path), {...options, headers, credentials: "include"});
+  const response = await fetch(await apiUrl(path), {
+    ...options, headers, credentials: "include", signal: options.signal || AbortSignal.timeout(20000)
+  });
   if (!response.ok) {
     let data = {};
     try { data = await response.json(); } catch (_) {}
@@ -466,7 +507,7 @@ async function submitMileage(event) {
 
 async function flushMileageQueue() {
   if (!csrfToken || !online) return false;
-  const queued = await dbAll(MILEAGE_QUEUE_STORE).catch(() => []);
+  const queued = await dbAll(MILEAGE_QUEUE_STORE);
   for (const operation of queued.filter((item) => item.driver_id === driverId)) {
     try {
       const data = await api("/api/driver/mileage", {
@@ -481,9 +522,8 @@ async function flushMileageQueue() {
       if (error.status === 409 && error.mileage) {
         mileage = error.mileage;
         await saveSession();
-        continue;
       }
-      return false;
+      throw error;
     }
   }
   return !mileage?.required;
@@ -496,18 +536,20 @@ async function flushQueue() {
   for (const operation of queued) {
     // Pre-v4 entries have no proven route identity: never retarget them.
     if (!operation.assignment_id || operation.assignment_id !== operation.payload?.assignment_id) {
-      setMessage("Старая офлайн-отгрузка не привязана к маршруту. Нужна проверка администратора; операция сохранена.", true);
-      return false;
+      throw new Error("Старая офлайн-отгрузка не привязана к маршруту. Нужна проверка администратора; операция сохранена.");
     }
     try {
       const data = await api(`/api/driver/order/stores/${encodeURIComponent(operation.store_id)}/complete`, {
         method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(operation.payload)
       });
+      const savedStore = data.assignment?.stores?.find((store) => store.store_id === operation.store_id);
+      if (!data.ok || data.assignment?.assignment_id !== operation.assignment_id || savedStore?.status !== "completed") {
+        throw new Error("Сервер не подтвердил отгрузку. Операция сохранена на устройстве.");
+      }
       await dbDelete(QUEUE_STORE, operation.payload.operation_id);
       await cacheAssignment(data.assignment);
     } catch (error) {
-      setMessage(error.message || "Отгрузка не отправлена. Операция сохранена на устройстве.", true);
-      return false;
+      throw error;
     }
   }
   return true;
@@ -551,14 +593,15 @@ async function completeStore() {
   root().querySelectorAll("[data-measurement-input]").forEach((input) => {
     const lineId = input.dataset.lineId;
     measurements[lineId] ||= {};
+    measurements[lineId].kind = "net";
     measurements[lineId][input.dataset.field] = input.value;
   });
   for (const measurement of Object.values(measurements)) {
-    const net = measurementNet(measurement);
+    const net = shipmentNet(measurement);
     if (net === "") invalid = true;
   }
   if (invalid || Object.keys(measurements).length !== (store.lines || []).length) {
-    setMessage("Для каждой строки укажите целые ящики, неотрицательную тару и грязный вес не меньше тары", true);
+    setMessage("Для каждой позиции укажите неотрицательный чистый вес, например 1,5 кг", true);
     return;
   }
   const operationId = crypto.randomUUID();
@@ -571,6 +614,9 @@ async function completeStore() {
       driver_id: driverId, assignment_id: assignment.assignment_id, store_id: store.store_id, payload
     });
     applyLocalCompletion(store, measurements);
+    syncStatus = "Есть неотправленная отгрузка";
+    for (const line of store.lines) delete shipmentDrafts[shipmentDraftKey(line.line_id)];
+    try { localStorage.setItem(SHIPMENT_DRAFT_KEY, JSON.stringify(shipmentDrafts)); } catch (_) {}
     await dbPut(ORDER_STORE, driverId, assignment);
     await cacheReturnContext(localReturnContext(assignment));
     view = "order";
@@ -587,7 +633,7 @@ function applyLocalCompletion(store, measurements) {
   store.status = "completed";
   store.completed_at = new Date().toISOString();
   for (const line of store.lines) {
-    const measurement = {...measurements[line.line_id], net_weight_kg: measurementNet(measurements[line.line_id])};
+    const measurement = {...measurements[line.line_id], net_weight_kg: shipmentNet(measurements[line.line_id])};
     line.shipment_measurement = measurement;
     line.actual_qty = measurement.net_weight_kg;
   }
@@ -603,36 +649,68 @@ function applyLocalCompletion(store, measurements) {
 }
 
 async function syncOrder() {
-  if (syncing || loggingOut) return;
+  if (loggingOut) return;
+  if (syncing) return syncFinished;
   syncing = true;
   let finishSync;
   syncFinished = new Promise((resolve) => { finishSync = resolve; });
+  syncStatus = "Синхронизация…";
+  updateSyncControls();
+  setMessage(syncStatus);
   try {
-    if (!csrfToken || !online) throw new Error("Нет связи с сервером. Изменения сохранены на устройстве.");
+    if (!online) throw new Error("Нет связи с сервером. Изменения сохранены на устройстве.");
+    // Refresh authentication and mileage without dropping the local operation queue.
+    const session = await api("/api/driver/me");
+    if (!session.driver?.id || session.driver.id !== driverId) {
+      throw new Error("Сессия другого водителя. Войдите под своим профилем; очередь сохранена.");
+    }
+    csrfToken = session.csrf_token || "";
+    if (!csrfToken) throw new Error("Войдите заново. Изменения сохранены на устройстве.");
+    mileage = session.mileage || null;
+    await cacheAssignment(session.assignment);
+    await saveSession();
     const mileageReady = await flushMileageQueue();
     const shipments = (await dbAll(QUEUE_STORE)).filter((item) => item.driver_id === driverId);
     // Historical returns need no mileage for today, but cannot overtake shipments.
-    if (shipments.length && (!mileageReady || !await flushQueue())) {
-      throw new Error("Сначала отправьте пробег и все отгрузки. Возвраты сохранены и ждут синхронизации.");
+    if (shipments.length) {
+      if (!mileageReady) throw new Error(mileage?.error || "Перед отправкой отгрузок укажите пробег автомобиля. Отгрузки сохранены на устройстве.");
+      if (!await flushQueue()) throw new Error("Отгрузки ещё не отправлены. Очередь сохранена на устройстве.");
     }
     await flushReturnQueue();
     if (mileageReady) {
       const data = await api("/api/driver/sync", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
       await cacheAssignment(data.assignment);
+      mileage = data.mileage || mileage;
     }
     if (view === "returns") await loadReturnIndex();
-    if (view === "return" && returnContext) await loadReturn(returnContext.assignment_id);
+    if (view === "return" && returnContext) {
+      const returnError = await loadReturn(returnContext.assignment_id);
+      if (returnError) throw returnError;
+    }
+    const pending = (await Promise.all([QUEUE_STORE, MILEAGE_QUEUE_STORE, RETURN_QUEUE_STORE].map(dbAll)))
+      .flat().some((operation) => operation.driver_id === driverId);
+    if (pending) throw new Error("Есть неотправленные операции. Они сохранены на устройстве.");
+    syncStatus = mileageReady ? "Данные синхронизированы" : "Заказ обновлён. Перед отгрузкой укажите пробег автомобиля";
+    await saveSession();
     render();
-    setMessage("Данные синхронизированы");
+    setMessage(syncStatus);
   } catch (error) {
     if (error.status === 409 && error.mileage) {
       mileage = error.mileage;
       await saveSession();
     }
+    if ([401, 403].includes(error.status)) {
+      csrfToken = "";
+      view = "login";
+    }
+    syncStatus = [401, 403].includes(error.status)
+      ? "Войдите заново. Неотправленные операции сохранены на устройстве."
+      : error.message || "Синхронизация недоступна. Очередь сохранена.";
     render();
-    setMessage(error.message || "Синхронизация недоступна", true);
+    setMessage(syncStatus, true);
   } finally {
     syncing = false;
+    updateSyncControls();
     finishSync();
   }
 }

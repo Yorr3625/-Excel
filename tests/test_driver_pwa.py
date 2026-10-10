@@ -22,13 +22,14 @@ def test_driver_pwa_keeps_required_mileage_in_the_driver_flow():
     assert 'api("/api/driver/mileage"' in source
 
 
-def test_driver_pwa_collects_weighted_store_shipment_measurements():
+def test_driver_pwa_collects_only_net_store_shipment_measurements():
     source = DRIVER_APP.read_text(encoding="utf-8")
 
-    assert 'data-field="box_count"' in source
-    assert 'data-field="tare_weight_per_box_kg"' in source
-    assert 'data-field="gross_weight_kg"' in source
-    assert "measurementNet" in source
+    assert 'data-field="net_weight_kg" type="text" inputmode="decimal"' in source
+    for field in ('box_count', 'tare_weight_per_box_kg', 'gross_weight_kg'):
+        assert f'data-field="{field}"' not in source
+    assert "shipmentNet" in source
+    assert 'measurements[lineId].kind = "net"' in source
     assert "measurements, operation_id" in source
     assert "waiting_loading" in source
 

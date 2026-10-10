@@ -112,6 +112,12 @@ def is_zero_measurement(measurement: object) -> bool:
 
 
 def _shipment_measurement_complete(measurement: object) -> bool:
+    if isinstance(measurement, dict) and measurement.get("kind") == "net":
+        try:
+            _validated_shipment_measurement(measurement)
+            return True
+        except OrderRecordError:
+            return False
     if _measurement_complete(measurement):
         return True
     return isinstance(measurement, dict) and str(measurement.get("legacy_net_weight_kg", "")).strip() != ""
@@ -227,6 +233,12 @@ def _loading_measurement_complete(value: object) -> bool:
 
 
 def _validated_shipment_measurement(value: object) -> dict:
+    if isinstance(value, dict) and value.get("kind") == "net":
+        if set(value) != {"kind", "net_weight_kg"}:
+            raise OrderRecordError("Для чистого веса передайте только нетто")
+        return {"kind": "net", "net_weight_kg": _quantity(value.get("net_weight_kg", ""), "Чистый вес")}
+    if isinstance(value, dict) and "kind" in value:
+        raise OrderRecordError("Некорректный тип измерения отгрузки")
     if isinstance(value, dict) and "legacy_net_weight_kg" in value:
         net_weight = _quantity(value.get("legacy_net_weight_kg", ""), "Фактическое количество")
         return {
@@ -321,6 +333,9 @@ def _normalize_shipment(position: dict) -> None:
             "gross_weight_kg": shipment.get("gross_weight_kg", ""),
             "net_weight_kg": shipment.get("net_weight_kg", ""),
         }
+    if measurement.get("kind") == "net":
+        shipment["measurement"] = {"kind": "net", "net_weight_kg": str(measurement.get("net_weight_kg", ""))}
+        return
     shipment["measurement"] = {
         key: str(measurement.get(key, ""))
         for key in ("box_count", "tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg")
@@ -500,6 +515,8 @@ def route_return_balance(record: dict, route_key: str) -> dict:
         if not isinstance(measurement, dict):
             raise OrderRecordError("Отсутствует подтверждённое измерение нетто")
         result = number(measurement.get("net_weight_kg"), "Нетто")
+        if legacy and measurement.get("kind") == "net":
+            return number(_validated_shipment_measurement(measurement)["net_weight_kg"], "Нетто")
         if legacy and "legacy_net_weight_kg" in measurement:
             expected = number(measurement["legacy_net_weight_kg"], "Нетто")
         else:

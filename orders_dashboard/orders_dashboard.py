@@ -738,9 +738,11 @@ async def driver_sync(request: Request):
     mileage_error = _mileage_required_response(session, assignment)
     if mileage_error:
         return mileage_error
-    if assignment is None:
-        return JSONResponse({"ok": True, "assignment": None})
-    return JSONResponse({"ok": True, "assignment": _public_driver_assignment(assignment)})
+    return JSONResponse({
+        "ok": True,
+        "assignment": _public_driver_assignment(assignment),
+        "mileage": _mileage_status(session, assignment),
+    })
 
 
 async def loader_login(request: Request):
