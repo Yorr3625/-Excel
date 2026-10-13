@@ -1,7 +1,9 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from io import BytesIO
 from types import SimpleNamespace
+import uuid
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -10,6 +12,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 from reflex._upload import upload
+from reflex.istate.data import RouterData
+from reflex.istate.manager.token import BaseStateToken
 
 import orders_dashboard.orders_dashboard as dashboard
 
@@ -129,3 +133,45 @@ def test_real_reflex_multipart_upload_passes_auth_and_saves_excel(tmp_path, monk
         assert "_redirect" not in response.text
     finally:
         dashboard.dashboard_sessions.destroy_session(token)
+
+
+def test_authenticated_upload_with_real_reflex_event_processor(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard.rx, "get_upload_dir", lambda: tmp_path)
+    monkeypatch.setattr(dashboard, "was_processed", lambda filename: None)
+    monkeypatch.setattr(dashboard, "detect_mode", lambda *args: ("Город", {"Город": 1, "Область": 0}))
+    monkeypatch.setattr(dashboard, "load_stores", lambda *args: {})
+    monkeypatch.setattr(dashboard.app, "_event_processor", None)
+    client_token = uuid.uuid4().hex
+    auth_token = dashboard.dashboard_sessions.create_session()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with dashboard.app._setup_event_processor():
+            async with dashboard.app.state_manager.modify_state_with_links(
+                    BaseStateToken(ident=client_token, cls=dashboard.State)) as root_state:
+                root_state.router_data = {"headers": {"cookie": "dashboard_session=" + auth_token},
+                                          "token": client_token, "pathname": "/"}
+                root_state.router = RouterData.from_router_data(root_state.router_data)
+                state = await root_state.get_state(dashboard.State)
+                state.is_authenticated = True
+            yield
+
+    api = dashboard.DashboardUploadAuth(Starlette(
+        routes=[Route("/_upload", upload(dashboard.app), methods=["POST"])], lifespan=lifespan))
+    book = Workbook()
+    book.active.append(["Товар", "Магазин"])
+    book.active.append(["Яблоки", 12])
+    stream = BytesIO()
+    book.save(stream)
+    try:
+        with TestClient(dashboard.app._context_middleware(api)) as client:
+            client.cookies.set("dashboard_session", auth_token)
+            response = client.post("/_upload", files={"files": ("real-reflex.xlsx", stream.getvalue())},
+                                   headers={"reflex-client-token": client_token,
+                                            "reflex-event-handler": dashboard.State.get_full_name() + ".handle_upload"})
+            assert response.status_code == 200
+            assert (tmp_path / "real-reflex.xlsx").exists(), response.text
+            assert "_redirect" not in response.text
+            assert "real-reflex.xlsx" in response.text
+    finally:
+        dashboard.dashboard_sessions.destroy_session(auth_token)
