@@ -250,10 +250,21 @@ def _source_rows(sheet, store_columns: list[tuple[int, str]]) -> list[tuple[int,
         if not name or name.casefold() == "итого":
             continue
         has_numeric = False
-        for column, _store in store_columns:
-            value = sheet.cell(row, column).value
+        for column, store in store_columns:
+            cell = sheet.cell(row, column)
+            value = cell.value
             if value not in (None, ""):
-                _decimal(value, "плановое количество")
+                try:
+                    _decimal(value, "плановое количество")
+                except DriverOrderError as error:
+                    shown_value = repr(value)
+                    if len(shown_value) > 80:
+                        shown_value = shown_value[:77] + "..."
+                    raise DriverOrderError(
+                        f"Обработанный лист «{sheet.title}», ячейка {cell.coordinate} "
+                        f"(магазин «{store}», товар «{name}»): "
+                        f"{error} — {shown_value}"
+                    ) from error
                 has_numeric = True
         if has_numeric:
             rows.append((row, name))

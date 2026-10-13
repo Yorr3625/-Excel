@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from modules import driver_orders, paths
 
@@ -170,3 +170,44 @@ def test_republishing_assignments_preserves_completed_store_without_double_count
     assert driver_orders.assignments_for_vehicle("vehicle-1")[0]["assignment_id"] == snapshot["assignment_id"]
     assert report["completed_stores"] == 1
     assert report["line_count"] == 2
+
+
+def test_invalid_planned_quantity_reports_processed_sheet_cell_and_value(order_fixture):
+    workbook = load_workbook(order_fixture)
+    workbook.active["C2"] = "—"
+    workbook.save(order_fixture)
+    workbook.close()
+
+    with pytest.raises(driver_orders.DriverOrderError) as exc:
+        driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
+
+    message = str(exc.value)
+    assert "Маршрут №1" in message
+    assert "C2" in message
+    assert "фм 10" in message
+    assert "Яблоки" in message
+    assert "'—'" in message
+    assert "плановое количество" in message
+
+
+def test_invalid_planned_quantity_cannot_partially_publish_assignments(order_fixture):
+    workbook = load_workbook(order_fixture)
+    workbook.active["D3"] = "не число"
+    workbook.save(order_fixture)
+    workbook.close()
+
+    with pytest.raises(driver_orders.DriverOrderError, match="D3"):
+        driver_orders.publish_assignments(order_fixture, "Город", "order.xlsx", [assignment()])
+
+    assert driver_orders._snapshots(active_only=False) == []
+    assert not driver_orders.index_path().exists()
+
+
+def test_valid_decimal_comma_still_publishes(order_fixture):
+    workbook = load_workbook(order_fixture)
+    workbook.active["C2"] = "1,5"
+    workbook.save(order_fixture)
+    workbook.close()
+
+    snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
+    assert snapshot["stores"][0]["lines"][0]["required_qty"] == "1.5"

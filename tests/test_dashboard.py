@@ -949,6 +949,39 @@ def test_web_order_processing_does_not_open_file_on_server(monkeypatch):
     assert created_records == [("result.xlsx", "upload.xlsx", "ООО Ромашка", "Город", None)]
 
 
+def test_web_order_processing_reports_driver_quantity_cell_without_traceback(monkeypatch):
+    monkeypatch.setattr(dashboard, "load_settings", lambda: {})
+    monkeypatch.setattr(dashboard, "load_stores", lambda path: {})
+    monkeypatch.setattr(dashboard, "run_pipeline", lambda *args: (
+        "result.xlsx", "order.log", {"route_totals": {}}
+    ))
+    monkeypatch.setattr(dashboard, "create_processed_order_record", lambda *args: {})
+    monkeypatch.setattr(dashboard, "record_order_route_assignments", lambda *args: None)
+    monkeypatch.setattr(dashboard.driver_orders, "publish_assignments", lambda *args: (
+        _ for _ in ()
+    ).throw(dashboard.driver_orders.DriverOrderError(
+        "Обработанный лист «Маршрут №1», ячейка C2: Некорректное значение плановое количество — '—'"
+    )))
+    recorded = []
+    monkeypatch.setattr(dashboard, "record_processing", lambda *args: recorded.append(args))
+    state = SimpleNamespace(
+        uploaded_file_path="upload.xlsx", preview_ready=True, preview_source="upload.xlsx",
+        preview_mode="Город", mode="Город", active_route_count=1,
+        route_assignments=[{"route": "route_1", "driver_id": "driver-1", "driver_name": "Иван"}],
+        selected_file="upload.xlsx", order_client_name="Клиент", order_mail_metadata=None,
+    )
+
+    dashboard.State.process_order.fn(state)
+
+    assert state.status == "Файл обработан, но задание водителю не опубликовано"
+    assert "C2" in state.error_text and "'—'" in state.error_text
+    assert "обработанному файлу" in state.error_text
+    assert "Traceback" not in state.error_text
+    assert state.output_file == "result.xlsx"
+    assert not state.is_processing
+    assert recorded == []
+
+
 def test_dashboard_login_creates_http_only_server_session(monkeypatch):
     dashboard.dashboard_sessions.reset_sessions()
     monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)

@@ -4731,6 +4731,13 @@ class State(rx.State):
             self.load_history()
             self._reset_preview()
 
+        except driver_orders.DriverOrderError as error:
+            self.status = "Файл обработан, но задание водителю не опубликовано"
+            self.error_text = (
+                f"{error}. Координата относится к обработанному файлу; "
+                "проверьте соответствующее значение в исходном заказе и повторите обработку."
+            )
+
         except Exception:
             self.status = "Ошибка обработки"
             self.error_text = traceback.format_exc()
