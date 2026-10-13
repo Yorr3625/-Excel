@@ -9115,6 +9115,25 @@ def loader_page():
     )
 
 
+DASHBOARD_UPLOAD_HANDLERS = frozenset({"handle_upload", "recognize_invoice_photos"})
+
+
+class DashboardUploadAuth:
+    """Проверяет настоящую HTTP-сессию до обработки файлов Reflex."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "").rstrip("/") == "/_upload":
+            request = Request(scope)
+            if not _dashboard_download_authorized(request):
+                response = JSONResponse({"ok": False, "error": "Требуется вход"}, status_code=401)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 class DashboardAuthMiddleware(rx.Middleware):
     """Не даёт анонимному клиенту вызвать обработчики административного state."""
 
@@ -9138,6 +9157,14 @@ class DashboardAuthMiddleware(rx.Middleware):
             dashboard_state.is_authenticated = True
             return None
 
+        # HTTP-загрузки Reflex не содержат router_data. Cookie запроса уже
+        # проверен DashboardUploadAuth; здесь проверяем живую серверную сессию.
+        if event_name in DASHBOARD_UPLOAD_HANDLERS and not event.router_data:
+            dashboard_state = await state.get_state(State)
+            if _admin_session_for_router(dashboard_state.router):
+                dashboard_state.is_authenticated = True
+                return None
+
         return StateUpdate(
             events=Event.from_event_type(
                 rx.redirect("/login", replace=True),
@@ -9158,7 +9185,7 @@ PWA_META = [
 
 
 app = rx.App(
-    api_transformer=custom_api,
+    api_transformer=[custom_api, DashboardUploadAuth],
     html_lang="ru",
     head_components=[rx.el.script(src="/theme-preference.js"), rx.el.script(src="/workspace-bootstrap.js"), rx.el.script(src="/route-template-dnd.js")],
     stylesheets=[
