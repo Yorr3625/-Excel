@@ -1048,6 +1048,7 @@ def loading_page():
                     rx.el.select(rx.el.option("Как на устройстве", value="system"), rx.el.option("Светлая", value="light"),
                                  rx.el.option("Тёмная", value="dark"), default_value="system", aria_label="Тема оформления",
                                  custom_attrs={"data-theme-select": ""}, class_name="theme-select"),
+                    rx.link("Рейсы машин / Догрузка", href="/trips", class_name="loading-secondary"),
                     rx.button("← Назад", on_click=LoadingState.back_to_orders, class_name="loading-secondary loading-back-button"),
                     align="center", spacing="2", class_name="loading-header-actions",
                 ),

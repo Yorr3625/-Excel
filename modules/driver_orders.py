@@ -402,6 +402,12 @@ def publish_assignments(
     with _LOCK:
         index = _read_index() or _empty_index()
         active = dict(index["active"])
+        from modules import vehicle_trips
+        for snapshot in prepared:
+            existing_id = active.get(snapshot["logical_assignment_id"])
+            trip = vehicle_trips.trip_for_assignment(existing_id) if existing_id else None
+            if trip and trip["status"] != "closed":
+                raise DriverOrderConflict("Маршрут участвует в рейсе машины. Завершите рейс перед повторной публикацией")
         paths_written = []
         publication_assignment_ids = []
         for snapshot in prepared:

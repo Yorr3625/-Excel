@@ -11,9 +11,9 @@ from modules.weight_log import STAGE_LOADING, STAGE_STORE_SHIPMENT, STAGE_UNLOAD
 
 def test_orders_page_does_not_show_duplicate_route_drivers_panel(monkeypatch):
     order_content = object()
-    monkeypatch.setattr(dashboard, "topbar", lambda *args: object())
+    monkeypatch.setattr(dashboard, "design_heading", lambda *args: object())
     monkeypatch.setattr(dashboard, "order_panel", lambda: order_content)
-    monkeypatch.setattr(dashboard, "page_shell", lambda *children: children)
+    monkeypatch.setattr(dashboard, "design_page", lambda *children, **kwargs: children)
     monkeypatch.setattr(
         dashboard,
         "route_drivers_panel",

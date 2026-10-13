@@ -1368,3 +1368,19 @@ button.loading-store-tile:focus-visible { outline:2px solid var(--accent); outli
   .loading-weighing-fields .loading-measurement-control { min-width: 0; }
   .loading-weighing-fields .loading-amount-input { width: 100%; min-width: 0; }
 }
+
+.driver-return-search { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+.driver-return-search label { display: grid; gap: 6px; flex: 1; min-width: 180px; }
+.driver-return-line[hidden] { display: none !important; }
+.driver-trip-stock { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+.driver-trip-stock > div { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.driver-refusal-fields { display: grid; gap: 8px; grid-column: 1 / -1; width: 100%; }
+.driver-refusal-fields label { display: grid; gap: 4px; }
+.trip-workspace { max-width: 1100px; padding: 24px; margin: 0 auto; min-height: 100vh; background: var(--page); color: var(--ink); }
+.trip-subcard { padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.trip-history-details { font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.trip-list-button { height: auto; white-space: normal; text-align: left; padding: 12px; }
+.trip-measurement-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.trip-field { display: grid; gap: 6px; min-width: 0; width: 100%; }
+.trip-field .loading-amount-input { width: 100%; min-width: 0; }
+@media (max-width: 760px) { .trip-workspace { padding: 12px; } .trip-measurement-fields { gap: 8px; } }

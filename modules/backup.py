@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sqlite3
+from contextlib import ExitStack
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -33,6 +35,7 @@ _BACKUP_RELATIVE_FILES = (
     "data/processed_files.json",
     "data/order_records.json",
     "data/goods_returns.json",
+    "data/vehicle_trips.sqlite3",
     "data/mail_items.json",
     "data/mail_seen.json",
     "data/mail_uid_cache.json",
@@ -238,16 +241,29 @@ def create_backup(
             dir=str(directory),
         )
         os.close(fd)
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "manifest.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
-            )
-            for relative, path in present:
-                archive.write(path, relative)
+        with ExitStack() as stack:
+            sqlite_snapshot = None
+            sqlite_path = root / "data/vehicle_trips.sqlite3"
+            if sqlite_path.exists():
+                guard = sqlite3.connect(sqlite_path, timeout=30)
+                stack.callback(guard.close)
+                guard.execute("BEGIN IMMEDIATE")
+                directory_snapshot = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="trip-backup-")))
+                sqlite_snapshot = directory_snapshot / "vehicle_trips.sqlite3"
+                with sqlite3.connect(sqlite_path) as source, sqlite3.connect(sqlite_snapshot) as target:
+                    source.backup(target)
+                source.close()
+                target.close()
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+                for relative, path in present:
+                    archive.write(sqlite_snapshot if relative == "data/vehicle_trips.sqlite3" else path, relative)
         os.replace(temporary, archive_path)
         temporary = None
-    except (OSError, zipfile.BadZipFile, ValueError) as exc:
+    except (OSError, sqlite3.DatabaseError, zipfile.BadZipFile, ValueError) as exc:
         raise BackupError(f"Не удалось создать резервную копию: {exc}") from exc
     finally:
         if temporary:
@@ -310,7 +326,7 @@ def _read_archive(archive_path: str | Path) -> tuple[dict, dict[str, bytes]]:
                 raise BackupError("Версия формата резервной копии не поддерживается.")
 
             entries = manifest.get("files")
-            if not isinstance(entries, list) or len(entries) != len(_BACKUP_RELATIVE_FILES):
+            if not isinstance(entries, list) or len(entries) not in {len(_BACKUP_RELATIVE_FILES), len(_BACKUP_RELATIVE_FILES) - 1}:
                 raise BackupError("В manifest.json указан неполный список файлов.")
 
             states: dict[str, bool] = {}
@@ -324,8 +340,11 @@ def _read_archive(archive_path: str | Path) -> tuple[dict, dict[str, bytes]]:
                     raise BackupError("В manifest.json отсутствует признак наличия файла.")
                 states[relative] = entry["present"]
 
-            if set(states) != _KNOWN_RELATIVE_FILES:
+            if set(states) not in (_KNOWN_RELATIVE_FILES, _KNOWN_RELATIVE_FILES - {"data/vehicle_trips.sqlite3"}):
                 raise BackupError("manifest.json не описывает все файлы состояния.")
+            if "data/vehicle_trips.sqlite3" not in states:
+                states["data/vehicle_trips.sqlite3"] = False
+                manifest["files"].append({"path": "data/vehicle_trips.sqlite3", "present": False})
 
             present_names = {relative for relative, present in states.items() if present}
             expected_names = {"manifest.json", *present_names}
@@ -343,6 +362,18 @@ def _read_archive(archive_path: str | Path) -> tuple[dict, dict[str, bytes]]:
         raise BackupError(f"Не удалось прочитать резервную копию: {exc}") from exc
 
     for relative, payload in payloads.items():
+        if relative == "data/vehicle_trips.sqlite3":
+            connection = sqlite3.connect(":memory:")
+            try:
+                connection.deserialize(payload)
+                connection.execute("PRAGMA trusted_schema=OFF")
+                if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise BackupError("Журнал рейсов в архиве повреждён")
+            except sqlite3.DatabaseError as exc:
+                raise BackupError("Журнал рейсов в архиве повреждён") from exc
+            finally:
+                connection.close()
+            continue
         try:
             json.loads(payload.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -471,7 +502,11 @@ def restore_backup(
             if target.exists() or target.is_symlink():
                 target.unlink()
                 removed.append(relative)
-    except (OSError, BackupError) as exc:
+        sqlite_target = root / "data/vehicle_trips.sqlite3"
+        if states.get("data/vehicle_trips.sqlite3"):
+            from modules.vehicle_trips import restore_source_snapshots
+            restore_source_snapshots(sqlite_target, root)
+    except (OSError, ValueError, sqlite3.DatabaseError, BackupError) as exc:
         if isinstance(exc, BackupError):
             raise
         raise BackupError(f"Не удалось применить восстановление: {exc}") from exc

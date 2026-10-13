@@ -184,6 +184,12 @@ def _context(assignment: dict, ledger: dict) -> dict:
         "eligible": False, "complete": False, "loading_ready": False,
         "error": "", "facts_token": "", "reasons": list(RETURN_REASONS), "lines": [], "document": None,
     }
+    from modules import vehicle_trips
+    trip = vehicle_trips.trip_for_assignment(context["assignment_id"])
+    if trip:
+        context["error"] = "Товар учитывается в рейсе машины. Оформите общий возврат рейса"
+        context["trip_id"] = trip["id"]
+        return context
     document = _route_document(ledger, assignment)
     other_owner = document is not None and not _owns(document, assignment)
     if document and not other_owner:

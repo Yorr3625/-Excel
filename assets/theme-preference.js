@@ -17,6 +17,9 @@
       container.classList.toggle("light", effective() === "light");
     });
     document.querySelectorAll("[data-theme-select]").forEach(select => { select.value = preference; });
+    document.querySelectorAll("[data-theme-choice]").forEach(button => {
+      button.setAttribute("aria-pressed", String(button.dataset.themeChoice === effective()));
+    });
   }
   function apply() {
     const theme = effective();
@@ -38,6 +41,10 @@
     apply();
   }
   window.LogisticsTheme = {getPreference: () => preference, getTheme: effective, setPreference};
+  document.addEventListener("click", event => {
+    const button = event.target.closest?.("[data-theme-choice]");
+    if (button) setPreference(button.dataset.themeChoice);
+  });
   document.addEventListener("change", event => {
     if (event.target.matches?.("[data-theme-select]")) setPreference(event.target.value);
   });

@@ -27,6 +27,7 @@ from modules import (
     driver_orders,
     driver_sessions,
     goods_returns,
+    vehicle_trips,
     loader_sessions,
     gdemoi,
     paths,
@@ -185,6 +186,7 @@ from modules.invoice_ocr import (
 from modules.help_chat import HelpChatError, send_chat_message
 from orders_dashboard import theme as ui
 from orders_dashboard.loading_page import LoadingAuthMiddleware, LoadingState, loading_page
+from orders_dashboard.vehicle_trips_page import TripAuthMiddleware, TripState, vehicle_trips_page
 
 
 DASHBOARD_API_ORIGIN_JS = f"""
@@ -364,12 +366,20 @@ def _set_loader_cookie(response: JSONResponse, request: Request, token: str) -> 
 
 
 def _assignment_for_session(session: dict) -> dict | None:
-    return driver_orders.find_assignment_for_driver(str(session.get("driver_id", "")))
+    driver_id = str(session.get("driver_id", ""))
+    trip = vehicle_trips.active_for_driver(driver_id)
+    if trip:
+        return vehicle_trips.as_assignment(trip)
+    assignment = driver_orders.find_assignment_for_driver(driver_id)
+    linked = vehicle_trips.trip_for_assignment(assignment["assignment_id"]) if assignment else None
+    return vehicle_trips.as_assignment(linked) if linked else assignment
 
 
 def _public_driver_assignment(assignment: dict | None) -> dict | None:
     if assignment is None:
         return None
+    if assignment.get("trip_id"):
+        return assignment
     payload = driver_orders.public_snapshot(assignment)
     try:
         payload["return_context"] = goods_returns.return_context(assignment)
@@ -406,7 +416,10 @@ async def driver_returns(request: Request):
         return error
     try:
         driver_id = str(session["driver_id"])
+        driver_trips = vehicle_trips.list_trips(driver_id)
         documents = [item for item in goods_returns.list_returns() if item["driver_id"] == driver_id]
+        documents.extend(doc for trip in driver_trips for doc in trip["returns"])
+        trip_assignments = [{"assignment_id": trip["id"], "trip_id": trip["id"], "route_label": "Рейс машины · " + ", ".join(item["route_label"] for item in trip["members"]), "order_number": trip["date"], "created_at": trip["created_at"]} for trip in driver_trips]
         assignments = [
             {
                 "assignment_id": item["assignment_id"],
@@ -415,7 +428,8 @@ async def driver_returns(request: Request):
                 "created_at": str(item.get("created_at", "")),
             }
             for item in driver_orders.completed_assignments_for_driver(driver_id)
-        ]
+            if not vehicle_trips.trip_for_assignment(item["assignment_id"])
+        ] + trip_assignments
     except (goods_returns.GoodsReturnError, DriverOrderError) as invalid:
         return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
     return JSONResponse(
@@ -574,10 +588,13 @@ async def driver_mileage_submit(request: Request):
     expected_vehicle_id = status["vehicle"]["id"]
     expected_day = status["date"]
     expected_assignment_id = status["assignment_id"]
+    allowed_assignment_ids = {expected_assignment_id}
+    if assignment.get("trip_id"):
+        allowed_assignment_ids.update(item["assignment_id"] for item in vehicle_trips.load_trip(assignment["trip_id"])["members"])
     if (
         str(payload.get("vehicle_id", "")) != expected_vehicle_id
         or str(payload.get("date", "")) != expected_day
-        or str(payload.get("assignment_id", "")) != expected_assignment_id
+        or str(payload.get("assignment_id", "")) not in allowed_assignment_ids
     ):
         return JSONResponse(
             {
@@ -638,7 +655,21 @@ async def driver_complete_store(request: Request):
     assignment = _assignment_for_session(session)
     if assignment is None:
         return JSONResponse({"ok": False, "error": "Активное назначение не найдено"}, status_code=404)
-    if payload.get("assignment_id", assignment["assignment_id"]) != assignment["assignment_id"]:
+    requested_id = payload.get("assignment_id", assignment["assignment_id"])
+    linked_trip = vehicle_trips.trip_for_assignment(str(requested_id))
+    if linked_trip:
+        try:
+            result = vehicle_trips.complete_legacy_stop(str(requested_id), request.path_params["store_id"], payload, {"kind": "driver", "id": str(session["driver_id"]), "name": str(assignment.get("driver_name", ""))})
+            return JSONResponse({"ok": True, "assignment": _public_driver_assignment(result)})
+        except vehicle_trips.TripNotFound as missing:
+            return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
+        except vehicle_trips.TripConflict as conflict:
+            return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+        except (vehicle_trips.TripError, OrderRecordError) as invalid:
+            return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+    if assignment.get("trip_id"):
+        return JSONResponse({"ok": False, "error": "Обновите кабинет: отгрузки объединённого рейса отправляются по заданиям"}, status_code=409)
+    if requested_id != assignment["assignment_id"]:
         return JSONResponse(
             {"ok": False, "error": "Операция относится к другому рейсу. Данные сохранены на устройстве."},
             status_code=409,
@@ -730,11 +761,79 @@ async def driver_complete_store(request: Request):
     return JSONResponse({"ok": True, "assignment": _public_driver_assignment(result)})
 
 
+def _owned_trip(session: dict, trip_id: str) -> dict:
+    trip = vehicle_trips.load_trip(trip_id)
+    if trip["driver_id"] != str(session["driver_id"]):
+        raise vehicle_trips.TripNotFound("Рейс не найден")
+    return trip
+
+
+async def driver_trip_detail(request: Request):
+    session, error = _session(request)
+    if error:
+        return error
+    try:
+        trip = _owned_trip(session, request.path_params["trip_id"])
+        return JSONResponse({"ok": True, "assignment": vehicle_trips.as_assignment(trip)})
+    except vehicle_trips.TripNotFound as missing:
+        return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
+
+
+async def driver_trip_complete(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    try:
+        trip = _owned_trip(session, request.path_params["trip_id"])
+        mileage_error = _mileage_required_response(session, vehicle_trips.as_assignment(trip))
+        if mileage_error:
+            return mileage_error
+        payload = await _json_payload(request)
+        if payload is None or payload.get("trip_id") != trip["id"] or payload.get("assignment_id") != trip["id"]:
+            raise vehicle_trips.TripConflict("Операция относится к другому рейсу")
+        trip = vehicle_trips.complete_stop(trip["id"], request.path_params["stop_id"], payload, {"kind": "driver", "id": str(session["driver_id"]), "name": trip["driver_name"]})
+        return JSONResponse({"ok": True, "assignment": vehicle_trips.as_assignment(trip)})
+    except vehicle_trips.TripNotFound as missing:
+        return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
+    except vehicle_trips.TripConflict as conflict:
+        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+    except (vehicle_trips.TripError, OrderRecordError) as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+
+
+async def driver_trip_return(request: Request):
+    session, error = _session(request, mutate=request.method == "POST")
+    if error:
+        return error
+    try:
+        trip = _owned_trip(session, request.path_params["trip_id"])
+        if request.method == "GET":
+            result = {"ok": True, "context": vehicle_trips.return_context(trip)}
+        else:
+            payload = await _json_payload(request)
+            if payload is None:
+                raise vehicle_trips.TripError("Некорректный запрос")
+            document = vehicle_trips.submit_return(trip["id"], payload, {"kind": "driver", "id": str(session["driver_id"]), "name": trip["driver_name"]})
+            result = {"ok": True, "document": document}
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except vehicle_trips.TripNotFound as missing:
+        return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
+    except vehicle_trips.TripConflict as conflict:
+        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+    except (vehicle_trips.TripError, goods_returns.GoodsReturnError, OrderRecordError) as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+
+
 async def driver_sync(request: Request):
     session, error = _session(request, mutate=True)
     if error:
         return error
     assignment = _assignment_for_session(session)
+    if assignment and assignment.get("trip_id"):
+        vehicle_trips.repair_projections(assignment["trip_id"])
+        assignment = vehicle_trips.as_assignment(vehicle_trips.load_trip(assignment["trip_id"]))
+        if assignment["projection_error"]:
+            return JSONResponse({"ok": False, "error": assignment["projection_error"]}, status_code=409)
     mileage_error = _mileage_required_response(session, assignment)
     if mileage_error:
         return mileage_error
@@ -933,6 +1032,9 @@ custom_api = Starlette(routes=[
     Route("/api/driver/order", driver_order, methods=["GET"]),
     Route("/api/driver/order/stores/{store_id}/complete", driver_complete_store, methods=["POST"]),
     Route("/api/driver/sync", driver_sync, methods=["POST"]),
+    Route("/api/driver/trips/{trip_id}", driver_trip_detail, methods=["GET"]),
+    Route("/api/driver/trips/{trip_id}/stops/{stop_id}/complete", driver_trip_complete, methods=["POST"]),
+    Route("/api/driver/trips/{trip_id}/returns", driver_trip_return, methods=["GET", "POST"]),
     Route("/api/driver/returns", driver_returns, methods=["GET"]),
     Route("/api/driver/returns/{assignment_id}", driver_return_detail, methods=["GET", "POST"]),
     Route("/api/loader/login", loader_login, methods=["POST"]),
@@ -987,6 +1089,18 @@ TABLER_ICON_MAP = {
     "search": "IconSearch",
     "chevron_right": "IconChevronRight",
     "chevron_down": "IconChevronDown",
+    "arrow_right": "IconArrowRight",
+    "clock": "IconClock",
+    "file_text": "IconFileText",
+    "layout_grid": "IconLayoutGrid",
+    "lock": "IconLock",
+    "menu": "IconMenu",
+    "log_out": "IconLogout",
+    "panel_left_open": "IconLayoutSidebarLeftExpand",
+    "panel_left_close": "IconLayoutSidebarLeftCollapse",
+    "refresh_cw": "IconRefresh",
+    "undo_2": "IconArrowBackUp",
+    "user": "IconUser",
 }
 
 
@@ -1523,6 +1637,7 @@ class State(rx.State):
     search_query: str = ""
     nav_groups: list[dict] = NAV_GROUPS
     mobile_menu_open: bool = False
+    sidebar_collapsed: bool = False
     today_mode: str = "Область"
     today_waiting: int = 0
     today_drafts: int = 0
@@ -1531,6 +1646,9 @@ class State(rx.State):
     today_completed: int = 0
     today_returns: int = 0
     today_error: str = ""
+
+    def toggle_sidebar(self):
+        self.sidebar_collapsed = not self.sidebar_collapsed
 
     def toggle_mobile_menu(self):
         self.mobile_menu_open = not self.mobile_menu_open
@@ -4868,12 +4986,55 @@ def theme_selector():
     )
 
 
-def sidebar_logo():
-    return rx.hstack(
-        rx.box("Д", class_name="app-brand-mark"),
-        rx.vstack(rx.text("Доставка", font_weight="600"), muted_text("Рабочее место"), spacing="0"),
-        class_name="app-brand", align="center", spacing="2",
+
+def design_icon(tag, size=20, **props):
+    return fa_icon(tag=tag, size=size, class_name="icon", **props)
+
+
+def design_button(label, action, icon="", primary=False, **props):
+    children = ([design_icon(icon, 17)] if icon else []) + [label]
+    return rx.el.button(*children, on_click=action, type="button",
+                        class_name="button " + ("button-primary" if primary else "button-secondary"), **props)
+
+
+def design_heading(title, eyebrow, description, action=None):
+    return rx.el.div(
+        rx.el.div(rx.el.p(eyebrow, class_name="eyebrow"),
+                  rx.el.h1(title, rx.el.span(".", class_name="heading-dot")),
+                  rx.el.p(description, class_name="page-description")),
+        action if action is not None else rx.fragment(), class_name="page-heading",
     )
+
+
+def design_page(*children, class_name=""):
+    return rx.el.div(*children, rx.el.footer(rx.el.span("Доставка / Рабочее пространство"),
+                                            rx.el.span("Заказы и доставка"), class_name="page-footer"),
+                     class_name="design-page " + class_name)
+
+
+def design_panel_heading(number, title, description):
+    return rx.el.div(rx.el.span(number, class_name="panel-number"),
+                     rx.el.div(rx.el.h3(title), rx.el.p(description)), class_name="panel-heading")
+
+
+def design_mail_panel(section, *children):
+    return rx.el.section(*children, class_name="mail-block " + section)
+
+
+def design_theme_switch():
+    return rx.el.div(
+        *[rx.el.button(design_icon(icon, 15), rx.el.span(label, class_name="theme-name"),
+                       type="button", custom_attrs={"data-theme-choice": value},
+                       aria_label=label + " тема", aria_pressed=False)
+          for value, label, icon in (("light", "Светлая", "sun"), ("dark", "Тёмная", "moon"))],
+        theme_selector(), class_name="theme-switch", role="group", aria_label="Выбор темы",
+    )
+
+
+def sidebar_logo():
+    return rx.el.div(rx.el.span("д", rx.el.span(), class_name="brand-mark"),
+                     rx.el.span(rx.el.strong("Доставка"), rx.el.small("Рабочее пространство"), class_name="brand-copy"),
+                     class_name="brand")
 
 
 def rail_item(item):
@@ -4881,100 +5042,76 @@ def rail_item(item):
         active = (State.current_page == "Маршруты") & State.routes_editor_open
     else:
         active = (State.current_page == item["target"]) & ~((State.current_page == "Маршруты") & State.routes_editor_open)
-    return rx.button(
-        navigation_icon(item["icon"], 18), rx.text(item["label"]),
-        on_click=State.navigate(item["target"]), aria_label=item["label"], aria_pressed=active,
-        class_name=rx.cond(active, "app-nav-item app-nav-active", "app-nav-item"),
+    return rx.el.button(
+        navigation_icon(item["icon"], 18), rx.el.span(item["label"], class_name="nav-text"),
+        rx.cond(active, rx.el.span(class_name="active-dot"), rx.fragment()),
+        on_click=State.navigate(item["target"]), type="button", title=item["label"],
+        aria_label=item["label"], aria_pressed=active,
+        class_name=rx.cond(active, "nav-item active", "nav-item"),
     )
 
 
 def loading_rail_item():
-    return rx.button(navigation_icon("package", 18), rx.text("Загрузка и сверка"),
-                     on_click=rx.redirect("/loading"), class_name="app-nav-item", aria_label="Загрузка и сверка")
+    return rx.el.button(design_icon("package", 18), rx.el.span("Загрузка и сверка", class_name="nav-text"),
+                        on_click=rx.redirect("/loading"), type="button", class_name="nav-item",
+                        title="Загрузка и сверка", aria_label="Загрузка и сверка")
 
 
 def sidebar():
     return rx.fragment(
         rx.cond(State.mobile_menu_open,
-                rx.button(aria_label="Закрыть меню", on_click=State.close_mobile_menu, class_name="app-menu-backdrop"),
-                rx.box(display="none")),
-        rx.vstack(
-            rx.hstack(sidebar_logo(), rx.button("Закрыть", on_click=State.close_mobile_menu, class_name="app-mobile-only"), width="100%", align="center"),
-            *[rx.vstack(
-                rx.text(section, class_name="app-nav-section"),
+                rx.el.button(aria_label="Закрыть меню", on_click=State.close_mobile_menu, class_name="app-menu-backdrop"),
+                rx.fragment()),
+        rx.el.aside(
+            rx.el.div(sidebar_logo(),
+                      rx.el.button(design_icon("x", 18), on_click=State.close_mobile_menu,
+                                   aria_label="Закрыть меню", class_name="sidebar-toggle sidebar-close", type="button"),
+                      class_name="sidebar-brand-row"),
+            rx.el.nav(*[rx.el.div(
+                rx.el.p(section, class_name="nav-heading"),
                 *[rail_item(item) for item in NAV_GROUPS if item["section"] == section],
                 *([loading_rail_item()] if section == "Работа" else []),
-                spacing="1", width="100%", align="start",
+                class_name="nav-group",
             ) for section in ["Работа", "Справочники", "Дополнительно", "Сервис"]],
-            rx.spacer(), rx.text("Оформление", class_name="app-nav-section"), theme_selector(),
-            class_name=rx.cond(State.mobile_menu_open, "app-sidebar app-sidebar-open", "app-sidebar"),
-            spacing="3", align="start",
+                class_name="navigation", aria_label="Основная навигация"),
+            rx.el.div(rx.el.span("Оформление", class_name="nav-heading"), design_theme_switch(),
+                      rx.el.div(rx.el.span("Д", class_name="workspace-avatar"),
+                                rx.el.span(rx.el.strong("Логистика"), rx.el.small("Рабочее место")),
+                                class_name="workspace"), class_name="sidebar-footer"),
+            class_name=rx.cond(State.mobile_menu_open, "sidebar app-sidebar-open", "sidebar"),
+            id="dashboard-sidebar", aria_label="Боковая панель",
         ),
     )
 
 
 def app_header():
-    return rx.hstack(
-        rx.button(fa_icon(tag="menu", size=20), on_click=State.toggle_mobile_menu, aria_label="Открыть меню", aria_expanded=State.mobile_menu_open, class_name="app-menu-button"),
-        rx.text(State.current_page_label, font_weight="600", class_name="app-header-title"),
-        rx.spacer(),
-        rx.cond(
-            (State.current_page == "Маршруты") | (State.current_page == "OCR накладных"),
-            rx.hstack(
-                fa_icon(tag="search", size=16, color=ui.INK_3),
-                rx.input(
-                    value=State.search_query,
-                    on_change=State.set_search_query,
-                    placeholder=rx.cond(State.current_page == "Маршруты", "Заказ, магазин, водитель…", "Найти магазин или товар"),
-                    aria_label="Поиск по текущему разделу",
-                    variant="soft",
-                    border="0",
-                    background=ui.TRANSPARENT,
-                    width="100%",
-                    height="30px",
-                ),
-                width="220px",
-                height="32px",
-                padding="0 8px",
-                border=f"1px solid {ui.LINE}",
-                border_radius=ui.RADIUS_CONTROL,
-                background=ui.PAGE,
-                align="center",
-                spacing="1",
-                class_name="app-search",
-            ),
-            rx.box(),
-        ),
-        secondary_button("Выйти", on_click=State.logout, width="72px"),
-        class_name="app-header",
-        width="100%",
-        height="56px",
-        min_height="52px",
-        padding="0 16px",
-        background=ui.PANEL,
-        border_bottom=f"1px solid {ui.LINE}",
-        align="center",
-        spacing="3",
+    return rx.el.header(
+        rx.el.div(
+            rx.el.button(rx.cond(State.sidebar_collapsed, design_icon("panel_left_open", 18), design_icon("panel_left_close", 18)),
+                         on_click=State.toggle_sidebar, type="button", class_name="sidebar-toggle desktop-toggle",
+                         aria_label=rx.cond(State.sidebar_collapsed, "Развернуть боковое меню", "Свернуть боковое меню"),
+                         aria_expanded=~State.sidebar_collapsed, aria_controls="dashboard-sidebar"),
+            rx.el.button(design_icon("menu", 18), on_click=State.toggle_mobile_menu, type="button",
+                         aria_label="Открыть меню", aria_expanded=State.mobile_menu_open,
+                         aria_controls="dashboard-sidebar", class_name="sidebar-toggle mobile-toggle"),
+            rx.el.div(rx.el.span("Рабочее пространство", class_name="breadcrumb-root"),
+                      design_icon("chevron_right", 12), rx.el.span(State.current_page_label), class_name="breadcrumb"),
+            class_name="header-start"),
+        rx.cond((State.current_page == "Маршруты") | (State.current_page == "OCR накладных"),
+                rx.input(value=State.search_query, on_change=State.set_search_query,
+                         placeholder="Заказ, магазин, водитель…", aria_label="Поиск по текущему разделу",
+                         class_name="app-search", width="220px"), rx.fragment()),
+        rx.el.button(design_icon("log_out", 16), rx.el.span("Выйти"), on_click=State.logout,
+                     type="button", class_name="logout"), class_name="topbar",
     )
 
 
 def page_tab(item):
     active = State.current_page == item["page"]
-    return rx.button(
-        navigation_icon(item["icon"], 16),
-        item["label"],
-        on_click=State.set_page(item["page"]),
-        height="44px",
-        padding="0 12px",
-        color=rx.cond(active, ui.INK, ui.INK_2),
-        background=ui.TRANSPARENT,
-        border="0",
-        border_bottom=rx.cond(active, f"2px solid {ui.PURPLE}", "2px solid transparent"),
-        border_radius="0",
-        font_weight=rx.cond(active, ui.FONT_WEIGHT_MEDIUM, ui.FONT_WEIGHT_REGULAR),
-        _hover={"color": ui.INK, "background": ui.TRANSPARENT},
-        white_space="nowrap",
-        class_name="prototype-interactive",
+    return rx.el.button(
+        navigation_icon(item["icon"], 16), item["label"], type="button",
+        on_click=State.set_page(item["page"]), aria_pressed=active,
+        class_name=rx.cond(active, "page-tab selected", "page-tab"),
     )
 
 
@@ -4995,7 +5132,7 @@ def page_primary_action():
 
 def app_tabs():
     return rx.cond(
-        (State.current_tabs.length() > 1) | (State.current_page == "Dashboard") | State.routes_editor_open,
+        (State.current_tabs.length() > 1) | State.routes_editor_open,
         rx.hstack(
             rx.cond(State.current_tabs.length() > 1, rx.hstack(rx.foreach(State.current_tabs, page_tab), spacing="0", overflow_x="auto", min_width="0"), rx.box(display="none")),
             rx.spacer(), page_primary_action(), width="100%", min_height="45px", padding="0 20px",
@@ -5006,172 +5143,65 @@ def app_tabs():
 
 def upload_area():
     return rx.upload(
-        rx.hstack(
-            rx.box(
-                fa_icon(tag="upload", size=18, color=ui.INK_2),
-                display="flex",
-                align_items="center",
-                justify_content="center",
-                width="40px",
-                height="40px",
-                min_width="40px",
-                border_radius="10px",
-                background=ui.STATUS_GRAY_BG,
-            ),
-            rx.vstack(
-                rx.text("1. Выберите Excel-файл", color=text(), font_size="15px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-                rx.text(f"Поддерживаются форматы: {SUPPORTED_EXCEL_LABEL}", color=muted(), font_size="12px"),
-                rx.vstack(
-                    rx.foreach(
-                        rx.selected_files(UPLOAD_ID),
-                        lambda file: rx.text(file, color=ACCENT, font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-                    ),
-                    align="start",
-                    spacing="1",
-                    width="100%",
-                ),
-                rx.text("Загруженный файл: ", State.selected_file, color=muted(), font_size="12px"),
-                align="start",
-                spacing="2",
-                width="100%",
-            ),
-            spacing="3",
-            align="start",
-            width="100%",
+        rx.vstack(
+            rx.el.span(design_icon("upload", 24), class_name="upload-symbol"),
+            rx.el.strong("Выберите Excel-файл"),
+            rx.el.p("Перетащите книгу сюда или нажмите, чтобы выбрать файл."),
+            rx.el.span("Обзор файлов", class_name="file-label"),
+            rx.foreach(rx.selected_files(UPLOAD_ID), lambda file: rx.el.span(file, class_name="selected-upload-file")),
+            align="center", spacing="3", width="100%",
         ),
-        id=UPLOAD_ID,
-        accept=EXCEL_MIME_TYPES,
-        max_files=1,
-        border=f"1px dashed {border()}",
-        border_radius="10px",
-        background=surface_alt(),
-        padding="18px",
-        width="100%",
-        cursor="pointer",
+        id=UPLOAD_ID, accept=EXCEL_MIME_TYPES, max_files=1,
+        aria_label="Выбрать Excel-файл заказа",
+        class_name="file-picker", width="100%", border="0", padding="0", cursor="pointer",
     )
 
 
 def order_panel():
-    return rx.vstack(
-        rx.hstack(
-            rx.vstack(
-                rx.heading("Новый заказ", color=text(), size="5"),
-                rx.text("Выберите файл, загрузите его, затем укажите режим обработки.", color=muted(), font_size="13px"),
-                align="start",
-                spacing="1",
-            ),
-            rx.spacer(),
-            width="100%",
-            align="center",
-        ),
-        upload_area(),
-        rx.hstack(
-            rx.vstack(
-                rx.text("2. Загрузите выбранный файл", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-                rx.text("После загрузки файл будет доступен для обработки.", color=muted(), font_size="12px"),
-                align="start",
-                spacing="1",
-            ),
-            rx.spacer(),
-            secondary_button(
-                "Загрузить выбранный",
-                width="190px",
-                on_click=State.handle_upload(rx.upload_files(upload_id=UPLOAD_ID)),
-            ),
-            width="100%",
-            align="center",
-            padding="12px 0",
-            border="0",
-            background=ui.TRANSPARENT,
-        ),
-        rx.cond(
-            State.duplicate_note != "",
-            rx.hstack(
-                fa_icon(tag="triangle_alert", size=15, color=ui.STATUS_AMBER_TEXT),
-                rx.text(State.duplicate_note, color=text(), font_size="12px"),
-                spacing="2",
-                align="center",
-                width="100%",
-                padding="10px 14px",
-                border=f"1px solid {ui.LINE}",
-                border_radius="10px",
-                background=ui.STATUS_AMBER_BG,
-            ),
-            rx.box(),
-        ),
-        rx.vstack(
-            rx.text("3. Клиент", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-            rx.input(
-                value=State.order_client_name,
-                on_change=State.set_order_client_name,
-                placeholder="Укажите клиента",
-                width="100%",
-                height="40px",
-            ),
-            rx.text("Клиент обязателен для последующей загрузки заказа.", color=muted(), font_size="12px"),
-            align="start",
-            spacing="2",
-            width="100%",
-            padding="12px 0",
-            border="0",
-            background=ui.TRANSPARENT,
-        ),
-        rx.hstack(
-            rx.vstack(
-                rx.text("4. Режим обработки", color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-                segmented_control(["Город", "Область"], State.mode, State.set_mode),
-                rx.cond(
-                    State.mode_auto_note != "",
-                    rx.text(State.mode_auto_note, color=muted(), font_size="12px"),
-                    rx.box(),
-                ),
-                align="start",
-                spacing="2",
-            ),
-            rx.spacer(),
-            secondary_button(
-                rx.cond(State.is_previewing, "Анализ...", "Показать просмотр"),
-                on_click=State.preview_order,
-                width="190px",
-                disabled=State.is_processing,
-            ),
-            width="100%",
-            align="center",
-            padding="12px 0",
-            border="0",
-            background=ui.TRANSPARENT,
-        ),
-        rx.cond(
-            State.preview_ready,
-            order_preview_panel(),
-            rx.box(),
-        ),
-        primary_button(
-            rx.cond(State.is_processing, "Обработка...", "Подтвердить обработку"),
-            on_click=State.open_route_assignment_dialog,
-            disabled=State.is_processing,
-            width="100%",
-        ),
-        rx.text(State.status, color=muted(), font_size="13px"),
-        rx.cond(State.output_file != "", processing_summary(), rx.box()),
-        rx.cond(
-            State.error_text != "",
-            rx.code_block(
-                State.error_text,
-                language="python",
-                width="100%",
-                max_height="260px",
-                overflow_y="auto",
-            ),
-            rx.box(),
-        ),
-        class_name="order-form",
-        spacing="4",
-        padding="20px",
-        border=f"1px solid {border()}",
-        border_radius="14px",
-        background=surface(),
-        width="100%",
+    return rx.el.section(
+        rx.el.div(rx.el.div(rx.el.h2("Новый заказ"), rx.el.p("От файла до обработки — три простых шага.")),
+                  class_name="order-section-heading"),
+        rx.el.ol(*[rx.el.li(rx.el.span(number), label) for number, label in
+                   (("01", "Выбрать файл"), ("02", "Указать параметры"), ("03", "Подтвердить"))],
+                 class_name="order-steps", aria_label="Порядок обработки"),
+        rx.el.div(
+            rx.el.section(design_panel_heading("01", "Файл заказа", "Выберите книгу Excel на компьютере"),
+                upload_area(), rx.el.p(f"Поддерживаются {SUPPORTED_EXCEL_LABEL}", class_name="field-hint"),
+                rx.el.div(rx.el.div(rx.el.strong("Загрузить выбранный файл"), rx.el.p("Выбор файла не означает загрузку в приложение.")),
+                          rx.button(design_icon("upload", 17), "Загрузить",
+                                    on_click=State.handle_upload(rx.upload_files(upload_id=UPLOAD_ID)),
+                                    type="button", class_name="button button-secondary",
+                                    disabled=State.is_processing),
+                          class_name="upload-action"),
+                rx.el.p("Загруженный файл: ", State.selected_file, class_name="field-hint"),
+                class_name="order-panel upload-panel"),
+            rx.el.section(design_panel_heading("02", "Параметры заказа", "Клиент и направление обработки"),
+                rx.el.div(rx.el.label("Клиент", rx.el.span("Обязательно", class_name="required-label"), html_for="order-client", class_name="field-label"),
+                          rx.input(id="order-client", value=State.order_client_name, on_change=State.set_order_client_name,
+                                   placeholder="Укажите клиента", width="100%", class_name="text-input"),
+                          rx.el.p("Клиент необходим для последующей загрузки заказа.", class_name="field-hint"), class_name="form-field"),
+                rx.el.fieldset(rx.el.legend("Режим обработки", class_name="field-label"),
+                    rx.el.div(*[rx.el.button(design_icon(icon), rx.el.strong(mode), rx.el.small(description),
+                                            type="button", on_click=State.set_mode(mode), aria_pressed=State.mode == mode,
+                                            class_name=rx.cond(State.mode == mode, "mode-card selected", "mode-card"))
+                               for mode, icon, description in (("Город", "layout_grid", "Городские маршруты"), ("Область", "map", "Областные маршруты"))],
+                              class_name="mode-options"), class_name="processing-mode"),
+                rx.cond(State.mode_auto_note != "", rx.el.p(State.mode_auto_note, class_name="field-hint"), rx.fragment()),
+                rx.el.div(rx.el.span(design_icon("file_text", 16), "Проверьте данные перед обработкой"),
+                          design_button(rx.cond(State.is_previewing, "Анализ…", "Показать просмотр"), State.preview_order, disabled=State.is_processing),
+                          class_name="preview-action"), class_name="order-panel parameters-panel"), class_name="order-grid"),
+        rx.cond(State.duplicate_note != "", rx.el.p(State.duplicate_note, class_name="design-warning", role="status"), rx.fragment()),
+        rx.cond(State.preview_ready, order_preview_panel(), rx.fragment()),
+        rx.el.section(rx.el.div(rx.el.span("03", class_name="panel-number"),
+                                rx.el.div(rx.el.h3("Подтверждение обработки"), rx.el.p("Загрузите файл и проверьте параметры заказа.")),
+                                class_name="confirmation-copy"),
+                      design_button(rx.cond(State.is_processing, "Обработка…", "Подтвердить обработку"),
+                                    State.open_route_assignment_dialog, "arrow_right", primary=True, disabled=State.is_processing),
+                      class_name="confirmation-panel"),
+        rx.el.div(design_icon("clock", 16), rx.el.span(State.status), class_name="order-status", role="status"),
+        rx.cond(State.output_file != "", processing_summary(), rx.fragment()),
+        rx.cond(State.error_text != "", rx.code_block(State.error_text, language="python", width="100%", max_height="260px", overflow_y="auto"), rx.fragment()),
+        class_name="order-workspace order-form", id="new-order",
     )
 
 
@@ -5575,32 +5605,48 @@ def dashboard_tracking_preview():
     )
 
 
-def _today_action(label, count, action, note):
-    return rx.button(
-        rx.hstack(rx.vstack(rx.text(label, font_weight="600"), muted_text(note), align="start", spacing="1"),
-                  rx.spacer(), rx.text(count, class_name="today-count"), fa_icon(tag="chevron_right", size=18), width="100%", align="center"),
-        on_click=action, class_name="today-action",
+def _today_action(label, count, action, note, icon="package", step="", returns=False):
+    return rx.el.button(
+        rx.el.div(rx.el.span(design_icon(icon, 18), class_name="stage-icon"),
+                  rx.el.span(step, class_name="stage-step"), class_name="stage-top"),
+        rx.el.h3(label), rx.el.p(note),
+        rx.el.div(rx.el.span(count, rx.el.span("возвратов" if returns else "заказов"), class_name="stage-value"),
+                  rx.el.span(rx.cond(count == 0, "Нет возвратов" if returns else "Нет заказов", "Открыть"), class_name="stage-state"),
+                  class_name="stage-bottom"),
+        on_click=action, type="button", aria_label=label,
+        class_name="stage-card stage-card-return" if returns else "stage-card",
     )
 
 
 def overview_page():
-    return page_shell(
-        topbar("Сегодня", "Работа по заказам, обработанным сегодня. Выберите направление."),
-        rx.hstack(segmented_control(["Город", "Область"], State.today_mode, State.set_today_mode),
-                  rx.spacer(), secondary_button("Обновить", on_click=[State.load_history, State.load_today_overview], width="110px"),
-                  width="100%", wrap="wrap", align="center"),
-        rx.cond(State.today_error != "", rx.text(State.today_error, role="alert", color=ui.STATUS_RED_TEXT),
-            rx.vstack(
-                _today_action("Ожидают загрузки", State.today_waiting, State.open_today_stage("Ожидает загрузки"), "Загрузка ещё не начата"),
-                _today_action("Загрузка начата", State.today_drafts, State.open_today_stage("Загрузка начата"), "Черновики, ожидающие подтверждения"),
-                _today_action("Готовы к отгрузке", State.today_ready, State.open_today_stage("Готов к отгрузке"), "Загрузка подтверждена"),
-                _today_action("Отгрузка идёт", State.today_shipping, State.open_today_stage("Отгрузка идёт"), "Есть подтверждённые позиции отгрузки"),
-                _today_action("Отгрузка завершена", State.today_completed, State.open_today_stage("Отгрузка завершена"), "Все магазины рейса завершены"),
-                _today_action("Возвраты на проверке", State.today_returns, State.set_page("Возвраты"), "Все даты и направления"),
-                spacing="0", width="100%", class_name="today-queue",
-            )),
-        muted_text("Обработано заказов сегодня: ", State.orders_today_count, ". За весь период: ", State.orders_total_count, "."),
-        rx.el.details(rx.el.summary("История объёмов", class_name="dispatch-store-summary"), volume_chart_panel(), width="100%"),
+    return design_page(
+        design_heading("Сегодня", "Обзор рабочего дня", "Заказы, загрузка и отгрузка — всё в одном месте.",
+                       design_button("Добавить заказ", State.set_page("Заказы"), "plus", primary=True)),
+        rx.el.section(
+            rx.el.div(rx.el.span(design_icon("package"), class_name="summary-icon"),
+                      rx.el.div(rx.el.h2("Обработано заказов"), rx.el.p("Сводка по обработке файлов")), class_name="summary-title"),
+            rx.el.dl(rx.el.div(rx.el.dt("Сегодня"), rx.el.dd(State.orders_today_count)),
+                     rx.el.div(rx.el.dt("За весь период"), rx.el.dd(State.orders_total_count)), class_name="summary-values"),
+            class_name="summary", aria_label="Обработка заказов"),
+        rx.el.section(
+            rx.el.div(rx.el.div(rx.el.h2("Этапы доставки"), rx.el.p("Заказы, обработанные сегодня")),
+                      rx.el.div(segmented_control(["Город", "Область"], State.today_mode, State.set_today_mode),
+                                design_button("Обновить", [State.load_history, State.load_today_overview], "refresh_cw"),
+                                class_name="toolbar-controls"), class_name="section-toolbar"),
+            rx.el.p("Направление: ", State.today_mode, class_name="direction-caption"),
+            rx.cond(State.today_error != "", rx.el.p(State.today_error, role="alert"),
+                rx.el.div(
+                    _today_action("Ожидают загрузки", State.today_waiting, State.open_today_stage("Ожидает загрузки"), "Загрузка ещё не начата", "clock", "01 / Загрузка"),
+                    _today_action("Загрузка начата", State.today_drafts, State.open_today_stage("Загрузка начата"), "Черновики, ожидающие подтверждения", "package", "02 / Подготовка"),
+                    _today_action("Готовы к отгрузке", State.today_ready, State.open_today_stage("Готов к отгрузке"), "Загрузка подтверждена", "circle_check", "03 / Готовность"),
+                    _today_action("Отгрузка идёт", State.today_shipping, State.open_today_stage("Отгрузка идёт"), "Есть подтверждённые позиции отгрузки", "truck", "04 / Отгрузка"),
+                    _today_action("Отгрузка завершена", State.today_completed, State.open_today_stage("Отгрузка завершена"), "Все магазины рейса завершены", "circle_check", "05 / Завершение"),
+                    _today_action("Возвраты на проверке", State.today_returns, State.set_page("Возвраты"), "Все даты и направления", "undo_2", "Отдельный процесс", returns=True),
+                    class_name="stage-grid")), class_name="workflow"),
+        rx.el.details(rx.el.summary(rx.el.span(design_icon("file_text", 17), class_name="history-icon"),
+                                    rx.el.span(rx.el.strong("История объёмов"), rx.el.small("Архив обработанных заказов")),
+                                    design_icon("chevron_right", 16)),
+                      rx.el.div(volume_chart_panel(), class_name="design-history-content"), class_name="history"),
     )
 
 
@@ -5647,13 +5693,8 @@ def route_drivers_panel():
 
 
 def orders_page():
-    return page_shell(
-        topbar(
-            "Заказы",
-            "Загрузите файл заказа, выберите режим обработки и запустите обработку.",
-        ),
-        order_panel(),
-    )
+    return design_page(design_heading("Заказы", "Обработка Excel", "Загрузите файл, укажите клиента и выберите направление доставки."),
+                       order_panel(), class_name="orders-page")
 
 
 def processed_file_row(item):
@@ -6752,106 +6793,38 @@ def mail_verdict_badge(is_order):
 
 
 def mail_item_row(item):
-    return rx.vstack(
-        rx.hstack(
-            rx.cond(
-                item["is_invoice"],
-                fa_icon(tag="file_pdf", size=15, color=muted()),
-                rx.cond(
-                    item["has_file"],
-                    fa_icon(tag="file_spreadsheet", size=15, color=muted()),
-                    fa_icon(tag="mail", size=15, color=muted()),
-                ),
-            ),
-            rx.text(item["file"], color=text(), font_size="14px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
-            rx.spacer(),
-            rx.cond(
-                item["is_invoice"],
-                rx.badge("Накладная", color_scheme="blue", variant="soft"),
-                rx.cond(
-                    item["kind"] == KIND_MESSAGE,
-                    rx.badge("Письмо", color_scheme="gray", variant="soft"),
-                    mail_verdict_badge(item["is_order"]),
-                ),
-            ),
-            width="100%",
-            align="center",
-            spacing="2",
-        ),
-        rx.hstack(
-            rx.text("Источник: ", item["source"], color=muted(), font_size="12px"),
-            rx.text("· ", item["received"], color=muted(), font_size="12px"),
-            spacing="1",
-        ),
-        rx.text("От: ", item["sender"], color=muted(), font_size="12px"),
-        rx.cond(
-            item["subject"] != "",
-            rx.text("Тема: ", item["subject"], color=muted(), font_size="12px"),
-            rx.box(),
-        ),
-        rx.cond(
-            item["is_order"],
-            rx.hstack(
-                rx.text(
-                    "Режим: ", item["mode"],
-                    " · магазинов найдено: ", item["matches"],
-                    color=muted(),
-                    font_size="12px",
-                ),
-                rx.spacer(),
-                secondary_button(
-                    "Взять в обработку",
-                    on_click=State.take_mail_order(
-                        item["path"],
-                        item["file"],
-                        item["received"],
-                    ),
-                    width="180px",
-                ),
-                width="100%",
-                align="center",
-            ),
-            rx.cond(
-                item["is_invoice"],
-                rx.hstack(
-                    rx.cond(
-                        item["order_file"] != "",
-                        rx.text("Привязана к: ", item["order_file"], color=ACCENT, font_size="12px"),
-                        rx.text("Ещё не привязана к заказу", color=muted(), font_size="12px"),
-                    ),
-                    rx.spacer(),
-                    secondary_button(
-                        "Открыть PDF",
-                        on_click=State.open_mail_attachment(item["path"]),
-                        width="140px",
-                    ),
-                    width="100%",
-                    align="center",
-                ),
-                rx.cond(
-                    item["reason"] != "",
-                    rx.text(item["reason"], color=ui.STATUS_RED_TEXT, font_size="12px"),
-                    rx.box(),
-                ),
-            ),
-        ),
-        align="start",
-        spacing="2",
-        width="100%",
-        padding="14px 16px",
-        border=f"1px solid {border()}",
-        border_radius="10px",
-        background=surface_alt(),
+    return rx.el.article(
+        rx.el.div(
+            rx.el.div(rx.cond(item["is_invoice"], design_icon("file_pdf", 18),
+                              rx.cond(item["has_file"], design_icon("file_spreadsheet", 18), design_icon("mail", 18))),
+                      rx.el.h3(item["file"]), class_name="mail-card-title"),
+            rx.cond(item["subject"] != "", rx.el.p(item["subject"], class_name="mail-subject"), rx.fragment()),
+            rx.el.dl(rx.el.div(rx.el.dt("Отправитель"), rx.el.dd(item["sender"])),
+                     rx.el.div(rx.el.dt("Получено"), rx.el.dd(item["received"])),
+                     rx.el.div(rx.el.dt("Источник"), rx.el.dd(item["source"])),
+                     rx.el.div(rx.el.dt("Направление"), rx.el.dd(item["mode"])), class_name="mail-meta"),
+            rx.cond(item["is_order"], rx.el.p("Магазинов найдено: ", item["matches"], class_name="field-hint"), rx.fragment()),
+            rx.cond(item["is_invoice"], rx.el.p(rx.cond(item["order_file"] != "", "Привязана к: " + item["order_file"].to(str), "Ещё не привязана к заказу"),
+                                               class_name="field-hint"), rx.fragment()),
+            class_name="mail-card-content"),
+        rx.el.div(
+            rx.el.div(rx.cond(item["is_invoice"], rx.badge("Накладная", color_scheme="blue", variant="soft"),
+                              rx.cond(item["kind"] == KIND_MESSAGE, rx.badge("Письмо", color_scheme="gray", variant="soft"),
+                                      mail_verdict_badge(item["is_order"]))), class_name="mail-status"),
+            rx.cond(item["is_order"],
+                    design_button("Взять в обработку", State.take_mail_order(item["path"], item["file"], item["received"]), "arrow_right", primary=True),
+                    rx.cond(item["is_invoice"], design_button("Открыть PDF", State.open_mail_attachment(item["path"]), "file_pdf"),
+                            rx.el.span("Нет действий", class_name="mail-card-placeholder"))),
+            class_name="mail-card-actions"),
+        rx.cond((~item["is_order"]) & (~item["is_invoice"]) & (item["reason"] != ""),
+                rx.el.p(design_icon("info", 16), item["reason"], class_name="mail-message"), rx.fragment()),
+        class_name="mail-card",
     )
 
 
 def mail_page():
-    return page_shell(
-        topbar(
-            "Почта",
-            "Заказы, пришедшие письмом. Файл скачивается и проверяется, "
-            "обработка — по кнопке.",
-        ),
+    return design_page(
+        design_heading("Почта", "Входящие заказы", "Проверка писем, вложения и обработка заказов — в одном месте."),
         rx.cond(
             State.mail_configured,
             rx.vstack(
@@ -6860,7 +6833,7 @@ def mail_page():
                     mail_setup_hint(),
                     rx.box(),
                 ),
-                panel_shell(
+                design_mail_panel("mail-connection",
                     rx.hstack(
                         panel_title("inbox", "Проверка почты"),
                         rx.spacer(),
@@ -6924,7 +6897,7 @@ def mail_page():
                 ),
                 rx.cond(
                     State.mail_notification != "",
-                    panel_shell(
+                    design_mail_panel("mail-notification",
                         rx.hstack(
                             panel_title("circle_check", "Новые заказы"),
                             rx.spacer(),
@@ -6950,7 +6923,7 @@ def mail_page():
                     ),
                     rx.box(),
                 ),
-                panel_shell(
+                design_mail_panel("mail-errors",
                     rx.hstack(
                         panel_title("triangle_alert", "Журнал ошибок подключения"),
                         rx.spacer(),
@@ -7010,7 +6983,7 @@ def mail_page():
                         ),
                     ),
                 ),
-                panel_shell(
+                design_mail_panel("mail-filters",
                     rx.hstack(
                         panel_title("inbox", "Фильтры писем"),
                         rx.spacer(),
@@ -7069,21 +7042,24 @@ def mail_page():
                 ),
                 rx.cond(
                     State.mail_items.length() > 0,
-                    panel_shell(
+                    design_mail_panel("mail-inbox",
                         panel_title("mail", "Письма и вложения"),
                         rx.vstack(
                             rx.foreach(State.mail_items, mail_item_row),
                             spacing="3",
                             width="100%",
+                            class_name="mail-card-grid",
                         ),
                     ),
-                    rx.box(),
+                    rx.el.p("Нет сообщений по выбранным фильтрам", class_name="mail-empty", role="status"),
                 ),
                 spacing="4",
                 width="100%",
+                class_name="mail-design-grid",
             ),
             mail_setup_hint(),
         ),
+        class_name="mail-page",
     )
 
 
@@ -7208,6 +7184,7 @@ def _dispatch_overview():
                 align="start", spacing="1",
             ),
             rx.spacer(),
+            rx.link(rx.button("Рейсы машин", variant="soft"), href="/trips"),
             secondary_button("Редактировать маршруты", on_click=State.open_routes_editor, width="210px"),
             width="100%", align="center", wrap="wrap", spacing="3",
         ),
@@ -9034,7 +9011,9 @@ DASHBOARD_LOGIN_JS = """
     const username = document.getElementById('dashboard-login-username');
     const password = document.getElementById('dashboard-login-password');
     const error = document.getElementById('dashboard-login-error');
-    if (!username || !password || !error) return;
+    const button = document.getElementById('dashboard-login-submit');
+    if (!username || !password || !error || button?.disabled) return;
+    if (button) button.disabled = true;
     error.textContent = '';
     try {
         const response = await fetch(""" + DASHBOARD_API_ORIGIN_JS + """ + '/api/dashboard/login', {
@@ -9053,102 +9032,52 @@ DASHBOARD_LOGIN_JS = """
     } catch (_) {
         password.value = '';
         error.textContent = 'Не удалось подключиться к серверу.';
+    } finally {
+        if (button) button.disabled = false;
     }
 })();
 """
 
 
 def login_page():
-    return rx.center(
-        rx.vstack(
-            rx.box(
-                "Э",
-                display="flex",
-                align_items="center",
-                justify_content="center",
-                width="40px",
-                height="40px",
-                color=ui.WHITE,
-                background=ui.PURPLE,
-                border_radius=ui.RADIUS_CONTROL,
-                font_size="18px",
-                font_weight=ui.FONT_WEIGHT_SEMIBOLD,
-            ),
-            rx.vstack(
-                rx.heading("Вход в дашборд", size="6", color=ui.INK),
-                rx.text("Введите данные администратора", color=ui.INK_2, font_size="14px"),
-                align="start",
-                spacing="1",
-                width="100%",
-            ),
-            rx.vstack(
-                rx.text("Логин", color=ui.INK_2, font_size="13px"),
-                rx.input(
-                    id="dashboard-login-username",
-                    placeholder="Логин",
-                    width="100%",
-                    auto_focus=True,
-                ),
-                rx.text("Пароль", color=ui.INK_2, font_size="13px"),
-                rx.input(
-                    id="dashboard-login-password",
-                    placeholder="Пароль",
-                    type="password",
-                    width="100%",
-                ),
-                rx.text(
-                    "",
-                    id="dashboard-login-error",
-                    color=ui.STATUS_RED_TEXT,
-                    font_size="13px",
-                    min_height="18px",
-                ),
-                primary_button(
-                    "Войти",
-                    on_click=rx.call_script(DASHBOARD_LOGIN_JS),
-                    width="100%",
-                ),
-                align="start",
-                spacing="2",
-                width="100%",
-            ),
-            width="min(400px, calc(100vw - 32px))",
-            padding="28px",
-            background=ui.PANEL,
-            border=f"1px solid {ui.LINE}",
-            border_radius="14px",
-            spacing="5",
-        ),
-        width="100%",
-        min_height="100vh",
-        padding="16px",
-        background=ui.PAGE,
+    def field(label, identity, icon, password=False):
+        return rx.el.div(rx.el.label(label, html_for=identity),
+                         rx.el.div(design_icon(icon, 17),
+                                   rx.el.input(id=identity, name="password" if password else "username",
+                                               placeholder="Введите пароль" if password else "Введите логин",
+                                               type="password" if password else "text", required=True,
+                                               auto_complete="current-password" if password else "username",
+                                               auto_focus=not password), class_name="login-input-wrap"), class_name="login-field")
+    return rx.el.div(
+        rx.el.div(class_name="animated-gradient", aria_hidden=True),
+        rx.el.main(rx.el.section(
+            rx.el.span(design_icon("lock", 24), class_name="login-symbol", aria_hidden=True),
+            rx.el.div(rx.el.p("Рабочее пространство", class_name="eyebrow"),
+                      rx.el.h1("Добро пожаловать", rx.el.span(".", class_name="heading-dot")),
+                      rx.el.p("Войдите, чтобы управлять заказами и доставкой."), class_name="login-heading"),
+            rx.el.form(field("Логин", "dashboard-login-username", "user"),
+                       field("Пароль", "dashboard-login-password", "lock", password=True),
+                       rx.el.p(id="dashboard-login-error", role="alert", aria_live="polite"),
+                       rx.el.button("Войти", design_icon("arrow_right", 17), type="submit", id="dashboard-login-submit",
+                                    class_name="button button-primary login-submit"),
+                       on_submit=rx.call_script(DASHBOARD_LOGIN_JS), class_name="login-form", aria_label="Вход в рабочее пространство"),
+            rx.el.p(design_icon("lock", 14), "Вход доступен только авторизованным пользователям.", class_name="login-notice"),
+            design_theme_switch(), class_name="login-card"), class_name="login-main"),
+        rx.el.footer(rx.el.span("Доставка · всё под контролем"), class_name="login-footer"),
+        class_name="app dashboard-design login-app",
     )
 
 
 def dashboard_shell():
     return rx.fragment(
-        rx.hstack(
+        rx.el.a("Перейти к содержимому", href="#dashboard-content", class_name="dashboard-skip-link"),
+        rx.el.div(
             sidebar(),
-            rx.vstack(
-                app_header(),
-                app_tabs(),
-                main_content(),
-                align="start",
-                spacing="0",
-                width="100%",
-                min_width="0",
-                min_height="100vh",
-                background=ui.PAGE,
-            ),
-            align="start",
-            spacing="0",
-            width="100%",
-            min_height="100vh",
-            background=ui.PAGE,
+            rx.el.div(app_header(), app_tabs(),
+                      rx.el.main(main_content(), id="dashboard-content", tab_index=-1), class_name="main-shell"),
+            class_name=rx.cond(State.sidebar_collapsed, "app dashboard-design app-collapsed", "app dashboard-design"),
         ),
-        order_details_drawer(),
-        route_assignment_dialog(),
+        order_details_drawer(), route_assignment_dialog(),
         rx.cond(State.current_page == "Помощь", help_chat_widget(), rx.box(display="none")),
     )
 
@@ -9234,6 +9163,7 @@ app = rx.App(
     head_components=[rx.el.script(src="/theme-preference.js"), rx.el.script(src="/workspace-bootstrap.js"), rx.el.script(src="/route-template-dnd.js")],
     stylesheets=[
         "/theme.css",
+        "/dashboard-design.css",
         "/scrollbar.css",
     ],
     style={
@@ -9246,6 +9176,8 @@ app = rx.App(
 )
 app.add_middleware(DashboardAuthMiddleware())
 app.add_middleware(LoadingAuthMiddleware())
+app.add_middleware(TripAuthMiddleware())
+app.add_page(vehicle_trips_page, route="/trips", title="Рейсы машин", on_load=TripState.load_page, meta=PWA_META)
 app.add_page(
     dashboard,
     route="/",

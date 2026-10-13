@@ -12,6 +12,7 @@ let returnContext = null;
 let returnDraft = null;
 let returnOperation = null;
 let returnSave = Promise.resolve();
+const tripReturnIds = new Set();
 let syncing = false;
 let syncStatus = "Нажмите синхронизацию, чтобы обновить данные";
 const SHIPMENT_DRAFT_KEY = "logistics-driver-shipment-drafts";
@@ -199,6 +200,12 @@ function shipmentNet(measurement) {
   return Number.isFinite(value) && value >= 0 ? text : "";
 }
 
+function returnPath(assignmentId, tripId = "") {
+  return tripId || tripReturnIds.has(assignmentId)
+    ? `/api/driver/trips/${encodeURIComponent(assignmentId)}/returns`
+    : `/api/driver/returns/${encodeURIComponent(assignmentId)}`;
+}
+
 function shipmentDraftKey(lineId) {
   return JSON.stringify([driverId, assignment?.assignment_id, selectedStoreId, lineId]);
 }
@@ -206,6 +213,9 @@ function shipmentDraftKey(lineId) {
 function saveShipmentInputs() {
   root().querySelectorAll("[data-measurement-input]").forEach((input) => {
     shipmentDrafts[shipmentDraftKey(input.dataset.lineId)] = input.value;
+  });
+  root().querySelectorAll("[data-refusal-reason], [data-refusal-comment]").forEach((input) => {
+    shipmentDrafts[shipmentDraftKey(input.dataset.lineId) + (input.hasAttribute("data-refusal-reason") ? ":reason" : ":comment")] = input.value;
   });
   try { localStorage.setItem(SHIPMENT_DRAFT_KEY, JSON.stringify(shipmentDrafts)); }
   catch (_) { setMessage("Не удалось сохранить черновик. Не закрывайте страницу.", true); }
@@ -323,7 +333,7 @@ function renderMileage() {
 
 function summaryRows() {
   return (assignment?.summary || []).map((line) => `
-    <tr><td data-label="Товар">${esc(line.name)}</td><td data-label="Ед.">${esc(line.unit)}</td><td data-label="Заказ на маршрут">${numberText(line.planned)}</td><td data-label="Необходимо на маршрут">${numberText(line.necessary)}</td><td data-label="Выполнено">${numberText(line.completed)}</td></tr>
+    <tr><td data-label="Товар">${esc(line.name)}</td><td data-label="Ед.">${esc(line.unit)}</td><td data-label="Заказ на маршрут">${numberText(line.planned)}</td><td data-label="Необходимо на маршрут">${numberText(line.necessary)}</td><td data-label="Выполнено">${numberText(line.completed)}</td>${assignment?.trip_id ? `<td data-label="Доп. задание">${numberText(line.additional_planned)}</td><td data-label="Доп. принято">${numberText(line.additional_completed)}</td>` : ""}</tr>
   `).join("");
 }
 
@@ -368,10 +378,11 @@ function renderOrder() {
         </section>
         <p data-message class="driver-message">${assignment?.loading_status === "waiting_loading" ? "Склад ещё не подтвердил загрузку. Отгрузка будет доступна после подтверждения." : ""}</p>
         <button data-route-return class="driver-secondary" type="button">Возврат остатка / история</button>
+        ${assignment?.trip_id ? `<section class="driver-panel"><h2>Остаток в машине</h2><div class="driver-trip-stock">${(assignment.stock || []).map(item => `<div><strong>${esc(item.name)}</strong><span>В машине: ${esc(item.remaining_kg)} кг</span><span>Выделено заданиям: ${esc(item.reserved_kg)} кг</span><span>Свободно: ${esc(item.available_kg)} кг</span></div>`).join("")}</div>${assignment.projection_error ? `<p class="driver-message driver-message-error">${esc(assignment.projection_error)}</p>` : ""}</section>` : ""}
         <div class="driver-workspace">
           <section class="driver-panel driver-order-panel">
             <div class="driver-panel-heading"><div><h2>Весь заказ</h2><p class="driver-muted">Общий объём товаров по маршруту. Данные обновляются при синхронизации.</p></div><span class="driver-products-count">${(assignment?.summary || []).length} товаров</span></div>
-            <div class="driver-table-wrap"><table class="driver-table"><thead><tr><th>Товар</th><th>Ед.</th><th>Заказ на маршрут</th><th>Необходимо на маршрут</th><th>Выполнено</th></tr></thead><tbody>${summaryRows()}</tbody></table></div>
+            <div class="driver-table-wrap"><table class="driver-table"><thead><tr><th>Товар</th><th>Ед.</th><th>Заказ на маршрут</th><th>Необходимо на маршрут</th><th>Выполнено</th>${assignment?.trip_id ? '<th>Доп. задание</th><th>Доп. принято</th>' : ''}</tr></thead><tbody>${summaryRows()}</tbody></table></div>
             <p class="driver-table-note">Для отгрузки магазина укажите только чистый вес по каждой позиции.</p>
           </section>
           ${storesPanel(stores)}
@@ -421,6 +432,7 @@ function renderStore() {
       ${saved ? savedDetails : `<div class="driver-line-measurements driver-line-net-only">
         <label>Чистый вес, кг<input data-measurement-input data-line-id="${esc(line.line_id)}" data-field="net_weight_kg" type="text" inputmode="decimal" value="${esc(draft)}" ${waitingForLoading ? "disabled" : ""} required></label>
       </div>`}
+      ${assignment?.trip_id && !saved ? `<div class="driver-refusal-fields"><span class="driver-muted">Выделено: ${esc(line.allocated_qty)} кг. При частичном отказе укажите причину.</span><label>Причина отказа<select data-refusal-reason data-line-id="${esc(line.line_id)}"><option value="">Без отказа</option>${(assignment.refusal_reasons || []).map(reason => `<option ${shipmentDrafts[shipmentDraftKey(line.line_id) + ":reason"] === reason ? "selected" : ""}>${esc(reason)}</option>`).join("")}</select></label><label>Комментарий<input data-refusal-comment data-line-id="${esc(line.line_id)}" type="text" maxlength="2000" value="${esc(shipmentDrafts[shipmentDraftKey(line.line_id) + ":comment"] || "")}"></label></div>` : ""}
     </section>`;
   }).join("");
   root().innerHTML = `
@@ -435,7 +447,7 @@ function renderStore() {
   bindFrameActions();
   root().querySelector("[data-back]").addEventListener("click", () => { view = "order"; render(); });
   root().querySelectorAll("[data-measurement-input]").forEach((input) => input.addEventListener("input", saveShipmentInputs));
-  refreshNetPreviews();
+  root().querySelectorAll("[data-refusal-reason], [data-refusal-comment]").forEach(input => input.addEventListener("input", saveShipmentInputs));
   const complete = root().querySelector("[data-complete]");
   if (complete) complete.addEventListener("click", completeStore);
 }
@@ -539,7 +551,10 @@ async function flushQueue() {
       throw new Error("Старая офлайн-отгрузка не привязана к маршруту. Нужна проверка администратора; операция сохранена.");
     }
     try {
-      const data = await api(`/api/driver/order/stores/${encodeURIComponent(operation.store_id)}/complete`, {
+      const endpoint = operation.payload.trip_id
+        ? `/api/driver/trips/${encodeURIComponent(operation.payload.trip_id)}/stops/${encodeURIComponent(operation.store_id)}/complete`
+        : `/api/driver/order/stores/${encodeURIComponent(operation.store_id)}/complete`;
+      const data = await api(endpoint, {
         method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(operation.payload)
       });
       const savedStore = data.assignment?.stores?.find((store) => store.store_id === operation.store_id);
@@ -605,7 +620,21 @@ async function completeStore() {
     return;
   }
   const operationId = crypto.randomUUID();
-  const payload = {measurements, operation_id: operationId, base_revision: assignment.revision, assignment_id: assignment.assignment_id};
+  const reasons = {};
+  if (assignment.trip_id) {
+    for (const line of store.lines) {
+      const reason = root().querySelector(`[data-refusal-reason][data-line-id="${CSS.escape(line.line_id)}"]`)?.value || "";
+      const comment = root().querySelector(`[data-refusal-comment][data-line-id="${CSS.escape(line.line_id)}"]`)?.value || "";
+      const net = Number(shipmentNet(measurements[line.line_id]));
+      if (net > Number(line.allocated_qty)) { setMessage("Вес превышает выделенный товар. Нужна дополнительная поставка.", true); return; }
+      if ((net === 0 || net < Number(line.required_qty)) && (!reason || (reason === "Другое" && !comment.trim()))) {
+        setMessage("Укажите причину частичного или полного отказа.", true); return;
+      }
+      reasons[line.line_id] = {reason, comment};
+    }
+  }
+  const payload = {measurements, operation_id: operationId, base_revision: assignment.trip_id ? store.revision : assignment.revision, assignment_id: assignment.assignment_id};
+  if (assignment.trip_id) Object.assign(payload, {trip_id: assignment.trip_id, reasons});
   const button = root().querySelector("[data-complete]");
   button.disabled = true;
   try {
@@ -613,7 +642,7 @@ async function completeStore() {
     await dbPut(QUEUE_STORE, operationId, {
       driver_id: driverId, assignment_id: assignment.assignment_id, store_id: store.store_id, payload
     });
-    applyLocalCompletion(store, measurements);
+    applyLocalCompletion(store, measurements, reasons);
     syncStatus = "Есть неотправленная отгрузка";
     for (const line of store.lines) delete shipmentDrafts[shipmentDraftKey(line.line_id)];
     try { localStorage.setItem(SHIPMENT_DRAFT_KEY, JSON.stringify(shipmentDrafts)); } catch (_) {}
@@ -629,20 +658,34 @@ async function completeStore() {
   }
 }
 
-function applyLocalCompletion(store, measurements) {
+function applyLocalCompletion(store, measurements, reasons = {}) {
   store.status = "completed";
   store.completed_at = new Date().toISOString();
   for (const line of store.lines) {
     const measurement = {...measurements[line.line_id], net_weight_kg: shipmentNet(measurements[line.line_id])};
     line.shipment_measurement = measurement;
     line.actual_qty = measurement.net_weight_kg;
+    line.refusal_reason = reasons[line.line_id]?.reason || "";
+    if (assignment.trip_id) {
+      const stock = assignment.stock?.find(item => item.id === line.loading_line_id);
+      if (stock) {
+        stock.remaining_kg = String(Number(stock.remaining_kg) - Number(line.actual_qty));
+        stock.reserved_kg = String(Math.max(0, Number(stock.reserved_kg) - Number(line.allocated_qty)));
+        stock.available_kg = String(Number(stock.remaining_kg) - Number(stock.reserved_kg));
+      }
+    }
   }
+  if (assignment.trip_id) store.revision += 1;
   assignment.revision += 1;
   for (const line of assignment.summary) {
     const matching = store.lines.find((item) => item.name === line.name);
     if (matching) {
-      line.completed = String(Number(line.completed) + Number(matching.actual_qty));
-      line.necessary = String(Math.max(Number(line.necessary) - Number(matching.required_qty), 0));
+      if (assignment.trip_id && store.kind === "transfer") {
+        line.additional_completed = String(Number(line.additional_completed) + Number(matching.actual_qty));
+      } else {
+        line.completed = String(Number(line.completed) + Number(matching.actual_qty));
+        line.necessary = String(Math.max(Number(line.necessary) - Number(matching.required_qty), 0));
+      }
     }
   }
   assignment.completed_stores += 1;
@@ -802,7 +845,9 @@ function localReturnContext(current) {
   context.local_complete = true;
   context.lines = context.lines.map((line) => ({...line,
     shipped_net_kg: String(shipped.get(line.loading_line_id)),
-    available_net_kg: String(Math.max(0, Number(line.loaded_net_kg) - shipped.get(line.loading_line_id)))
+    available_net_kg: current.trip_id
+      ? String(current.stock?.find((item) => item.id === line.loading_line_id)?.remaining_kg ?? line.available_net_kg)
+      : String(Math.max(0, Number(line.loaded_net_kg) - shipped.get(line.loading_line_id)))
   }));
   return context;
 }
@@ -821,11 +866,12 @@ async function cacheReturnContext(context) {
 async function cacheAssignment(current) {
   assignment = current;
   if (!assignment) return;
+  if (assignment.trip_id) tripReturnIds.add(assignment.trip_id);
   const queued = (await dbAll(QUEUE_STORE)).filter((item) => item.driver_id === driverId && item.assignment_id === assignment.assignment_id);
   queued.sort((a, b) => Number(a.payload.base_revision) - Number(b.payload.base_revision));
   for (const operation of queued) {
     const store = assignment.stores?.find((item) => item.store_id === operation.store_id);
-    if (store && store.status !== "completed") applyLocalCompletion(store, operation.payload.measurements);
+    if (store && store.status !== "completed") applyLocalCompletion(store, operation.payload.measurements, operation.payload.reasons);
   }
   await dbPut(ORDER_STORE, driverId, assignment);
   await cacheReturnContext(localReturnContext(assignment));
@@ -869,6 +915,7 @@ async function loadReturnIndex() {
     try {
       const data = await api("/api/driver/returns");
       returnIndex = {returns: data.returns || [], assignments: data.assignments || []};
+      for (const item of [...returnIndex.returns, ...returnIndex.assignments]) if (item.trip_id) tripReturnIds.add(item.trip_id);
       await dbPut(RETURN_CACHE_STORE, `${driverId}:index`, {driver_id: driverId, index: returnIndex});
     } catch (error) {
       if (error.status === 401 || error.status === 403) throw error;
@@ -913,7 +960,7 @@ async function loadReturn(assignmentId) {
   let error = null;
   if (online) {
     try {
-      const data = await api(`/api/driver/returns/${encodeURIComponent(assignmentId)}`);
+      const data = await api(returnPath(assignmentId, context?.trip_id));
       context = data.context;
       await cacheReturnContext(context);
     } catch (failure) {
@@ -978,6 +1025,25 @@ function renderReturns() {
   root().querySelectorAll("[data-return-id]").forEach((button) => button.addEventListener("click", () => openReturn(button.dataset.returnId)));
 }
 
+const returnSearches = new Map();
+
+function filterReturnLines() {
+  const search = root().querySelector("[data-return-search]");
+  if (!search) return;
+  const query = String(search.value || "").trim().toLocaleLowerCase("ru");
+  if (returnContext) returnSearches.set(returnKey(returnContext.assignment_id), search.value);
+  let visible = 0;
+  const cards = root().querySelectorAll("[data-return-product]");
+  cards.forEach((card) => {
+    card.hidden = !card.dataset.returnProduct.toLocaleLowerCase("ru").includes(query);
+    if (!card.hidden) visible += 1;
+  });
+  const count = root().querySelector("[data-return-search-count]");
+  if (count) count.textContent = `Показано ${visible} из ${cards.length}`;
+  const empty = root().querySelector("[data-return-search-empty]");
+  if (empty) empty.hidden = visible !== 0;
+}
+
 function renderReturn() {
   if (!returnContext) { view = "returns"; renderReturns(); return; }
   const context = returnContext;
@@ -990,11 +1056,11 @@ function renderReturn() {
     const id = source.loading_line_id;
     const saved = returnDraft?.lines[id] || {};
     const measure = source.measurement || source;
-    if (locked) return `<section class="driver-return-line"><h2>${esc(source.name || id)}</h2>
+    if (locked) return `<section class="driver-return-line" data-return-product="${esc(source.name || id)}"><h2>${esc(source.name || id)}</h2>
       <p>Ящики: ${esc(measure.box_count)} · Тара: ${esc(measure.tare_weight_per_box_kg)} кг/ящ. · Грязный вес: ${esc(measure.gross_weight_kg)} кг</p>
-      <p>Нетто: ${esc(measure.net_weight_kg ?? measurementNet(measure))} кг</p><p>${esc(source.reason)}${source.comment ? ` — ${esc(source.comment)}` : ""}</p></section>`;
+      <p>Нетто: ${esc(measure.net_weight_kg ?? measurementNet(measure))} кг</p>${source.accepted_net_kg != null ? `<p>Принято складом: ${esc(source.accepted_net_kg)} кг · Разница: ${esc(source.difference_kg)} кг</p>` : ""}<p>${esc(source.reason)}${source.comment ? ` — ${esc(source.comment)}` : ""}</p></section>`;
     const noRemainder = Number(source.available_net_kg) <= 0;
-    return `<section class="driver-return-line" data-return-line="${esc(id)}">
+    return `<section class="driver-return-line" data-return-line="${esc(id)}" data-return-product="${esc(source.name)}">
       <label class="driver-return-select"><input data-return-selected type="checkbox" ${saved.selected ? "checked" : ""} ${!editable || (noRemainder && !saved.selected) ? "disabled" : ""}><strong>${esc(source.name)}</strong></label>
       <p class="driver-muted">План: ${esc(source.planned_kg)} кг · Загружено: ${esc(source.loaded_net_kg)} кг · Отгружено: ${esc(source.shipped_net_kg)} кг · Доступно: ${esc(source.available_net_kg)} кг</p>
       <fieldset ${!editable || !saved.selected ? "disabled" : ""}><legend class="driver-muted">Параметры возврата</legend>
@@ -1015,6 +1081,8 @@ function renderReturn() {
       ${!editable && !locked && !returnOperation ? `<p class="driver-message driver-message-error">${esc(context.error || "Сначала завершите все магазины. Нужна подтверждённая загрузка.")}</p>` : ""}
       ${changed && !locked ? '<p class="driver-message driver-message-error">Основа черновика изменилась. Проверьте новые остатки.</p>' : ""}
       ${returnOperation ? `<p class="driver-muted">${returnOperation.server_rejected ? "Сервер отклонил документ. Проверьте данные и продолжите редактирование." : returnOperation.sent_body ? "Отправка начата. При повторе будет отправлен тот же документ без изменений." : "Документ ждёт отправки всех отгрузок."}</p>` : ""}
+      <div class="driver-return-search"><label>Поиск товара<input data-return-search type="search" placeholder="Название товара" value="${esc(returnSearches.get(returnKey(context.assignment_id)) || "")}"></label><button data-return-search-clear class="driver-secondary" type="button">Очистить</button><small data-return-search-count aria-live="polite"></small></div>
+      <p data-return-search-empty class="driver-muted" hidden>Ничего не найдено</p>
       <form data-return-form class="driver-return-form">${lines || '<p class="driver-muted">Нет товаров для возврата.</p>'}
         ${editable ? '<button data-return-submit class="driver-primary" type="submit">Отправить возврат на проверку</button>' : ""}</form>
       ${!locked && ((changed && !returnOperation) || (returnOperation && (!returnOperation.sent_body || returnOperation.server_rejected))) ? '<button data-return-rebase class="driver-secondary" type="button">Проверить остатки и продолжить редактирование</button>' : ""}
@@ -1026,6 +1094,12 @@ function renderReturn() {
   bindFrameActions();
   root().querySelector("[data-return-back]").addEventListener("click", openReturns);
   root().querySelector("[data-return-sync]").addEventListener("click", syncOrder);
+  root().querySelector("[data-return-search]").addEventListener("input", filterReturnLines);
+  root().querySelector("[data-return-search-clear]").addEventListener("click", () => {
+    root().querySelector("[data-return-search]").value = "";
+    filterReturnLines();
+  });
+  filterReturnLines();
   root().querySelector("[data-return-form]").addEventListener("submit", submitReturn);
   root().querySelectorAll("[data-return-selected], [data-return-field]").forEach((input) => input.addEventListener("input", updateReturnDraft));
   root().querySelector("[data-return-rebase]")?.addEventListener("click", rebaseReturnDraft);
@@ -1037,7 +1111,7 @@ async function rebaseReturnDraft() {
     await returnSave;
     if (returnOperation?.server_rejected) {
       if (!online) throw new Error("Подключитесь к серверу, чтобы проверить отклонённый документ.");
-      const {context} = await api(`/api/driver/returns/${encodeURIComponent(returnContext.assignment_id)}`);
+      const {context} = await api(returnPath(returnContext.assignment_id, returnContext.trip_id));
       await cacheReturnContext(context);
       returnContext = context;
       render();
@@ -1114,7 +1188,7 @@ async function submitReturn(event) {
     const lines = validateReturnDraft(returnDraft, returnContext);
     if (!sameReturnFacts(returnDraft.expected_facts, returnContext)) throw new Error("Загрузка или отгрузки изменились. Проверьте остатки и обновите основу черновика.");
     const operation = {driver_id: driverId, assignment_id: returnContext.assignment_id,
-      expected_facts: structuredClone(returnDraft.expected_facts), created_at: new Date().toISOString(),
+      expected_facts: structuredClone(returnDraft.expected_facts), trip_id: returnContext.trip_id || "", created_at: new Date().toISOString(),
       payload: {operation_id: crypto.randomUUID(), base_revision: returnDraft.base_revision, facts_token: "", lines}};
     await dbPut(RETURN_QUEUE_STORE, returnKey(operation.assignment_id), operation);
     returnOperation = operation;
@@ -1134,7 +1208,7 @@ async function flushReturnQueue() {
   queued.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   for (const operation of queued) {
     const key = returnKey(operation.assignment_id);
-    const path = `/api/driver/returns/${encodeURIComponent(operation.assignment_id)}`;
+    const path = returnPath(operation.assignment_id, operation.trip_id);
     let posting = false;
     try {
       if (operation.server_rejected) throw new Error(operation.error || "Сервер отклонил документ. Требуется проверка и редактирование.");

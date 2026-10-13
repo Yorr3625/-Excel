@@ -374,3 +374,51 @@ test('lost shipment response retries identical bytes and operation identity', as
   assert.equal(t.run(`calls[0]`), t.run(`calls[1]`));
   assert.equal(await t.run(`dbAll(QUEUE_STORE).then(items => items.length)`), 0);
 });
+
+test('return search filters Cyrillic in place and preserves hidden product inputs', () => {
+  const t = app();
+  const search = {value: '  ПОМИД  '};
+  const count = {};
+  const empty = {};
+  const cards = [
+    {dataset: {returnProduct: 'Помидоры'}, selected: true, gross: '30'},
+    {dataset: {returnProduct: 'Огурцы'}, selected: true, gross: '5'}
+  ];
+  t.element.querySelector = selector => ({'[data-return-search]': search, '[data-return-search-count]': count, '[data-return-search-empty]': empty}[selector]);
+  t.element.querySelectorAll = () => cards;
+  t.run('returnContext = contextFixture; filterReturnLines()');
+  assert.deepEqual(cards.map(c => c.hidden), [false, true]);
+  assert.equal(count.textContent, 'Показано 1 из 2');
+  assert.equal(empty.hidden, true);
+  search.value = 'нет совпадений';
+  t.run('filterReturnLines()');
+  assert.equal(empty.hidden, false);
+  assert.equal(cards[0].selected, true);
+  assert.equal(cards[0].gross, '30');
+  assert.equal(t.run('returnSearches.get(returnKey(contextFixture.assignment_id))'), search.value);
+  search.value = '';
+  t.run('filterReturnLines()');
+  assert.deepEqual(cards.map(c => c.hidden), [false, false]);
+});
+
+test('trip return paths remain distinct from legacy route returns', () => {
+  const t = app();
+  assert.equal(t.run("returnPath('route-a')"), '/api/driver/returns/route-a');
+  assert.equal(t.run("returnPath('trip-a', 'trip-a')"), '/api/driver/trips/trip-a/returns');
+  t.run("tripReturnIds.add('trip-b')");
+  assert.equal(t.run("returnPath('trip-b')"), '/api/driver/trips/trip-b/returns');
+});
+
+test('trip shipment queue uses stop endpoint and deletes only confirmed operations', async () => {
+  const t = app();
+  await t.run("dbPut(QUEUE_STORE, 'trip-op', {driver_id: driverId, assignment_id: 'trip-a', store_id: 'stop-a', payload: {operation_id: 'trip-op', trip_id: 'trip-a', assignment_id: 'trip-a', base_revision: 0, measurements: {line: {kind: 'net', net_weight_kg: '5'}}}})");
+  t.run("api = async (url, options) => { calls.push({url, options}); return {ok: true, assignment: {assignment_id: 'trip-a', trip_id: 'trip-a', stores: [{store_id: 'stop-a', status: 'completed'}]}}; }; cacheAssignment = async () => {};");
+  await t.run('flushQueue()');
+  assert.equal(t.run('calls[0].url'), '/api/driver/trips/trip-a/stops/stop-a/complete');
+  assert.equal(await t.run("dbGet(QUEUE_STORE, 'trip-op')"), undefined);
+});
+
+test('trip return cache preserves stock after warehouse receipt instead of recalculating returned goods', () => {
+  const t = app();
+  assert.equal(t.run("localReturnContext({trip_id: 'trip-a', stock: [{id: 'load-1', remaining_kg: '0'}], return_context: contextFixture, stores: [{status: 'completed', lines: [{loading_line_id: 'load-1', actual_qty: '4'}]}]}).lines[0].available_net_kg"), '0');
+});
