@@ -203,11 +203,87 @@ def test_invalid_planned_quantity_cannot_partially_publish_assignments(order_fix
     assert not driver_orders.index_path().exists()
 
 
-def test_valid_decimal_comma_still_publishes(order_fixture):
+@pytest.mark.parametrize("quantity", ["1,5", " 1,5 ", " 1,5 "])
+def test_valid_decimal_comma_still_publishes(order_fixture, quantity):
     workbook = load_workbook(order_fixture)
-    workbook.active["C2"] = "1,5"
+    workbook.active["C2"] = quantity
     workbook.save(order_fixture)
     workbook.close()
 
     snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
     assert snapshot["stores"][0]["lines"][0]["required_qty"] == "1.5"
+
+
+@pytest.mark.parametrize("blank", [None, "", " ", " \t\r\n ", " ", " "])
+def test_blank_planned_quantity_preserves_other_stores_and_numeric_zero(order_fixture, blank):
+    workbook = load_workbook(order_fixture)
+    workbook.active["C2"] = blank
+    workbook.save(order_fixture)
+    workbook.close()
+
+    snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
+
+    assert [store["name"] for store in snapshot["stores"]] == ["фм 10", "фм 14"]
+    assert [(line["name"], line["required_qty"]) for line in snapshot["stores"][0]["lines"]] == [
+        ("Бананы", "2.5"),
+    ]
+    assert [(line["name"], line["required_qty"]) for line in snapshot["stores"][1]["lines"]] == [
+        ("Яблоки", "4"), ("Бананы", "0"),
+    ]
+
+
+def test_whitespace_only_product_row_is_treated_as_empty(order_fixture):
+    workbook = load_workbook(order_fixture)
+    workbook.active["C2"] = " "
+    workbook.active["D2"] = " "
+    workbook.save(order_fixture)
+    workbook.close()
+
+    snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
+
+    assert [store["name"] for store in snapshot["stores"]] == ["фм 10", "фм 14"]
+    assert [line["name"] for store in snapshot["stores"] for line in store["lines"]] == [
+        "Бананы", "Бананы",
+    ]
+
+
+def test_route_2_g9_space_publishes_without_losing_melon_in_another_store(order_fixture):
+    workbook = load_workbook(order_fixture)
+    sheet = workbook.active
+    sheet.title = "Маршрут №2"
+    sheet["G1"] = "ФМ 47 Донецк Артема 185д"
+    sheet["A9"] = "Дыня Амал вес"
+    sheet["C9"] = "1,5"
+    sheet["G9"] = " "
+    sheet["G2"] = 3
+    workbook.save(order_fixture)
+    workbook.close()
+    route_assignment = {**assignment(), "route": "route_2", "label": "Маршрут №2"}
+
+    published = driver_orders.publish_assignments(
+        order_fixture, "Город", "order.xlsx", [route_assignment]
+    )
+    snapshot = driver_orders.load_snapshot(published[0])
+    stores = {store["name"]: store for store in snapshot["stores"]}
+
+    assert ("Дыня Амал вес", "1.5") in [
+        (line["name"], line["required_qty"]) for line in stores["фм 10"]["lines"]
+    ]
+    assert [(line["name"], line["required_qty"]) for line in stores[
+        "ФМ 47 Донецк Артема 185д"
+    ]["lines"]] == [("Яблоки", "3")]
+    assert driver_orders.index_path().exists()
+
+
+@pytest.mark.parametrize("blank", [" ", " ", "\t\n"])
+def test_whitespace_actual_weight_is_still_rejected(order_fixture, blank):
+    snapshot = driver_orders.build_assignment_snapshot(order_fixture, "Город", assignment())
+    path = driver_orders.save_snapshot(snapshot)
+    store = snapshot["stores"][0]
+    values = store_measurements(store, {"Яблоки": "1", "Бананы": "1"})
+    values[store["lines"][0]["line_id"]]["gross_weight_kg"] = blank
+
+    with pytest.raises(driver_orders.DriverOrderError):
+        driver_orders.complete_store(path, store["store_id"], values, "operation-1", 0)
+
+    assert driver_orders.load_snapshot(path)["revision"] == 0

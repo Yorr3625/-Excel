@@ -1,4 +1,8 @@
+import json
+from copy import deepcopy
 from types import SimpleNamespace
+
+import pytest
 
 from modules import dashboard_sessions
 from orders_dashboard import loading_page
@@ -100,6 +104,7 @@ def _state(router=None):
         total_ordered_kg="0",
         total_loaded_net_kg="",
         loading_rows=[],
+        loading_sort="source",
         draft_measurements={},
         shipment_rows=[],
         shipment_completed_count=0,
@@ -172,6 +177,7 @@ def test_field_autosave_survives_refresh_and_route_switch(monkeypatch):
         return record
 
     monkeypatch.setattr(loading_page, "save_loading_draft", save_draft)
+    loading_page.LoadingState.set_loading_sort.fn(state, "weight_desc")
     loading_page.LoadingState.set_measurement_field.fn(state, "line-1", "box_count", "12")
 
     assert holder["record"]["loading_lines"][0]["measurement"]["box_count"] == "12"
@@ -180,6 +186,7 @@ def test_field_autosave_survives_refresh_and_route_switch(monkeypatch):
     assert state.selected_route_key == "route_2"
     loading_page.LoadingState.select_route.fn(state, "route_1")
     assert state.draft_measurements["line-1"]["box_count"] == "12"
+    assert state.loading_sort == "weight_desc"
 
 
 def test_zero_measurement_marks_row_for_reason_selection():
@@ -233,3 +240,113 @@ def test_order_switch_preserves_autosaved_draft(monkeypatch):
     assert state.selected_order_id == "record-2"
     loading_page.LoadingState.request_order.fn(state, "record-1")
     assert state.draft_measurements["line-1"]["box_count"] == "12"
+
+
+@pytest.mark.parametrize("sort_order,expected", [
+    ("source", ["tomato", "banana", "melon", "zero"]),
+    ("name_asc", ["zero", "banana", "melon", "tomato"]),
+    ("name_desc", ["tomato", "melon", "banana", "zero"]),
+    ("weight_asc", ["zero", "banana", "tomato", "melon"]),
+    ("weight_desc", ["melon", "tomato", "banana", "zero"]),
+])
+def test_loading_product_sort_is_numeric_and_does_not_mutate_rows(sort_order, expected):
+    rows = [
+        {"id": "tomato", "name": "Помидоры", "planned_kg": "10", "weighings": [{"id": "part-1"}]},
+        {"id": "banana", "name": "Бананы", "planned_kg": "2,5"},
+        {"id": "melon", "name": "Дыня", "planned_kg": "100"},
+        {"id": "zero", "name": " арбуз ", "planned_kg": "0"},
+    ]
+    original = deepcopy(rows)
+
+    result = loading_page._sort_loading_rows(rows, sort_order)
+
+    assert [row["id"] for row in result] == expected
+    assert rows == original
+    assert result is not rows
+    assert all(any(row is source for source in rows) for row in result)
+
+
+def test_loading_alphabet_sort_places_yo_with_e():
+    rows = [{"name": name} for name in ("Яблоки", "Жимолость", "Ёлка", "Ежевика", "Ель")]
+
+    assert [row["name"] for row in loading_page._sort_loading_rows(rows, "name_asc")] == [
+        "Ежевика", "Ёлка", "Ель", "Жимолость", "Яблоки",
+    ]
+
+
+@pytest.mark.parametrize("sort_order", ["weight_asc", "weight_desc"])
+def test_loading_weight_sort_has_stable_alphabetic_ties_and_missing_values_last(sort_order):
+    rows = [
+        {"id": "b", "name": "Бананы", "planned_kg": "10"},
+        {"id": "a-1", "name": "Арбуз", "planned_kg": "10"},
+        {"id": "a-2", "name": "Арбуз", "planned_kg": "10"},
+        {"id": "bad", "name": "Дыня", "planned_kg": "не число"},
+        {"id": "nan", "name": "Малина", "planned_kg": "NaN"},
+        {"id": "inf", "name": "Персик", "planned_kg": "Infinity"},
+        {"id": "missing", "name": "Яблоки"},
+    ]
+
+    assert [row["id"] for row in loading_page._sort_loading_rows(rows, sort_order)] == [
+        "a-1", "a-2", "b", "bad", "nan", "inf", "missing",
+    ]
+
+
+@pytest.mark.parametrize("mode", ["route", "stores"])
+def test_loading_sort_keeps_measurements_totals_and_context_in_both_modes(mode):
+    record = _record()
+    first = record["loading_lines"][0]
+    first["measurement"] = measurement("1", "1", "11", "10")
+    second = {**deepcopy(first), "id": "line-3", "name": "Арбуз", "planned_amount": "2"}
+    record["loading_lines"].append(second)
+    destination = record["routes"][0]["destinations"][0]
+    destination["positions"] = [
+        {"id": "position-" + line["id"], "name": line["name"], "planned_amount": line["planned_amount"],
+         "loading": {"measurement": deepcopy(line["measurement"])}}
+        for line in (first, second)
+    ]
+    rows = (loading_page._loading_rows(record, "route_1", {}) if mode == "route" else
+            loading_page._store_loading_rows(record, "route_1", destination))
+    state = SimpleNamespace(loading_rows=rows, loading_sort="source", is_read_only=True)
+    original = deepcopy(rows)
+    totals = loading_page._loading_totals(rows)
+
+    loading_page.LoadingState.set_loading_sort.fn(state, "name_asc")
+    sorted_rows = loading_page.LoadingState.__dict__["sorted_loading_rows"].fget(state)
+
+    assert [row["name"] for row in sorted_rows] == ["Арбуз", "Помидоры"]
+    assert loading_page._loading_totals(sorted_rows) == totals == ("22", "20")
+    assert rows == original
+    assert all(row["order_id"] == "record-1" and row["route_key"] == "route_1" for row in sorted_rows)
+    assert all(row["destination_id"] == ("store-1" if mode == "stores" else "") for row in sorted_rows)
+    loading_page.LoadingState.set_loading_sort.fn(state, "source")
+    assert loading_page.LoadingState.__dict__["sorted_loading_rows"].fget(state) == original
+
+
+def test_loading_sort_rejects_unknown_options_and_survives_record_changes(monkeypatch):
+    record = _record()
+    monkeypatch.setattr(loading_page, "load_order_record", lambda order_id: {**record, "id": order_id})
+    state = _state()
+    loading_page.LoadingState.set_loading_sort.fn(state, "name_desc")
+    loading_page.LoadingState.set_loading_sort.fn(state, "unknown")
+    assert state.loading_sort == "name_desc"
+
+    state._apply_record("record-1")
+    state._apply_record("record-1", "route_2")
+    state._apply_record("record-2", "route_1")
+    state._clear_record()
+
+    assert state.loading_sort == "name_desc"
+    assert loading_page._sort_loading_rows([], "weight_asc") == []
+
+
+def test_loading_page_renders_accessible_sort_control_and_stable_product_keys():
+    rendered = str(loading_page._loading_table())
+
+    assert "loading-product-sort" in rendered
+    assert "htmlFor" in rendered
+    assert "set_loading_sort" in rendered
+    assert "sorted_loading_rows" in rendered
+    assert 'key:row_rx_state_?.["id"]' in rendered
+    for label in loading_page.LOADING_SORT_OPTIONS.values():
+        assert json.dumps(label) in rendered
+    assert "sorted_loading_rows" in str(loading_page._store_loading_reconciliation())

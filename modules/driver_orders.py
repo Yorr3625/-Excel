@@ -243,6 +243,10 @@ def _sheet_store_columns(sheet) -> list[tuple[int, str]]:
     return columns
 
 
+def _is_blank_planned_quantity(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _source_rows(sheet, store_columns: list[tuple[int, str]]) -> list[tuple[int, str]]:
     rows = []
     for row in range(2, sheet.max_row + 1):
@@ -253,7 +257,7 @@ def _source_rows(sheet, store_columns: list[tuple[int, str]]) -> list[tuple[int,
         for column, store in store_columns:
             cell = sheet.cell(row, column)
             value = cell.value
-            if value not in (None, ""):
+            if not _is_blank_planned_quantity(value):
                 try:
                     _decimal(value, "плановое количество")
                 except DriverOrderError as error:
@@ -306,7 +310,7 @@ def build_assignment_snapshot(
         lines = []
         for row, product_name in rows:
             value = sheet.cell(row, column).value
-            if value in (None, ""):
+            if _is_blank_planned_quantity(value):
                 continue
             lines.append({
                 "line_id": _stable_id(order_id, route_key, store_name, str(row), product_name),

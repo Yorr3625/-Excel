@@ -40,6 +40,15 @@ from modules.order_records import (
 from orders_dashboard import theme as ui
 
 
+LOADING_SORT_OPTIONS = {
+    "source": "Как в заказе",
+    "name_asc": "Название: А–Я",
+    "name_desc": "Название: Я–А",
+    "weight_desc": "Заказанный вес: по убыванию",
+    "weight_asc": "Заказанный вес: по возрастанию",
+}
+
+
 def _cookie(router, name: str) -> str:
     headers = getattr(router, "headers", None)
     if headers is None and isinstance(router, dict):
@@ -209,6 +218,26 @@ def _store_loading_cards(record: dict, route_key: str) -> list[dict]:
     return cards
 
 
+def _sort_loading_rows(rows: list[dict], sort_order: str) -> list[dict]:
+    def name_key(row: dict) -> str:
+        return str(row.get("name", "")).strip().casefold().replace("ё", "е")
+
+    if sort_order in ("name_asc", "name_desc"):
+        return sorted(rows, key=name_key, reverse=sort_order == "name_desc")
+    if sort_order in ("weight_asc", "weight_desc"):
+        def weight_key(row: dict) -> tuple[bool, Decimal, str]:
+            try:
+                weight = Decimal(str(row.get("planned_kg", "")).strip().replace(",", "."))
+            except InvalidOperation:
+                return True, Decimal(0), name_key(row)
+            if not weight.is_finite():
+                return True, Decimal(0), name_key(row)
+            return False, -weight if sort_order == "weight_desc" else weight, name_key(row)
+
+        return sorted(rows, key=weight_key)
+    return list(rows)
+
+
 def _loading_totals(rows: list[dict]) -> tuple[str, str]:
     ordered = Decimal("0")
     loaded = Decimal("0")
@@ -309,6 +338,7 @@ class LoadingState(rx.State):
     total_ordered_kg: str = "0"
     total_loaded_net_kg: str = ""
     loading_rows: list[dict] = []
+    loading_sort: str = "source"
     draft_measurements: dict[str, dict[str, str]] = {}
     shipment_rows: list[dict] = []
     shipment_completed_count: int = 0
@@ -332,6 +362,14 @@ class LoadingState(rx.State):
     store_confirmed_net_kg: str = "0"
     route_is_ready: bool = False
     _last_weighing_request: str = ""
+
+    @rx.var
+    def sorted_loading_rows(self) -> list[dict]:
+        return _sort_loading_rows(self.loading_rows, self.loading_sort)
+
+    def set_loading_sort(self, value: str):
+        if value in LOADING_SORT_OPTIONS:
+            self.loading_sort = value
 
     @rx.var
     def filtered_store_cards(self) -> list[dict]:
@@ -854,7 +892,17 @@ def _loading_table():
     return rx.vstack(
         rx.heading("Загрузка", size="3"),
         rx.text(rx.cond(LoadingState.loading_mode == "stores", "Магазин: " + LoadingState.selected_store_name, "Фактические веса маршрута «" + LoadingState.selected_route_label + "»"), class_name="loading-panel-description"),
-        rx.foreach(LoadingState.loading_rows, lambda row: rx.vstack(
+        rx.hstack(
+            rx.el.label("Сортировка товаров", html_for="loading-product-sort"),
+            rx.el.select(
+                *[rx.el.option(label, value=value) for value, label in LOADING_SORT_OPTIONS.items()],
+                id="loading-product-sort", value=LoadingState.loading_sort,
+                on_change=LoadingState.set_loading_sort,
+                aria_label="Сортировка товаров в загрузке", class_name="loading-store-mode",
+            ),
+            width="100%", wrap="wrap", align="center", spacing="3",
+        ),
+        rx.foreach(LoadingState.sorted_loading_rows, lambda row: rx.vstack(
             rx.hstack(
                 rx.text(row["name"], class_name="loading-product-name"), rx.spacer(),
                 rx.text("Заказано: ", row["planned_kg"], " кг"), wrap="wrap", width="100%",
@@ -1019,7 +1067,7 @@ def _store_loading_reconciliation():
     return rx.vstack(
         rx.heading("Сверка выбранного магазина", size="3"),
         rx.text("Загрузка ниже — подтверждённые измерения. Отгрузку вводит водитель. Возвраты учитываются отдельно по маршруту.", class_name="loading-panel-description"),
-        rx.foreach(LoadingState.loading_rows, lambda row: rx.box(
+        rx.foreach(LoadingState.sorted_loading_rows, lambda row: rx.box(
             rx.text(row["name"], font_weight="500"),
             rx.text("Заказано: ", row["planned_kg"], " кг · Загружено: ", rx.cond(LoadingState.is_read_only, row["preview_net_weight_kg"].to(str) + " кг", "не подтверждено"),
                     " · Отгружено: ", rx.cond(row["shipped_net_kg"] != "", row["shipped_net_kg"].to(str) + " кг", "не подтверждено")),
