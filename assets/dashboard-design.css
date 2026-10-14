@@ -496,3 +496,29 @@ html[data-theme="dark"] .dashboard-design.login-app .login-card { box-shadow: 0 
 @media (min-width:992px) { .dashboard-design.app-collapsed .theme-switch select { display:none; } }
 
 .dashboard-design .file-picker input[type="file"] { display:block !important; position:static !important; width:100%; height:auto; clip:auto !important; clip-path:none !important; opacity:1 !important; }
+
+.dashboard-design.trip-design { grid-template-columns:252px minmax(0,1fr); --page:var(--canvas); --panel:var(--surface); --line:var(--border); --ink-2:var(--secondary); --ink-3:var(--muted); }
+.trip-design .trip-workspace { max-width:1280px; padding:32px; background:transparent; }
+.trip-design .loading-panel { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:24px; }
+.trip-design .trip-subcard { background:var(--canvas); border-color:var(--border); border-radius:10px; padding:16px; }
+.trip-design .trip-list-button { border:1px solid var(--border); border-radius:10px; background:var(--surface); color:var(--ink); min-height:54px; }
+.trip-design .loading-amount-input, .trip-design input, .trip-design select, .trip-design textarea { border:1px solid var(--border-strong) !important; border-radius:8px; background:var(--surface) !important; color:var(--ink) !important; min-height:42px; padding:8px 12px; }
+.trip-design details { width:100%; }
+.trip-design summary { cursor:pointer; font-size:16px; font-weight:600; padding:12px 0; }
+.trip-design .trip-unload-form { padding:20px; border:1px solid var(--border); border-radius:12px; background:var(--canvas); }
+.dashboard-design .pending-trip-note { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:16px; padding:20px; border:1px solid var(--accent-border); border-radius:12px; background:var(--accent-soft); }
+.trip-design h2 { font-size:18px; font-weight:600; letter-spacing:-.4px; line-height:1.4; margin:0; }
+.trip-design .trip-workspace > .rx-Stack { min-width:0; }
+.trip-design .trip-sidebar .brand { padding:0; }
+.trip-design .trip-sidebar .brand-copy strong, .trip-design .trip-sidebar .brand-copy small { display:block; }
+@media (max-width:991px) { .dashboard-design.trip-design { grid-template-columns:minmax(0,1fr); } .trip-design .trip-sidebar { display:flex; height:auto; position:static; padding:16px; } .trip-design .trip-sidebar .brand { margin-bottom:16px; } .trip-design .trip-sidebar .navigation { flex-direction:row; flex-wrap:wrap; gap:8px; } .trip-design .trip-sidebar .nav-heading { display:none; } .trip-design .trip-sidebar .nav-item { width:auto; } }
+.trip-print-sheet { display:none; }
+@media (max-width:767px) { .trip-design .trip-workspace { padding:16px; } .trip-design .loading-panel, .trip-design .trip-unload-form { padding:16px; } }
+@media print {
+ body:has(.trip-print-sheet) *:not(:has(.trip-print-sheet)):not(.trip-print-sheet):not(.trip-print-sheet *) { display:none !important; }
+ body:has(.trip-print-sheet) *:has(.trip-print-sheet) { display:block !important; min-height:0 !important; height:auto !important; padding:0 !important; margin:0 !important; border:0 !important; }
+ .trip-print-sheet, .trip-print-sheet * { visibility:visible !important; }
+ .trip-print-sheet { display:block !important; position:static; padding:12mm; background:white; color:black; }
+ .trip-print-sheet table { width:100%; border-collapse:collapse; }
+ .trip-print-sheet th, .trip-print-sheet td { border:1px solid black; padding:8px; height:40px; }
+}

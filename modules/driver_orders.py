@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -432,7 +433,7 @@ def publish_assignments(
                 existing = _read(sidecar_path(str(existing_id))) if existing_id else None
             except DriverOrderError:
                 existing = None
-            if existing and any(store.get("status") == "completed" for store in existing.get("stores", [])):
+            if existing and (existing.get("loading_batch_id") or any(store.get("status") == "completed" for store in existing.get("stores", []))):
                 paths_written.append(sidecar_path(str(existing_id)))
                 publication_assignment_ids.append(str(existing_id))
                 continue
@@ -462,6 +463,136 @@ def load_snapshot(path_or_id: str | Path) -> dict:
     path = sidecar_path(str(path_or_id)) if not isinstance(path_or_id, Path) else path_or_id
     with _LOCK:
         return _read(path)
+
+
+def _loading_assignment(order_record_id: str, route_key: str) -> dict:
+    candidates = [item for item in _snapshots(active_only=True)
+                  if item.get("order_record_id") == order_record_id and item.get("route_key") == route_key]
+    current = max(candidates, key=lambda item: item.get("created_at", ""), default=None)
+    if current is None or not current.get("driver_id"):
+        raise DriverOrderConflict("Маршруту ещё не назначен водитель")
+    return current
+
+
+def _partial_loading_blocker(current: dict) -> str:
+    from modules import goods_returns, vehicle_trips
+    trip = vehicle_trips.trip_for_assignment(current["assignment_id"])
+    if trip:
+        if trip.get("projection_error"):
+            return "Сначала синхронизируйте отгрузки предыдущей отправки"
+        if trip["status"] in {"active", "on_base", "released_pending", "closed"}:
+            return ""
+        return "Сначала начните или завершите рейс машины предыдущей отправки"
+    if current.get("loading_batch_id"):
+        if not current.get("stores") or any(store.get("status") != "completed" for store in current["stores"]):
+            return "Сначала завершите отгрузку магазинов предыдущей отправки"
+        if not trip:
+            context = goods_returns.return_context(current)
+            if context.get("error") and not context.get("complete"):
+                return context["error"]
+            document = context.get("document")
+            if document and document["status"] != "accepted":
+                return "Сначала завершите проверку возврата предыдущей отправки"
+            accepted = {line["loading_line_id"]: Decimal(line["measurement"]["net_weight_kg"])
+                        for line in (document or {}).get("lines", [])} if document else {}
+            if any(Decimal(line["available_net_kg"]) != accepted.get(line["loading_line_id"], Decimal(0)) for line in context["lines"]):
+                return "Сначала оформите и завершите сверку остатка предыдущей отправки"
+    elif any(store.get("status") == "completed" for store in current.get("stores", [])):
+        return "Частичную загрузку нельзя выделить из уже начатой полной отгрузки"
+    return ""
+
+
+def loading_batch_published(batch: dict) -> bool:
+    identity = _stable_id(batch["source_assignment_id"], "loading-batch", batch["id"])
+    index = _read_index()
+    if not index or not any(identity in publication["assignment_ids"] for publication in index["publications"]):
+        return False
+    try:
+        snapshot = _read(sidecar_path(identity))
+    except DriverOrderError:
+        return False
+    return (snapshot.get("assignment_id") == identity and snapshot.get("loading_batch_id") == batch["id"]
+            and isinstance(snapshot.get("stores"), list) and len(snapshot["stores"]) == len(batch["destination_ids"])
+            and all(isinstance(store, dict) for store in snapshot["stores"])
+            and {store.get("order_record_destination_id") for store in snapshot["stores"]} == set(batch["destination_ids"]))
+
+
+def partial_loading_blocker(order_record_id: str, route_key: str) -> str:
+    try:
+        return _partial_loading_blocker(_loading_assignment(order_record_id, route_key))
+    except (DriverOrderError, ValueError) as error:
+        return str(error)
+
+
+def release_partial_loading(order_record_id: str, route_key: str, revision: int,
+                            actor: dict, operation_id: str) -> dict:
+    """Publish one immutable store group; retries repair a split record/index write."""
+    from modules import goods_returns, order_records, vehicle_trips
+    if not isinstance(actor, dict) or actor.get("kind") not in {"loader", "dashboard"} or not actor.get("id"):
+        raise DriverOrderError("Нет доступа к отправке загрузки")
+    if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
+        raise DriverOrderError("Некорректный идентификатор операции")
+    with vehicle_trips._db(True), goods_returns._LOCK, order_records._LOCK, _LOCK:
+        record = order_records.load_order_record(order_record_id)
+        batches = order_records.loading_batches(record, route_key)
+        known = next((batch for batch in batches if batch.get("operation_id") == operation_id), None)
+        index = _read_index()
+        if known and loading_batch_published(known):
+            identity = _stable_id(known["source_assignment_id"], "loading-batch", known["id"])
+            return _read(sidecar_path(identity))
+        pending = batches[-1] if batches and not loading_batch_published(batches[-1]) else None
+        if known and pending != known:
+            raise DriverOrderConflict("Отправка уже заменена другой; обновите загрузку")
+        source = _read(sidecar_path(pending["source_assignment_id"])) if pending else None
+        logical_id = source.get("logical_assignment_id", source["assignment_id"]) if source else ""
+        active_id = (index or {}).get("active", {}).get(logical_id)
+        identity = _stable_id(source["assignment_id"], "loading-batch", pending["id"]) if pending else ""
+        current = source if pending and active_id in (None, identity) else _loading_assignment(order_record_id, route_key)
+        blocker = _partial_loading_blocker(current)
+        if blocker:
+            raise DriverOrderConflict(blocker)
+        source_id = current.get("source_assignment_id") or current["assignment_id"]
+        source = _read(sidecar_path(source_id))
+        if source.get("order_record_id") != order_record_id or source.get("route_key") != route_key:
+            raise DriverOrderConflict("Исходное назначение не соответствует маршруту")
+        batch = pending or order_records.release_store_loading(
+            order_record_id, revision, route_key, source_id, operation_id, actor
+        )
+        record = order_records.load_order_record(order_record_id)
+        balance = order_records.route_return_balance(record, route_key, batch["id"])
+        selected = set(batch["destination_ids"])
+        snapshot = deepcopy(source)
+        snapshot.update({
+            "assignment_id": _stable_id(source_id, "loading-batch", batch["id"]),
+            "source_assignment_id": source_id, "loading_batch_id": batch["id"],
+            "batch_number": len(order_records.loading_batches(record, route_key)),
+            "created_at": batch["created_at"], "revision": 0, "operations": [],
+            "stores": [deepcopy(store) for store in source["stores"] if store.get("order_record_destination_id") in selected],
+        })
+        path = sidecar_path(snapshot["assignment_id"])
+        if path.exists():
+            snapshot = _read(path)
+            if (snapshot.get("assignment_id") != path.stem or snapshot.get("loading_batch_id") != batch["id"]
+                    or {store.get("order_record_destination_id") for store in snapshot.get("stores", [])} != selected):
+                raise DriverOrderConflict("Состав сохранённой отправки изменился; восстановите назначение")
+        else:
+            if any(position["completed"] for destination in balance["destinations"] for position in destination["positions"]):
+                raise DriverOrderConflict("Отгрузка уже начата; восстановите сохранённое назначение")
+            try:
+                goods_returns._snapshot_complete(snapshot, balance)
+            except goods_returns.GoodsReturnError as error:
+                raise DriverOrderConflict(f"Назначение не соответствует отправке: {error}") from error
+            _atomic_write(path, snapshot)
+        index = _read_index() or _empty_index()
+        logical_id = source.get("logical_assignment_id", source_id)
+        index["active"][logical_id] = snapshot["assignment_id"]
+        if not any(snapshot["assignment_id"] in publication["assignment_ids"] for publication in index["publications"]):
+            index["publications"].append({
+                "publication_id": batch["id"], "created_at": batch["created_at"],
+                "assignment_ids": [snapshot["assignment_id"]], "logical_assignment_ids": [logical_id],
+            })
+        _atomic_write(index_path(), index)
+        return deepcopy(snapshot)
 
 
 def find_assignment_for_driver(driver_id: str) -> dict | None:
@@ -691,5 +822,32 @@ def complete_store(
             "revision": snapshot["revision"],
             "created_at": _now(),
         })
+        _atomic_write(path, snapshot)
+        return public_snapshot(snapshot)
+
+
+def append_store_delivery(assignment_id: str, store_id: str, measurements: dict, operation_id: str) -> dict:
+    """Add a later visit to a completed shop without counting a second shop."""
+    if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
+        raise DriverOrderError("Некорректный идентификатор операции")
+    path = sidecar_path(assignment_id)
+    with _LOCK:
+        snapshot = _read(path)
+        store = _find_store(snapshot, store_id)
+        expected = {line["line_id"] for line in store["lines"]}
+        if store["status"] != "completed" or not isinstance(measurements, dict) or set(measurements) != expected:
+            raise DriverOrderConflict("Повторная поставка не соответствует магазину")
+        validated = {identity: _measurement(value) for identity, value in measurements.items()}
+        if any(item.get("operation_id") == operation_id for item in snapshot.get("operations", [])):
+            visits = store.get("additional_deliveries", [])
+            if not any(item["operation_id"] == operation_id and item["measurements"] == validated for item in visits):
+                raise DriverOrderConflict("Повторная операция содержит другие данные")
+            return public_snapshot(snapshot)
+        for line in store["lines"]:
+            line["actual_qty"] = _quantity(_decimal(line["actual_qty"]) + _decimal(validated[line["line_id"]]["net_weight_kg"]))
+        store.setdefault("additional_deliveries", []).append({"operation_id": operation_id, "at": _now(), "measurements": validated})
+        snapshot["revision"] += 1
+        snapshot.setdefault("operations", []).append({"operation_id": operation_id, "store_id": store_id,
+                                                       "revision": snapshot["revision"], "created_at": _now()})
         _atomic_write(path, snapshot)
         return public_snapshot(snapshot)

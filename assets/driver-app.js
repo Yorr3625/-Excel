@@ -1,4 +1,6 @@
-const DB_NAME = "logistics-driver";
+const CREW_MODE = (window.location.pathname || "").replace(/\/$/, "") === "/crew";
+const API_PREFIX = CREW_MODE ? "/api/crew" : "/api/driver";
+const DB_NAME = CREW_MODE ? "logistics-crew" : "logistics-driver";
 const DB_VERSION = 4;
 const ORDER_STORE = "orders";
 const SESSION_STORE = "session";
@@ -15,7 +17,7 @@ let returnSave = Promise.resolve();
 const tripReturnIds = new Set();
 let syncing = false;
 let syncStatus = "Нажмите синхронизацию, чтобы обновить данные";
-const SHIPMENT_DRAFT_KEY = "logistics-driver-shipment-drafts";
+const SHIPMENT_DRAFT_KEY = CREW_MODE ? "logistics-crew-shipment-drafts" : "logistics-driver-shipment-drafts";
 let shipmentDrafts = {};
 try {
   const savedDrafts = JSON.parse(localStorage.getItem(SHIPMENT_DRAFT_KEY) || "{}");
@@ -26,6 +28,7 @@ let syncFinished = Promise.resolve();
 let csrfToken = "";
 let driverId = "";
 let assignment = null;
+let vehicles = [];
 let mileage = null;
 let selectedStoreId = "";
 let view = "login";
@@ -152,8 +155,8 @@ function logoMark() {
 
 function appHeader(showLogout = false) {
   return `<header class="driver-app-header">
-    <a class="driver-brand" href="/driver" aria-label="Dostavo.online">
-      <span class="driver-brand-mark">${logoMark()}</span><strong>dostavo.online</strong><span class="driver-brand-subtitle">Кабинет водителя</span>
+    <a class="driver-brand" href="${CREW_MODE ? "/crew" : "/driver"}" aria-label="Доставка">
+      <span class="driver-brand-mark">${logoMark()}</span><strong>Доставка</strong><span class="driver-brand-subtitle">${CREW_MODE ? "Кабинет машины" : "Кабинет водителя"}</span>
     </a>
     <div class="driver-header-actions">
       <label class="driver-theme-control">Тема<select data-theme-select aria-label="Тема оформления">
@@ -202,8 +205,8 @@ function shipmentNet(measurement) {
 
 function returnPath(assignmentId, tripId = "") {
   return tripId || tripReturnIds.has(assignmentId)
-    ? `/api/driver/trips/${encodeURIComponent(assignmentId)}/returns`
-    : `/api/driver/returns/${encodeURIComponent(assignmentId)}`;
+    ? `${API_PREFIX}/trips/${encodeURIComponent(assignmentId)}/returns`
+    : `${API_PREFIX}/returns/${encodeURIComponent(assignmentId)}`;
 }
 
 function shipmentDraftKey(lineId) {
@@ -254,20 +257,20 @@ function renderLogin() {
       ${appHeader()}
       <main class="driver-login-shell">
         <section class="driver-panel driver-login-panel">
-          <h1>Рабочее место водителя</h1>
-          <p class="driver-muted">Войдите по коду водителя и PIN-коду</p>
+          <h1>${CREW_MODE ? "Рабочее место машины" : "Рабочее место водителя"}</h1>
+          ${CREW_MODE ? '<p class="driver-muted">Выберите автомобиль в кабинете грузчика.</p><a class="driver-primary" href="/loader">Выбрать автомобиль</a>' : `<p class="driver-muted">Войдите по коду водителя и PIN-коду</p>
           <form data-login-form class="driver-form">
             <label>Код водителя<input name="driver_id" autocomplete="username" required maxlength="128"></label>
             <label>PIN-код<input name="pin" type="password" inputmode="numeric" autocomplete="current-password" required minlength="4" maxlength="12"></label>
             <button class="driver-primary" type="submit">Войти</button>
-          </form>
+          </form>`}
           <p data-message class="driver-message"></p>
         </section>
         <p class="driver-offline-note ${online ? "driver-online" : "driver-offline"}"><span aria-hidden="true"></span>${online ? "Подключение к серверу доступно" : "Нет подключения к серверу"}</p>
       </main>
     </div>`;
   bindFrameActions();
-  root().querySelector("[data-login-form]").addEventListener("submit", async (event) => {
+  root().querySelector("[data-login-form]")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const button = event.currentTarget.querySelector("button");
@@ -343,13 +346,14 @@ function driverInitials() {
 
 function storeCards(stores, offset = 0) {
   const waitingForLoading = assignment?.loading_status === "waiting_loading";
+  const paused = assignment?.trip_id && assignment.status !== "active";
   return stores.map((store, index) => {
     const completed = store.status === "completed";
-    const blocked = completed || waitingForLoading;
+    const blocked = completed || waitingForLoading || paused;
     return `<button class="driver-store ${completed ? "driver-store-done" : ""}" data-store-id="${esc(store.store_id)}" ${blocked ? "disabled" : ""}>
       <span class="driver-store-index">${offset + index + 1}</span>
       <span class="driver-store-name">${esc(store.name)}</span>
-      <strong>${completed ? "Выполнено" : (waitingForLoading ? "Ожидает загрузки" : "Открыть")}</strong>
+      <strong>${completed ? "Выполнено" : (paused ? "На базе" : waitingForLoading ? "Ожидает загрузки" : "Открыть")}</strong>
     </button>`;
   }).join("");
 }
@@ -361,6 +365,30 @@ function storesPanel(stores, offset = 0, className = "") {
   </section>`;
 }
 
+async function runTripAction(action, details = {}) {
+  if (!assignment?.trip_id || !online) {
+    setMessage("Для изменения состояния рейса подключитесь к серверу.", true);
+    return;
+  }
+  const tripId = assignment.trip_id;
+  try {
+    if (!await flushMileageQueue()) throw new Error("Сначала внесите пробег автомобиля.");
+    await flushQueue();
+    if (assignment?.trip_id !== tripId) throw new Error("Рейс изменился. Проверьте назначение.");
+    const data = await api(`${API_PREFIX}/trips/${encodeURIComponent(tripId)}/${action}`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({trip_id: tripId, revision: assignment.revision, operation_id: crypto.randomUUID(), ...details})
+    });
+    if (data.assignment?.trip_id !== tripId) throw new Error("Сервер вернул другой рейс");
+    await cacheAssignment(data.assignment);
+    assignment = data.assignment;
+    if (assignment.status === "released_pending") await loadOrder();
+    else render();
+  } catch (error) {
+    setMessage(error.message || "Не удалось обновить рейс. Проверьте соединение.", true);
+  }
+}
+
 function renderOrder() {
   const completed = assignment?.completed_stores || 0;
   const total = assignment?.store_count || 0;
@@ -370,15 +398,21 @@ function renderOrder() {
     <div class="driver-app-frame">
       ${appHeader(true)}
       <main class="driver-shell driver-order-shell">
-        <p class="driver-breadcrumb">Назначенный заказ</p>
+        <p class="driver-breadcrumb">Рейс машины</p>
+        ${CREW_MODE ? '<a class="driver-secondary" href="/loader">Сменить машину</a>' : vehicles.length ? `<label class="driver-vehicle-picker">Машина<select data-vehicle-select>${vehicles.map(vehicle => `<option value="${esc(vehicle.id)}" ${vehicle.id === assignment?.vehicle_id ? "selected" : ""}>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · "))}</option>`).join("")}</select></label>` : ""}
         <div class="driver-route-title"><h1>${esc(assignment?.route_label || "Назначенный заказ")}</h1><span>${online ? "Онлайн" : "Офлайн"}</span></div>
         <section class="driver-overview">
-          <div class="driver-overview-card"><span class="driver-avatar">${driverInitials()}</span><div><small>Водитель</small><strong>${esc(assignment?.driver_name || "Не назначен")}</strong></div></div>
+          <div class="driver-overview-card"><span class="driver-avatar">${driverInitials()}</span><div><small>${CREW_MODE ? "Машина" : "Водитель"}</small><strong>${esc(CREW_MODE ? (assignment?.vehicle_name || assignment?.vehicle_plate || "Не выбрана") : (assignment?.driver_name || "Не назначен"))}</strong></div></div>
           <div class="driver-overview-card driver-progress-card"><div><small>${completed} из ${total} магазинов</small><strong>${progress}%</strong></div><div class="driver-progress"><span style="width:${progress}%"></span></div></div>
         </section>
         <p data-message class="driver-message">${assignment?.loading_status === "waiting_loading" ? "Склад ещё не подтвердил загрузку. Отгрузка будет доступна после подтверждения." : ""}</p>
+        ${assignment?.loading_batch_id ? `<p class="driver-muted">Отправка №${esc(assignment.batch_number || 1)}: только подтверждённые магазины. Ещё ожидают отправки: ${esc(assignment.waiting_store_count || 0)}. Остаток и возврат считаются по этой отправке.</p>` : ""}
         <button data-route-return class="driver-secondary" type="button">Возврат остатка / история</button>
-        ${assignment?.trip_id ? `<section class="driver-panel"><h2>Остаток в машине</h2><div class="driver-trip-stock">${(assignment.stock || []).map(item => `<div><strong>${esc(item.name)}</strong><span>В машине: ${esc(item.remaining_kg)} кг</span><span>Выделено заданиям: ${esc(item.reserved_kg)} кг</span><span>Свободно: ${esc(item.available_kg)} кг</span></div>`).join("")}</div>${assignment.projection_error ? `<p class="driver-message driver-message-error">${esc(assignment.projection_error)}</p>` : ""}</section>` : ""}
+        ${assignment?.trip_id ? `<section class="driver-panel driver-trip-status"><h2>Рейс машины</h2><p>${esc(({active: "В пути", on_base: "На базе — товар в машине", released_pending: "Выгрузка на бумаге — ждёт внесения", return_pending: "Сверка возврата", closed: "Закрыт"})[assignment.status] || "Готовится")}</p>
+          ${assignment.status === "active" ? '<button data-trip-arrive class="driver-secondary" type="button">Вернулись на базу — товар в машине</button>' : ""}
+          ${assignment.status === "on_base" ? `<p class="driver-muted">Проверьте товар перед выездом. Недоставленные магазины останутся в этом рейсе.</p><div class="driver-trip-check">${(assignment.stock || []).map(item => `<label>${esc(item.name)} · по учёту ${esc(item.remaining_kg)} кг<input data-stock-check="${esc(item.id)}" type="text" inputmode="decimal" value="${esc(item.remaining_kg)}" aria-label="Фактический вес: ${esc(item.name)}"></label>`).join("")}</div><button data-trip-check class="driver-secondary" type="button">Сохранить проверку</button>${assignment.last_stock_check?.matches ? '<button data-trip-resume class="driver-primary" type="button">Продолжить рейс</button>' : ""}<button data-trip-unload class="driver-secondary" type="button">Полностью выгрузили машину</button>` : ""}
+          ${assignment.last_stock_check && !assignment.last_stock_check.matches ? '<p class="driver-message driver-message-error">Есть расхождение. Попросите администратора сверить товар.</p>' : ""}</section>
+        <section class="driver-panel"><h2>Товар и недоставленное</h2><div class="driver-trip-stock">${(assignment.stock || []).map(item => `<div><strong>${esc(item.name)}</strong><span>В машине: ${esc(item.remaining_kg)} кг</span><span>Осталось доставить: ${esc((assignment.summary || []).find(line => line.name === item.name)?.necessary || "0")} кг</span><span>Выделено заданиям: ${esc(item.reserved_kg)} кг</span><span>Свободно: ${esc(item.available_kg)} кг</span></div>`).join("")}</div>${assignment.projection_error ? `<p class="driver-message driver-message-error">${esc(assignment.projection_error)}</p>` : ""}</section>` : ""}
         <div class="driver-workspace">
           <section class="driver-panel driver-order-panel">
             <div class="driver-panel-heading"><div><h2>Весь заказ</h2><p class="driver-muted">Общий объём товаров по маршруту. Данные обновляются при синхронизации.</p></div><span class="driver-products-count">${(assignment?.summary || []).length} товаров</span></div>
@@ -391,6 +425,27 @@ function renderOrder() {
       </main>
     </div>`;
   bindFrameActions();
+  root().querySelector("[data-vehicle-select]")?.addEventListener("change", async event => {
+    try {
+      if ((await dbAll(QUEUE_STORE)).some(item => item.driver_id === driverId)) throw new Error("Сначала синхронизируйте неотправленные отгрузки.");
+      await api("/api/driver/vehicle", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({vehicle_id: event.target.value})});
+      const data = await api(`${API_PREFIX}/me`);
+      mileage = data.mileage || null;
+      await cacheAssignment(data.assignment);
+      render();
+    } catch (error) { setMessage(error.message || "Не удалось выбрать машину", true); }
+  });
+  root().querySelector("[data-trip-arrive]")?.addEventListener("click", () => runTripAction("arrive"));
+  root().querySelector("[data-trip-check]")?.addEventListener("click", () => {
+    const amounts = Object.fromEntries([...root().querySelectorAll("[data-stock-check]")].map(input => [input.dataset.stockCheck, input.value.trim()]));
+    runTripAction("check", {amounts});
+  });
+  root().querySelector("[data-trip-resume]")?.addEventListener("click", () => runTripAction("resume"));
+  root().querySelector("[data-trip-unload]")?.addEventListener("click", () => {
+    if (window.confirm("Машина полностью пуста? Недоставленные магазины останутся к доставке, а вес выгрузки можно внести позже.")) {
+      runTripAction("unload-all", {occurred_at: new Date().toISOString(), note: "Физическая выгрузка подтверждена, вес будет внесён позднее"});
+    }
+  });
   root().querySelectorAll("[data-store-id]").forEach((button) => button.addEventListener("click", () => {
     selectedStoreId = button.dataset.storeId;
     view = "store";
@@ -422,7 +477,7 @@ function renderStore() {
   const store = selectedStore();
   if (!store) { view = "order"; render(); return; }
   const completed = store.status === "completed";
-  const waitingForLoading = assignment?.loading_status === "waiting_loading";
+  const waitingForLoading = assignment?.loading_status === "waiting_loading" || (assignment?.trip_id && assignment.status !== "active");
   const lines = (store.lines || []).map((line) => {
     const measurement = line.shipment_measurement || {};
     const saved = completed;
@@ -454,7 +509,7 @@ function renderStore() {
 
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
-  if (options.method && options.method !== "GET") headers["X-Driver-CSRF"] = csrfToken;
+  if (options.method && options.method !== "GET") headers[CREW_MODE ? "X-Loader-CSRF" : "X-Driver-CSRF"] = csrfToken;
   const response = await fetch(await apiUrl(path), {
     ...options, headers, credentials: "include", signal: options.signal || AbortSignal.timeout(20000)
   });
@@ -552,8 +607,8 @@ async function flushQueue() {
     }
     try {
       const endpoint = operation.payload.trip_id
-        ? `/api/driver/trips/${encodeURIComponent(operation.payload.trip_id)}/stops/${encodeURIComponent(operation.store_id)}/complete`
-        : `/api/driver/order/stores/${encodeURIComponent(operation.store_id)}/complete`;
+        ? `${API_PREFIX}/trips/${encodeURIComponent(operation.payload.trip_id)}/stops/${encodeURIComponent(operation.store_id)}/complete`
+        : `${API_PREFIX}/order/stores/${encodeURIComponent(operation.store_id)}/complete`;
       const data = await api(endpoint, {
         method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(operation.payload)
       });
@@ -572,10 +627,15 @@ async function flushQueue() {
 
 async function loadOrder() {
   try {
-    const data = await api("/api/driver/order");
+    const data = await api(`${API_PREFIX}/order`);
     await cacheAssignment(data.assignment);
-    if (!assignment) throw new Error("Для водителя нет активного назначения");
-    await dbPut(ORDER_STORE, driverId, assignment);
+    if (!assignment) {
+      await dbDelete(ORDER_STORE, driverId);
+      view = "order";
+      render();
+      setMessage("Нет активного рейса. Выберите машину или дождитесь назначения.");
+      return;
+    }
     view = "order";
     render();
   } catch (error) {
@@ -602,7 +662,7 @@ async function loadOrder() {
 
 async function completeStore() {
   const store = selectedStore();
-  if (!store || assignment?.loading_status === "waiting_loading") return;
+  if (!store || assignment?.loading_status === "waiting_loading" || (assignment?.trip_id && assignment.status !== "active")) return;
   const measurements = {};
   let invalid = false;
   root().querySelectorAll("[data-measurement-input]").forEach((input) => {
@@ -703,7 +763,7 @@ async function syncOrder() {
   try {
     if (!online) throw new Error("Нет связи с сервером. Изменения сохранены на устройстве.");
     // Refresh authentication and mileage without dropping the local operation queue.
-    const session = await api("/api/driver/me");
+    const session = await api(`${API_PREFIX}/me`);
     if (!session.driver?.id || session.driver.id !== driverId) {
       throw new Error("Сессия другого водителя. Войдите под своим профилем; очередь сохранена.");
     }
@@ -721,7 +781,7 @@ async function syncOrder() {
     }
     await flushReturnQueue();
     if (mileageReady) {
-      const data = await api("/api/driver/sync", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+      const data = await api(`${API_PREFIX}/sync`, {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
       await cacheAssignment(data.assignment);
       mileage = data.mileage || mileage;
     }
@@ -761,7 +821,7 @@ async function syncOrder() {
 async function logout() {
   loggingOut = true;
   await syncFinished;
-  try { await api("/api/driver/logout", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"}); } catch (_) {}
+  try { await api(`${API_PREFIX}/logout`, {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"}); } catch (_) {}
   await clearOfflineData();
   loggingOut = false;
   view = "login";
@@ -770,10 +830,11 @@ async function logout() {
 
 async function restoreSession() {
   const saved = await dbGet(SESSION_STORE, "current").catch(() => null);
-  if (!saved) { render(); return; }
+  if (!saved && !CREW_MODE) { render(); return; }
   try {
-    const data = await api("/api/driver/me");
+    const data = await api(`${API_PREFIX}/me`);
     driverId = data.driver.id;
+    vehicles = data.vehicles || [];
     csrfToken = data.csrf_token || "";
     mileage = data.mileage || null;
     await cacheAssignment(data.assignment);
@@ -787,11 +848,12 @@ async function restoreSession() {
     } else {
       view = "order";
       render();
-      setMessage("Для водителя нет активного назначения", true);
+      setMessage("Нет активного рейса для выбранной машины.");
     }
   } catch (_) {
+    if (!saved) { view = "login"; render(); return; }
     driverId = saved.driver_id;
-    mileage = saved.mileage || {required: true, available: false, error: "Подключитесь к серверу, чтобы проверить обязательный пробег."};
+    mileage = saved.mileage || {required: !CREW_MODE, available: false, error: "Подключитесь к серверу, чтобы проверить обязательный пробег."};
     assignment = await dbGet(ORDER_STORE, driverId).catch(() => null);
     if (mileage.required) {
       view = "order";
@@ -913,7 +975,7 @@ async function loadReturnIndex() {
   let fetchError = null;
   if (online) {
     try {
-      const data = await api("/api/driver/returns");
+      const data = await api(`${API_PREFIX}/returns`);
       returnIndex = {returns: data.returns || [], assignments: data.assignments || []};
       for (const item of [...returnIndex.returns, ...returnIndex.assignments]) if (item.trip_id) tripReturnIds.add(item.trip_id);
       await dbPut(RETURN_CACHE_STORE, `${driverId}:index`, {driver_id: driverId, index: returnIndex});

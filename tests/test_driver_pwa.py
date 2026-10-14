@@ -43,7 +43,7 @@ def test_driver_pwa_return_storage_is_migrated_and_cleared_on_logout():
     assert source.index('else if (view === "returns")') < source.index("else if (mileage?.required)")
     assert source.index("await flushQueue()") < source.index("await flushReturnQueue()")
     assert 'assignment_id: assignment.assignment_id' in source
-    assert 'const CACHE_NAME = "logistics-static-v6";' in Path("assets/service-worker.js").read_text(encoding="utf-8")
+    assert 'const CACHE_NAME = "logistics-static-v7";' in Path("assets/service-worker.js").read_text(encoding="utf-8")
 
 
 def test_driver_pwa_javascript_behavior():

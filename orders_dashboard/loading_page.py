@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from http.cookies import CookieError, SimpleCookie
@@ -10,7 +11,7 @@ import reflex as rx
 from reflex.state import StateUpdate
 from reflex_base.event import Event
 
-from modules import dashboard_sessions, goods_returns, loader_sessions
+from modules import dashboard_sessions, driver_orders, goods_returns, loader_sessions
 from modules.fleet import loader_by_id
 from modules.order_records import (
     OrderRecordConflict,
@@ -21,6 +22,7 @@ from modules.order_records import (
     confirm_route_loading,
     confirm_store_loading,
     loading_line_net_weight,
+    loading_batches,
     loading_measurement_parts,
     loading_measurement_totals,
     change_loading_weighing,
@@ -78,6 +80,7 @@ def loading_principal_for_router(router) -> dict | None:
         "kind": "loader",
         "id": str(loader.get("id", "")),
         "name": str(loader.get("name", "Грузчик")),
+        "vehicle_id": str(session.get("vehicle_id", "")),
     }
 
 
@@ -203,6 +206,10 @@ def _store_loading_rows(record: dict, route_key: str, destination: dict) -> list
 
 def _store_loading_cards(record: dict, route_key: str) -> list[dict]:
     cards = []
+    batches = loading_batches(record, route_key)
+    published = {batch["id"]: driver_orders.loading_batch_published(batch) for batch in batches}
+    released = {identity: (index + 1, published[batch["id"]])
+                for index, batch in enumerate(batches) for identity in batch["destination_ids"]}
     for route in record.get("routes", []):
         if route.get("route_key") != route_key:
             continue
@@ -213,7 +220,8 @@ def _store_loading_cards(record: dict, route_key: str) -> list[dict]:
             cards.append({
                 "id": str(destination["id"]), "name": str(destination.get("name", "")),
                 "planned_kg": ordered, "loaded_net_kg": loaded if status == "loaded" else "",
-                "status": status, "status_label": {"new": "Не начата", "draft": "Черновик", "loaded": "Подтверждена"}.get(status, "Не начата"),
+                "released": destination["id"] in released,
+                "status": status, "status_label": (f"Отправлена №{released[destination['id']][0]}" if released[destination["id"]][1] else "Подтверждена, ожидает публикации") if destination["id"] in released else {"new": "Ожидает загрузки", "draft": "Черновик", "loaded": "Подтверждена, ожидает отправки"}.get(status, "Ожидает загрузки"),
             })
     return cards
 
@@ -362,6 +370,21 @@ class LoadingState(rx.State):
     store_confirmed_net_kg: str = "0"
     route_is_ready: bool = False
     _last_weighing_request: str = ""
+    partial_has_batches: bool = False
+    partial_send_stores: list[dict] = []
+    partial_send_net_kg: str = "0"
+    partial_waiting_count: int = 0
+    partial_blocker: str = ""
+    partial_pending_publication: bool = False
+    partial_dialog_open: bool = False
+    partial_dialog_names: list[str] = []
+    partial_dialog_net_kg: str = "0"
+    partial_dialog_waiting_count: int = 0
+    partial_dialog_error: str = ""
+    _partial_revision: int = 0
+    _partial_operation_id: str = ""
+    _partial_order_id: str = ""
+    _partial_route_key: str = ""
 
     @rx.var
     def sorted_loading_rows(self) -> list[dict]:
@@ -483,8 +506,47 @@ class LoadingState(rx.State):
             return
         self._apply_record(self.selected_order_id, self.selected_route_key)
         self.status = "Загрузка маршрута подтверждена. Водитель может начать отгрузку." if self.route_is_ready else "Загрузка магазина подтверждена. Выберите любой следующий магазин."
-        self.save_completed = self.route_is_ready
+        if self.partial_has_batches:
+            self.status = "Загрузка магазина подтверждена. Отправьте следующую загрузку после завершения предыдущей отправки."
+        self.save_completed = self.route_is_ready and not self.partial_has_batches
         self._refresh_options()
+
+    def prepare_partial_loading(self):
+        if not self.partial_send_stores or self.partial_blocker:
+            return
+        self._partial_revision = int(self.selected_record["revision"])
+        self._partial_order_id = self.selected_order_id
+        self._partial_route_key = self.selected_route_key
+        self._partial_operation_id = uuid.uuid4().hex
+        self.partial_dialog_names = [store["name"] for store in self.partial_send_stores]
+        self.partial_dialog_net_kg = self.partial_send_net_kg
+        self.partial_dialog_waiting_count = self.partial_waiting_count
+        self.partial_dialog_error = ""
+        self.partial_dialog_open = True
+
+    def set_partial_dialog_open(self, value: bool):
+        self.partial_dialog_open = value
+
+    def finish_partial_loading(self):
+        if not self.partial_dialog_open or not self._partial_operation_id:
+            return
+        if self.selected_order_id != self._partial_order_id or self.selected_route_key != self._partial_route_key:
+            self.partial_dialog_open = False
+            self.status = "Заказ или маршрут изменился. Выберите магазины заново."
+            return
+        try:
+            snapshot = driver_orders.release_partial_loading(
+                self._partial_order_id, self._partial_route_key, self._partial_revision,
+                self.principal, self._partial_operation_id,
+            )
+        except (driver_orders.DriverOrderError, OrderRecordError) as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.partial_dialog_error = str(error)
+            return
+        self.partial_dialog_open = False
+        self._partial_operation_id = ""
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.status = f"Отправка №{snapshot['batch_number']} опубликована: {len(snapshot['stores'])} магазинов. Остальные магазины можно загрузить позже."
 
     def _refresh_options(self):
         self.order_options = [
@@ -534,6 +596,16 @@ class LoadingState(rx.State):
         self.store_confirmed_count = 0
         self.store_confirmed_net_kg = "0"
         self.route_is_ready = False
+        self.partial_has_batches = False
+        self.partial_send_stores = []
+        self.partial_send_net_kg = "0"
+        self.partial_waiting_count = 0
+        self.partial_blocker = ""
+        self.partial_pending_publication = False
+        self.partial_dialog_open = False
+        self._partial_operation_id = ""
+        self._partial_order_id = ""
+        self._partial_route_key = ""
 
     def _apply_record(self, order_record_id: str, route_key: str = "") -> bool:
         if not order_record_id:
@@ -563,6 +635,10 @@ class LoadingState(rx.State):
         if self.selected_order_id != order_record_id or self.selected_route_key != selected_route_key:
             self.selected_store_id = ""
             self.store_search = ""
+            self.partial_dialog_open = False
+            self._partial_operation_id = ""
+            self._partial_order_id = ""
+            self._partial_route_key = ""
         self.selected_order_id = order_record_id
         self.selected_order_label = next(
             (item["label"] for item in self.order_options if item["id"] == order_record_id),
@@ -595,6 +671,18 @@ class LoadingState(rx.State):
         self.store_cards = _store_loading_cards(record, selected_route_key) if self.loading_mode == "stores" else []
         self.store_confirmed_count = sum(item["status"] == "loaded" for item in self.store_cards)
         self.store_confirmed_net_kg = _format_number(sum((Decimal(item["loaded_net_kg"] or "0") for item in self.store_cards), Decimal(0)))
+        batches = loading_batches(record, selected_route_key)
+        self.partial_has_batches = bool(batches)
+        self.partial_pending_publication = bool(batches and not driver_orders.loading_batch_published(batches[-1]))
+        if self.partial_pending_publication:
+            self.partial_send_stores = [store for store in self.store_cards if store["id"] in batches[-1]["destination_ids"]]
+        else:
+            self.partial_send_stores = [store for store in self.store_cards if store["status"] == "loaded" and not store["released"]]
+        if not batches and selected_route["ready"]:
+            self.partial_send_stores = []
+        self.partial_send_net_kg = _format_number(sum((Decimal(store["loaded_net_kg"] or "0") for store in self.partial_send_stores), Decimal(0)))
+        self.partial_waiting_count = sum(not store["released"] and store not in self.partial_send_stores for store in self.store_cards)
+        self.partial_blocker = driver_orders.partial_loading_blocker(order_record_id, selected_route_key) if self.partial_send_stores and not self.partial_pending_publication else ""
         self.selected_store_name = ""
         self.loading_rows = _loading_rows(record, selected_route_key, self.draft_measurements)
         if self.store_cards:
@@ -1052,12 +1140,52 @@ def _store_loading_selector():
             rx.text("Подтверждённое нетто сборки: ", LoadingState.store_confirmed_net_kg, " кг"),
             width="100%", wrap="wrap", spacing="3",
         ),
-        rx.text("Выберите любой магазин. Маршрут готов к отгрузке после подтверждения всех магазинов.", class_name="loading-panel-description"),
+        rx.text("Выберите любой магазин. Подтвердите все магазины для полной загрузки или отправьте подтверждённые магазины частично.", class_name="loading-panel-description"),
         rx.input(value=LoadingState.store_search, on_change=LoadingState.set_store_search, placeholder="Найти магазин", aria_label="Поиск магазина для загрузки", width="100%"),
         rx.cond(
             LoadingState.filtered_store_cards.length() > 0,
             rx.box(rx.foreach(LoadingState.filtered_store_cards, _store_loading_tile), class_name="loading-store-grid"),
             rx.text("Магазины по запросу не найдены. Измените поиск; выбранный магазин остаётся открытым."),
+        ),
+        width="100%", align="start", spacing="3",
+    )
+
+
+def _partial_loading_control():
+    return rx.vstack(
+        rx.cond(
+            LoadingState.partial_has_batches,
+            rx.text("Маршрут отправляется частями. Неотправленные магазины остаются в заказе и доступны для дальнейшей загрузки.", class_name="loading-panel-description"),
+            rx.box(),
+        ),
+        rx.cond(
+            LoadingState.partial_send_stores.length() > 0,
+            rx.vstack(
+                rx.text("К отправке: ", LoadingState.partial_send_stores.length(), " магазинов · ", LoadingState.partial_send_net_kg, " кг нетто. После неё останется: ", LoadingState.partial_waiting_count),
+                rx.button(
+                    rx.cond(LoadingState.partial_pending_publication, "Повторить публикацию отправки",
+                            rx.cond(LoadingState.partial_has_batches, "Отправить следующую загрузку", "Завершить загрузку частично")),
+                    on_click=LoadingState.prepare_partial_loading,
+                    disabled=LoadingState.partial_blocker != "", class_name="loading-primary",
+                ),
+                rx.cond(LoadingState.partial_blocker != "", rx.text(LoadingState.partial_blocker, class_name="loading-message", aria_live="polite"), rx.box()),
+                align="start", width="100%", spacing="2",
+            ), rx.box(),
+        ),
+        rx.alert_dialog.root(
+            rx.alert_dialog.content(
+                rx.alert_dialog.title("Отправить подтверждённые магазины?"),
+                rx.alert_dialog.description("Водителю будут доступны только магазины этой отправки. Остальные не отменяются и остаются ожидающими загрузки."),
+                rx.vstack(rx.foreach(LoadingState.partial_dialog_names, lambda name: rx.text(name)), spacing="1", align="start", margin_top="12px"),
+                rx.text("Подтверждённое нетто: ", LoadingState.partial_dialog_net_kg, " кг. Остаётся магазинов: ", LoadingState.partial_dialog_waiting_count, margin_top="12px"),
+                rx.cond(LoadingState.partial_dialog_error != "", rx.text(LoadingState.partial_dialog_error, color="red", role="alert"), rx.box()),
+                rx.hstack(
+                    rx.alert_dialog.cancel(rx.button("Отмена", variant="soft")),
+                    rx.button("Подтвердить отправку", on_click=LoadingState.finish_partial_loading),
+                    justify="end", wrap="wrap", margin_top="16px",
+                ),
+            ),
+            open=LoadingState.partial_dialog_open, on_open_change=LoadingState.set_partial_dialog_open,
         ),
         width="100%", align="start", spacing="3",
     )
@@ -1143,6 +1271,7 @@ def loading_page():
                                     rx.button("Подтвердить загрузку маршрута", on_click=LoadingState.save_loading, class_name="loading-primary"),
                                 ),
                             ),
+                            rx.cond(LoadingState.loading_mode == "stores", _partial_loading_control(), rx.box()),
                             rx.cond(LoadingState.loading_mode == "stores", _store_loading_reconciliation(), rx.box()),
                             rx.cond(LoadingState.status != "", rx.text(LoadingState.status, class_name="loading-message", aria_live="polite"), rx.box()),
                             rx.cond(
@@ -1165,7 +1294,7 @@ def loading_page():
                         align="start", spacing="3", width="100%", class_name="loading-empty-workspace",
                     ),
                 ),
-                rx.cond(LoadingState.route_is_ready, _shipment_progress(), rx.box()),
+                rx.cond(LoadingState.route_is_ready | LoadingState.partial_has_batches, _shipment_progress(), rx.box()),
                 rx.cond(LoadingState.shipment_status == "shipment_completed", _reconciliation(), rx.box()),
                 align="start", spacing="4", width="100%", class_name="loading-shell",
             ),

@@ -1,6 +1,7 @@
-const CACHE_NAME = "logistics-static-v6";
+const CACHE_NAME = "logistics-static-v7";
 const STATIC_ASSETS = [
   "/driver/",
+  "/crew/",
   "/manifest.webmanifest",
   "/icon-192.svg",
   "/icon-512.svg",
@@ -43,7 +44,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/")) return;
-  const cacheable = url.pathname === "/driver" || url.pathname === "/env.json"
+  const cacheable = url.pathname === "/driver" || url.pathname === "/crew" || url.pathname === "/env.json"
     || STATIC_ASSETS.includes(url.pathname)
     || ["script", "style", "image", "font"].includes(request.destination);
   if (!cacheable) return;
@@ -55,7 +56,7 @@ self.addEventListener("fetch", (event) => {
     return response;
   }).catch(async (error) => {
     const cached = await caches.match(request)
-      || (url.pathname === "/driver" ? await caches.match("/driver/") : null);
+      || (url.pathname === "/driver" || url.pathname === "/crew" ? await caches.match(url.pathname + "/") : null);
     if (cached) return cached;
     throw error;
   }));

@@ -360,11 +360,12 @@ def _normalize_route_loading(value: object) -> dict:
     status = str(value.get("status", "new"))
     return {
         "mode": "stores" if value.get("mode") == "stores" else "route",
-        "status": status if status in {"new", "draft", "loaded"} else "new",
+        "status": status if status in {"new", "draft", "partial", "loaded"} else "new",
         "last_saved_at": str(value.get("last_saved_at", "")),
         "last_saved_by": _actor(value.get("last_saved_by")),
         "confirmed_at": str(value.get("confirmed_at", "")),
         "confirmed_by": _actor(value.get("confirmed_by")),
+        "batches": deepcopy(value.get("batches", [])),
     }
 
 
@@ -445,17 +446,113 @@ def store_loading_measurements(record: dict, route_key: str, line_id: str) -> li
     ]
 
 
+def loading_batches(record: dict, route_key: str) -> list[dict]:
+    batches = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {}).get("batches", [])
+    if not isinstance(batches, list):
+        raise OrderRecordError("Некорректные отправки загрузки")
+    valid_stores = {str(destination.get("id", "")) for route in record.get("routes", [])
+                    if route.get("route_key") == route_key for destination in route.get("destinations", [])}
+    seen_ids, seen_stores, seen_operations = set(), set(), set()
+    for batch in batches:
+        if (not isinstance(batch, dict) or not isinstance(batch.get("id"), str) or not batch["id"]
+                or batch["id"] in seen_ids or not isinstance(batch.get("operation_id"), str)
+                or not batch["operation_id"] or batch["operation_id"] in seen_operations
+                or not isinstance(batch.get("source_assignment_id"), str) or not batch["source_assignment_id"]):
+            raise OrderRecordError("Некорректные отправки загрузки")
+        stores = batch.get("destination_ids")
+        if not isinstance(stores, list) or not stores or any(not isinstance(identity, str) or not identity for identity in stores):
+            raise OrderRecordError("Некорректный состав отправки")
+        if len(set(stores)) != len(stores) or seen_stores.intersection(stores) or not set(stores).issubset(valid_stores):
+            raise OrderRecordError("Магазин включён в несколько отправок или не относится к маршруту")
+        seen_ids.add(batch["id"])
+        seen_operations.add(batch["operation_id"])
+        seen_stores.update(stores)
+    return batches
+
+
+def loading_batch_destinations(record: dict, route_key: str, batch_id: str) -> list[dict]:
+    if route_loading_mode(record, route_key) != "stores":
+        raise OrderRecordConflict("Частичная отправка доступна только при загрузке по магазинам")
+    batch = next((item for item in loading_batches(record, route_key) if item["id"] == batch_id), None)
+    if batch is None:
+        raise OrderRecordNotFound("Отправка загрузки не найдена")
+    destinations = _store_loading_destinations(record, route_key)
+    selected = [item for item in destinations if item["id"] in batch["destination_ids"]]
+    if len(selected) != len(batch["destination_ids"]) or any(
+        (item.get("loading") or {}).get("status") != "loaded"
+        or not all(_store_measurement_ready((position.get("loading") or {}).get("measurement")) for position in item["positions"])
+        for item in selected
+    ):
+        raise OrderRecordConflict("Состав или измерения отправки изменились")
+    return selected
+
+
+def release_store_loading(order_record_id: str, revision: int, route_key: str,
+                          source_assignment_id: str, operation_id: str, actor: dict) -> dict:
+    if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
+        raise OrderRecordError("Некорректный идентификатор операции")
+    if not isinstance(source_assignment_id, str) or not source_assignment_id:
+        raise OrderRecordError("Нет водительского назначения маршрута")
+    if not isinstance(actor, dict) or actor.get("kind") not in {"loader", "dashboard"} or not actor.get("id"):
+        raise OrderRecordError("Нет доступа к отправке загрузки")
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        batches = loading_batches(record, route_key)
+        known = next((item for item in batches if item.get("operation_id") == operation_id), None)
+        if known:
+            if known.get("source_assignment_id") != source_assignment_id:
+                raise OrderRecordConflict("Операция относится к другому назначению")
+            return deepcopy(known)
+        _check_loading_revision(record, revision)
+        if route_loading_mode(record, route_key) != "stores":
+            raise OrderRecordConflict("Частичная отправка доступна только при загрузке по магазинам")
+        destinations = _store_loading_destinations(record, route_key)
+        released = {identity for batch in batches for identity in batch["destination_ids"]}
+        selected = [item for item in destinations if item["id"] not in released and (item.get("loading") or {}).get("status") == "loaded"]
+        if not selected:
+            raise OrderRecordConflict("Нет новых подтверждённых магазинов для отправки")
+        for destination in selected:
+            if any((position.get("shipment") or {}).get("status") == "completed" for position in destination["positions"]):
+                raise OrderRecordConflict("Магазин уже отгружен")
+            for position in destination["positions"]:
+                _validated_loading_measurement((position.get("loading") or {}).get("measurement"), require_zero_reason=True)
+        batch = {"id": uuid.uuid4().hex, "source_assignment_id": source_assignment_id,
+                 "destination_ids": [item["id"] for item in selected], "operation_id": operation_id,
+                 "created_at": _now(), "created_by": _actor(actor)}
+        _route_state(record, route_key).setdefault("batches", []).append(batch)
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(batch)
+
+
 def loading_line_net_weight(record: dict, line: dict) -> Decimal:
     """Confirmed route totals share the original loading-line identity in both modes."""
     route_key = str(line.get("route_key", ""))
-    if not (route_loading_ready(record, route_key) if route_key else _legacy_loading_ready(record)):
-        return Decimal(0)
+    batches = loading_batches(record, route_key)
+    if batches:
+        released = {identity for batch in batches for identity in batch["destination_ids"]}
+        destinations = [destination for destination in _store_loading_destinations(record, route_key) if destination["id"] in released]
+        if len(destinations) != len(released) or any(
+            (destination.get("loading") or {}).get("status") != "loaded"
+            or not all(_store_measurement_ready((position.get("loading") or {}).get("measurement")) for position in destination["positions"])
+            for destination in destinations
+        ):
+            raise OrderRecordConflict("Состав или измерения отправки изменились")
+        measurements = [(position.get("loading") or {}).get("measurement") or {}
+                        for destination in destinations for position in destination["positions"]
+                        if position.get("loading_line_id") == line["id"]]
+    else:
+        if not (route_loading_ready(record, route_key) if route_key else _legacy_loading_ready(record)):
+            return Decimal(0)
+        measurements = store_loading_measurements(record, route_key, str(line["id"])) if route_loading_mode(record, route_key) == "stores" else []
     if route_loading_mode(record, route_key) == "stores":
         with localcontext() as arithmetic:
             arithmetic.prec = 60
             return sum((
                 _decimal(_validated_loading_measurement(measurement, require_zero_reason=True)["net_weight_kg"], "Нетто")
-                for measurement in store_loading_measurements(record, route_key, str(line["id"]))
+                for measurement in measurements
             ), Decimal(0))
     measurement = line.get("measurement") or {}
     return _decimal(measurement["net_weight_kg"], "Нетто") if _loading_measurement_complete(measurement) else Decimal(0)
@@ -491,14 +588,22 @@ def route_loading_ready(record: dict, route_key: str) -> bool:
     )
 
 
-def route_return_balance(record: dict, route_key: str) -> dict:
+def route_return_balance(record: dict, route_key: str, loading_batch_id: str = "") -> dict:
     """Keep exact destination facts to detect incomplete two-file shipment saves."""
     routes = [route for route in record.get("routes", []) if route.get("route_key") == route_key]
     lines = _route_lines(record, route_key)
     if len(routes) != 1 or not lines:
         raise OrderRecordError("Нет надёжной связи загрузки с маршрутом")
-    if not route_loading_ready(record, route_key):
-        raise OrderRecordError("Склад ещё не подтвердил загрузку маршрута")
+    if loading_batch_id:
+        destinations = loading_batch_destinations(record, route_key, loading_batch_id)
+        selected_line_ids = {position["loading_line_id"] for destination in destinations for position in destination["positions"]}
+        lines = [line for line in lines if line["id"] in selected_line_ids]
+    else:
+        if loading_batches(record, route_key):
+            raise OrderRecordConflict("Для частичной загрузки выберите конкретную отправку")
+        if not route_loading_ready(record, route_key):
+            raise OrderRecordError("Склад ещё не подтвердил загрузку маршрута")
+        destinations = routes[0].get("destinations", [])
 
     def number(value, field):
         if len(str(value)) > 64:
@@ -537,17 +642,18 @@ def route_return_balance(record: dict, route_key: str) -> dict:
             line_id = str(line.get("id", ""))
             if not line_id or line_id in balances:
                 raise OrderRecordError("Некорректные идентификаторы загрузки")
+            positions = [position for destination in destinations for position in destination["positions"] if position.get("loading_line_id") == line_id]
             balances[line_id] = {
                 "loading_line_id": line_id, "name": str(line.get("name", "")),
-                "planned": number(line.get("planned_amount"), "Заказано"),
-                "loaded": sum((net(measurement) for measurement in store_loading_measurements(record, route_key, line_id)), Decimal(0))
+                "planned": sum((number(position.get("planned_amount"), "Заказано") for position in positions), Decimal(0)) if loading_batch_id else number(line.get("planned_amount"), "Заказано"),
+                "loaded": sum((net((position.get("loading") or {}).get("measurement")) for position in positions), Decimal(0))
                 if route_loading_mode(record, route_key) == "stores" else net(line.get("measurement")),
                 "shipped": Decimal("0"),
             }
         destination_facts = []
         destination_ids, position_ids, used_lines = set(), set(), set()
         complete = True
-        for destination in routes[0].get("destinations", []):
+        for destination in destinations:
             destination_id = str(destination.get("id", ""))
             if not destination_id or destination_id in destination_ids or not destination.get("positions"):
                 raise OrderRecordError("Некорректные связи магазинов маршрута")
@@ -563,6 +669,8 @@ def route_return_balance(record: dict, route_key: str) -> dict:
                 shipment = position.get("shipment") or {}
                 completed = shipment.get("status") == "completed"
                 shipped = net(shipment.get("measurement"), legacy=True) if completed else Decimal("0")
+                for visit in shipment.get("extra", []):
+                    shipped += net(visit.get("measurement"), legacy=True)
                 balances[line_id]["shipped"] += shipped
                 complete = complete and completed
                 facts.append({"id": position_id, "loading_line_id": line_id,
@@ -588,8 +696,13 @@ def _refresh_overall_loading_status(record: dict) -> None:
         return
     loading = record["loading"]
     states = loading["route_states"]
+    for route_key in route_keys:
+        if loading_batches(record, route_key) and states[route_key]["status"] != "loaded":
+            states[route_key]["status"] = "partial"
     if route_keys and all(route_loading_ready(record, route_key) for route_key in route_keys):
         loading["status"] = "loaded"
+    elif any(states[route_key]["status"] == "partial" for route_key in route_keys):
+        loading["status"] = "partial"
     elif any(states[route_key]["status"] != "new" for route_key in route_keys):
         loading["status"] = "draft"
     else:
@@ -659,7 +772,7 @@ def _normalize_legacy_record(record: dict) -> None:
             for route_key in route_keys
         },
     }
-    if record["loading"]["status"] not in {"new", "draft", "loaded"}:
+    if record["loading"]["status"] not in {"new", "draft", "partial", "loaded"}:
         record["loading"]["status"] = "new"
     _refresh_overall_loading_status(record)
     record.setdefault("revision", 0)
@@ -930,6 +1043,10 @@ def _destinations(record: dict):
 
 def shipment_status(record: dict) -> str:
     if not _record_loading_ready(record):
+        if any((position.get("shipment") or {}).get("status") == "completed" for _, destination in _destinations(record) for position in destination.get("positions", [])):
+            return "shipment_in_progress"
+        if any(loading_batches(record, route_key) for route_key in _route_keys(record)):
+            return "ready_for_shipment"
         return "waiting_loading"
     destinations = list(_destinations(record))
     if not destinations:
@@ -972,7 +1089,7 @@ def logistics_summary(record: dict) -> dict:
             continue
         route_key = str(loading_line.get("route_key", ""))
         ready = route_loading_ready(record, route_key) if route_key else _legacy_loading_ready(record)
-        if ready:
+        if ready or loading_batches(record, route_key):
             line["loaded"] += loading_line_net_weight(record, loading_line)
 
     for _, destination in _destinations(record):
@@ -985,6 +1102,9 @@ def logistics_summary(record: dict) -> dict:
             if line is None or shipment.get("status") != "completed" or not _shipment_measurement_complete(measurement):
                 continue
             line["shipped"] += _decimal(measurement["net_weight_kg"], "Чистый вес")
+            for visit in shipment.get("extra", []):
+                added = _validated_shipment_measurement(visit["measurement"])
+                line["shipped"] += _decimal(added["net_weight_kg"], "Чистый вес")
 
     items = []
     total_ordered = Decimal("0")
@@ -1047,7 +1167,11 @@ def list_route_trip_summaries(processed_date: str, mode: str) -> list[dict]:
             route_key = str(route.get("route_key", ""))
             lines = _route_lines(record, route_key)
             linked = bool(lines)
-            ready = linked and route_loading_ready(record, route_key)
+            batches = loading_batches(record, route_key)
+            released = {identity for batch in batches for identity in batch["destination_ids"]}
+            ready = linked and route_loading_ready(record, route_key) and all(
+                item["id"] in released for item in route.get("destinations", [])
+            ) if batches else linked and route_loading_ready(record, route_key)
             loading_status = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {}).get("status", "new")
             stores = []
             shipped_total = Decimal(0)
@@ -1079,11 +1203,13 @@ def list_route_trip_summaries(processed_date: str, mode: str) -> list[dict]:
                 stage = "Отгрузка идёт"
             elif ready:
                 stage = "Готов к отгрузке"
+            elif batches or loading_status == "partial":
+                stage = "Загружен частично"
             elif loading_status == "draft":
                 stage = "Загрузка начата"
             else:
                 stage = "Ожидает загрузки"
-            loaded = sum((loading_line_net_weight(record, line) for line in lines), Decimal(0)) if ready else None
+            loaded = sum((loading_line_net_weight(record, line) for line in lines), Decimal(0)) if ready or loading_batches(record, route_key) else None
             trips.append({
                 "order_record_id": str(record["id"]), "order_number": str(record.get("order_number", "")),
                 "client_name": str(record.get("client_name", "")), "processed_at": processed_at.astimezone().isoformat(),
@@ -1475,6 +1601,7 @@ def save_store_shipment(
     measurements: dict[str, object],
     operation_id: str,
     actor: dict,
+    loading_batch_id: str = "",
 ) -> dict:
     if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
         raise OrderRecordError("Некорректный идентификатор операции")
@@ -1484,7 +1611,13 @@ def save_store_shipment(
     with _LOCK:
         payload = _read_payload()
         record = _find_record(payload, order_record_id)
-        if not route_loading_ready(record, route_key):
+        if loading_batch_id:
+            allowed = {item["id"] for item in loading_batch_destinations(record, route_key, loading_batch_id)}
+            if destination_id not in allowed:
+                raise OrderRecordConflict("Магазин не включён в эту отправку загрузки")
+        elif loading_batches(record, route_key):
+            raise OrderRecordConflict("Для частичной загрузки выберите конкретную отправку")
+        elif not route_loading_ready(record, route_key):
             raise OrderRecordConflict("Склад ещё не подтвердил загрузку маршрута")
         _, destination = _find_destination(record, route_key, destination_id)
         positions = destination.get("positions")
@@ -1514,6 +1647,39 @@ def save_store_shipment(
                 "measurement": _validated_shipment_measurement(measurements[str(position["id"])]),
             }
 
+        record["revision"] += 1
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def append_store_shipment(order_record_id: str, route_key: str, destination_id: str,
+                          measurements: dict[str, object], operation_id: str, actor: dict) -> dict:
+    """Record a later visit without overwriting the first delivery."""
+    if not isinstance(operation_id, str) or not operation_id or len(operation_id) > MAX_OPERATION_ID_LENGTH:
+        raise OrderRecordError("Некорректный идентификатор операции")
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        _, destination = _find_destination(record, route_key, destination_id)
+        positions = destination.get("positions", [])
+        if not isinstance(measurements, dict) or set(measurements) != {str(position["id"]) for position in positions}:
+            raise OrderRecordError("Заполните отгрузку для каждой позиции")
+        validated = {identity: _validated_shipment_measurement(value) for identity, value in measurements.items()}
+        if any((position.get("shipment") or {}).get("status") != "completed" for position in positions):
+            raise OrderRecordConflict("Первую поставку магазина нужно записать отдельно")
+        if any(position["shipment"].get("operation_id") == operation_id for position in positions):
+            raise OrderRecordConflict("Операция уже записана как первая поставка")
+        present = [next((item for item in (position.get("shipment") or {}).get("extra", []) if item.get("operation_id") == operation_id), None)
+                   for position in positions]
+        if any(present):
+            if not all(present) or any(item["measurement"] != validated[str(position["id"])] for position, item in zip(positions, present)):
+                raise OrderRecordConflict("Повторная поставка содержит другие данные")
+            return deepcopy(record)
+        when = _now()
+        by = _actor(actor)
+        for position in positions:
+            position["shipment"].setdefault("extra", []).append({"operation_id": operation_id, "completed_at": when,
+                                                                 "completed_by": by, "measurement": validated[str(position["id"])]})
         record["revision"] += 1
         _atomic_write(payload)
         return deepcopy(record)

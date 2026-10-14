@@ -1,6 +1,6 @@
 /* Mount standalone cabinets only after Reflex hydrates the server-rendered page. */
 (() => {
-  const routes = {"/driver": ["driver-app", "/driver-app.js"], "/loader": ["loader-app", "/loader-app.js"]};
+  const routes = {"/driver": ["driver-app", "/driver-app.js"], "/crew": ["driver-app", "/driver-app.js"], "/loader": ["loader-app", "/loader-app.js"]};
   const config = routes[window.location.pathname.replace(/\/$/, "")];
   if (!config || window.__logisticsCabinetBootstrap) return;
   window.__logisticsCabinetBootstrap = true;

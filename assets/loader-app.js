@@ -49,7 +49,7 @@ function themePreference() {
 function appHeader(showLogout = false) {
   return `<header class="driver-app-header">
     <a class="driver-brand" href="/loader" aria-label="Dostavo.online">
-      <span class="driver-brand-mark"><img src="/icon-192.svg" alt="" aria-hidden="true"></span><strong>dostavo.online</strong><span class="driver-brand-subtitle">Кабинет грузчика</span>
+      <span class="driver-brand-mark"><img src="/icon-192.svg" alt="" aria-hidden="true"></span><strong>Доставка</strong><span class="driver-brand-subtitle">Кабинет грузчика</span>
     </a>
     <div class="driver-header-actions">
       <label class="driver-theme-control">Тема<select data-theme-select aria-label="Тема оформления">
@@ -145,7 +145,7 @@ function renderOrders() {
     <div class="loader-app-frame"><div class="driver-app-frame">
       ${appHeader(true)}
       <main class="driver-shell">
-        <header class="driver-header"><div><h1>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Выбранная машина")}</h1><p class="driver-muted">Заказы доступны только для этой машины</p></div><div><button data-loading class="driver-secondary">Загрузка</button> <button data-change class="driver-secondary">Сменить</button></div></header>
+        <header class="driver-header"><div><h1>${esc([vehicle.name, vehicle.plate].filter(Boolean).join(" · ") || "Выбранная машина")}</h1><p class="driver-muted">Заказы доступны только для этой машины</p></div><div><a href="/crew" class="driver-primary">Рейс и магазины</a> <button data-loading class="driver-secondary">Загрузка</button> <button data-change class="driver-secondary">Сменить</button></div></header>
         <p data-message class="driver-message"></p>
         <div class="driver-store-list">${assignments.map(assignmentCard).join("") || "<p class=\"driver-muted\">Для машины нет текущих назначений</p>"}</div>
       </main>

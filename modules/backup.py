@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sqlite3
 from contextlib import ExitStack
@@ -49,6 +50,9 @@ _BACKUP_RELATIVE_FILES = (
     "config/backup.json",
 )
 _KNOWN_RELATIVE_FILES = frozenset(_BACKUP_RELATIVE_FILES)
+_DRIVER_ORDER_PREFIX = "data/driver_orders/"
+_DRIVER_ORDER_NAME = re.compile(r"(?:index|[0-9a-f]{24})\.json\Z")
+_MAX_DRIVER_ORDER_FILES = 10000
 
 
 class BackupError(RuntimeError):
@@ -170,6 +174,30 @@ def save_backup_directory(
     return resolved
 
 
+def _driver_order_member(relative: str) -> bool:
+    return relative.startswith(_DRIVER_ORDER_PREFIX) and bool(_DRIVER_ORDER_NAME.fullmatch(relative[len(_DRIVER_ORDER_PREFIX):]))
+
+
+def _driver_order_paths(root: Path) -> list[tuple[str, Path]]:
+    folder = root / "data/driver_orders"
+    if folder.is_symlink():
+        raise BackupError("Каталог назначений водителей является символической ссылкой")
+    if not folder.is_dir():
+        return []
+    result = []
+    for path in folder.iterdir():
+        relative = _DRIVER_ORDER_PREFIX + path.name
+        if not _driver_order_member(relative):
+            continue
+        if path.is_symlink():
+            raise BackupError(f"Файл состояния является символической ссылкой: {relative}")
+        if path.is_file():
+            result.append((relative, path))
+    if len(result) > _MAX_DRIVER_ORDER_FILES:
+        raise BackupError("Слишком много файлов назначений водителей для резервной копии")
+    return sorted(result)
+
+
 def _tracked_paths(root: Path) -> list[tuple[str, Path]]:
     return [(relative, root / Path(*relative.split("/"))) for relative in _BACKUP_RELATIVE_FILES]
 
@@ -217,20 +245,7 @@ def create_backup(
     except OSError as exc:
         raise BackupError(f"Не удалось открыть папку резервных копий: {exc}") from exc
 
-    present = _present_files(root)
     now = datetime.now().astimezone()
-    tracked = [
-        {"path": relative, "present": any(relative == item[0] for item in present)}
-        for relative, _path in _tracked_paths(root)
-    ]
-    manifest = {
-        "format_version": BACKUP_FORMAT_VERSION,
-        "app_version": APP_VERSION,
-        "created_at": now.isoformat(),
-        "reason": str(reason or "вручную"),
-        "files": tracked,
-    }
-
     archive_path = _next_archive_path(directory, now)
     temporary = None
 
@@ -254,6 +269,23 @@ def create_backup(
                     source.backup(target)
                 source.close()
                 target.close()
+            from modules import driver_orders, goods_returns, order_records
+            for lock in (goods_returns._LOCK, order_records._LOCK, driver_orders._LOCK):
+                stack.enter_context(lock)
+            present = [*_present_files(root), *_driver_order_paths(root)]
+            if sum(path.stat().st_size for _, path in present) > MAX_BACKUP_UNCOMPRESSED_BYTES:
+                raise BackupError("Размер данных для резервной копии превышает допустимый предел")
+            included = {relative for relative, _ in present}
+            tracked = [{"path": relative, "present": relative in included} for relative, _ in _tracked_paths(root)]
+            tracked.extend({"path": relative, "present": True} for relative, _ in present if _driver_order_member(relative))
+            manifest = {
+                "driver_orders_included": True,
+                "format_version": BACKUP_FORMAT_VERSION,
+                "app_version": APP_VERSION,
+                "created_at": now.isoformat(),
+                "reason": str(reason or "вручную"),
+                "files": tracked,
+            }
             with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr(
                     "manifest.json",
@@ -326,7 +358,10 @@ def _read_archive(archive_path: str | Path) -> tuple[dict, dict[str, bytes]]:
                 raise BackupError("Версия формата резервной копии не поддерживается.")
 
             entries = manifest.get("files")
-            if not isinstance(entries, list) or len(entries) not in {len(_BACKUP_RELATIVE_FILES), len(_BACKUP_RELATIVE_FILES) - 1}:
+            includes_orders = manifest.get("driver_orders_included", False)
+            if (not isinstance(includes_orders, bool) or not isinstance(entries, list)
+                    or len(entries) < len(_BACKUP_RELATIVE_FILES) - 1
+                    or len(entries) > len(_BACKUP_RELATIVE_FILES) + _MAX_DRIVER_ORDER_FILES):
                 raise BackupError("В manifest.json указан неполный список файлов.")
 
             states: dict[str, bool] = {}
@@ -334,13 +369,14 @@ def _read_archive(archive_path: str | Path) -> tuple[dict, dict[str, bytes]]:
                 if not isinstance(entry, dict):
                     raise BackupError("Некорректная запись файла в manifest.json.")
                 relative = _validate_member_name(entry.get("path"))
-                if relative not in _KNOWN_RELATIVE_FILES or relative in states:
+                if (relative not in _KNOWN_RELATIVE_FILES and not (includes_orders and _driver_order_member(relative))) or relative in states:
                     raise BackupError("manifest.json содержит неизвестный или повторный путь.")
-                if not isinstance(entry.get("present"), bool):
+                if not isinstance(entry.get("present"), bool) or (_driver_order_member(relative) and not entry["present"]):
                     raise BackupError("В manifest.json отсутствует признак наличия файла.")
                 states[relative] = entry["present"]
 
-            if set(states) not in (_KNOWN_RELATIVE_FILES, _KNOWN_RELATIVE_FILES - {"data/vehicle_trips.sqlite3"}):
+            core = set(states) & _KNOWN_RELATIVE_FILES
+            if core not in (_KNOWN_RELATIVE_FILES, _KNOWN_RELATIVE_FILES - {"data/vehicle_trips.sqlite3"}):
                 raise BackupError("manifest.json не описывает все файлы состояния.")
             if "data/vehicle_trips.sqlite3" not in states:
                 states["data/vehicle_trips.sqlite3"] = False
@@ -375,9 +411,20 @@ def _read_archive(archive_path: str | Path) -> tuple[dict, dict[str, bytes]]:
                 connection.close()
             continue
         try:
-            json.loads(payload.decode("utf-8"))
+            document = json.loads(payload.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise BackupError(f"Файл {relative} в архиве повреждён.") from exc
+        if _driver_order_member(relative):
+            from modules import driver_orders
+            identity = relative.removeprefix(_DRIVER_ORDER_PREFIX).removesuffix(".json")
+            valid = (isinstance(document, dict) and document.get("schema_version") == driver_orders.SCHEMA_VERSION)
+            if identity == "index":
+                valid = (isinstance(document, dict) and document.get("schema_version") == driver_orders.INDEX_SCHEMA_VERSION
+                         and isinstance(document.get("active"), dict) and isinstance(document.get("publications"), list))
+            else:
+                valid = valid and document.get("assignment_id") == identity
+            if not valid:
+                raise BackupError(f"Файл {relative} в архиве повреждён.")
 
     return manifest, payloads
 
@@ -453,6 +500,7 @@ def restore_backup(
     archive = _safe_archive_path(archive_path)
     manifest, payloads = _read_archive(archive)
     states = {entry["path"]: entry["present"] for entry in manifest["files"]}
+    current_driver_orders = _driver_order_paths(root) if manifest.get("driver_orders_included") else []
 
     # Prepare every replacement before changing a live file. This also ensures
     # an unreadable destination is reported before the first os.replace call.
@@ -500,6 +548,10 @@ def restore_backup(
                 continue
             target = root / Path(*relative.split("/"))
             if target.exists() or target.is_symlink():
+                target.unlink()
+                removed.append(relative)
+        for relative, target in current_driver_orders:
+            if relative not in states:
                 target.unlink()
                 removed.append(relative)
         sqlite_target = root / "data/vehicle_trips.sqlite3"

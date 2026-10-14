@@ -27,6 +27,7 @@ from modules import (
     driver_orders,
     driver_sessions,
     goods_returns,
+    order_records,
     vehicle_trips,
     loader_sessions,
     gdemoi,
@@ -72,6 +73,8 @@ from modules.order_records import (
     list_route_trip_summaries,
     load_order_record,
     logistics_summary,
+    loading_batch_destinations,
+    loading_batches,
     route_loading_ready,
     save_store_shipment,
 )
@@ -293,6 +296,16 @@ async def _json_payload(request: Request) -> dict | None:
 
 
 def _session(request: Request, mutate: bool = False):
+    if request.url.path.startswith("/api/crew/"):
+        session, error = _loader_session(request, mutate=mutate)
+        if error:
+            return None, error
+        vehicle_id = str(session.get("vehicle_id", ""))
+        if vehicle_id not in {item["id"] for item in _loader_available_vehicles()}:
+            return None, JSONResponse({"ok": False, "error": "Сначала выберите машину в кабинете грузчика"}, status_code=409)
+        if request.headers.get("x-driver-cache-key") not in (None, session["loader_id"]):
+            return None, JSONResponse({"ok": False, "error": "Недействительный запрос"}, status_code=403)
+        return {**session, "kind": "loader", "driver_id": session["loader_id"]}, None
     token = request.cookies.get(driver_sessions.SESSION_COOKIE)
     session = driver_sessions.get_session(token)
     if session is None:
@@ -366,13 +379,23 @@ def _set_loader_cookie(response: JSONResponse, request: Request, token: str) -> 
 
 
 def _assignment_for_session(session: dict) -> dict | None:
+    if session.get("kind") == "loader":
+        trip = vehicle_trips.active_for_vehicle(str(session.get("vehicle_id", "")))
+        return vehicle_trips.as_assignment(trip) if trip else None
     driver_id = str(session.get("driver_id", ""))
     trip = vehicle_trips.active_for_driver(driver_id)
     if trip:
         return vehicle_trips.as_assignment(trip)
-    assignment = driver_orders.find_assignment_for_driver(driver_id)
+    selected_vehicle = session.get("vehicle_id", "")
+    if selected_vehicle:
+        candidates = [item for item in driver_orders.assignments_for_vehicle(selected_vehicle) if item.get("driver_id") == driver_id]
+        assignment = max(candidates, key=lambda item: item.get("created_at", ""), default=None)
+    else:
+        assignment = driver_orders.find_assignment_for_driver(driver_id)
     linked = vehicle_trips.trip_for_assignment(assignment["assignment_id"]) if assignment else None
-    return vehicle_trips.as_assignment(linked) if linked else assignment
+    if linked:
+        return vehicle_trips.as_assignment(linked) if linked["status"] in {"draft", "active", "on_base", "return_pending"} else None
+    return assignment
 
 
 def _public_driver_assignment(assignment: dict | None) -> dict | None:
@@ -397,8 +420,22 @@ def _public_driver_assignment(assignment: dict | None) -> dict | None:
         payload["loading_status"] = "record_unavailable"
         payload["shipment_status"] = "record_unavailable"
         return payload
-    route_ready = route_loading_ready(record, str(assignment.get("route_key", "")))
-    payload["loading_status"] = "loaded" if route_ready else "waiting_loading"
+    route_key = str(assignment.get("route_key", ""))
+    batch_id = str(assignment.get("loading_batch_id", ""))
+    try:
+        if batch_id:
+            destinations = loading_batch_destinations(record, route_key, batch_id)
+            route_ready = {store.get("order_record_destination_id") for store in assignment["stores"]} == {item["id"] for item in destinations}
+            batches = loading_batches(record, route_key)
+            released = {identity for batch in batches for identity in batch["destination_ids"]}
+            route = next((item for item in record["routes"] if item["route_key"] == route_key), {})
+            payload["waiting_store_count"] = sum(item["id"] not in released for item in route.get("destinations", []))
+            payload["loading_status"] = "partial" if route_ready else "waiting_loading"
+        else:
+            route_ready = route_loading_ready(record, route_key) and not loading_batches(record, route_key)
+            payload["loading_status"] = "loaded" if route_ready else "waiting_loading"
+    except OrderRecordError:
+        payload["loading_status"] = "record_unavailable"
     payload["shipment_status"] = summary["shipment_status"]
     return payload
 
@@ -416,10 +453,11 @@ async def driver_returns(request: Request):
         return error
     try:
         driver_id = str(session["driver_id"])
-        driver_trips = vehicle_trips.list_trips(driver_id)
-        documents = [item for item in goods_returns.list_returns() if item["driver_id"] == driver_id]
+        driver_trips = ([item for item in vehicle_trips.list_trips() if item["vehicle_id"] == session["vehicle_id"]]
+                        if session.get("kind") == "loader" else vehicle_trips.list_trips(driver_id))
+        documents = [] if session.get("kind") == "loader" else [item for item in goods_returns.list_returns() if item["driver_id"] == driver_id]
         documents.extend(doc for trip in driver_trips for doc in trip["returns"])
-        trip_assignments = [{"assignment_id": trip["id"], "trip_id": trip["id"], "route_label": "Рейс машины · " + ", ".join(item["route_label"] for item in trip["members"]), "order_number": trip["date"], "created_at": trip["created_at"]} for trip in driver_trips]
+        trip_assignments = [{"assignment_id": trip["id"], "trip_id": trip["id"], "route_label": "Рейс машины · " + (trip.get("route_label") or ", ".join(item["route_label"] for item in trip["members"])), "order_number": trip["date"], "created_at": trip["created_at"]} for trip in driver_trips]
         assignments = [
             {
                 "assignment_id": item["assignment_id"],
@@ -465,6 +503,8 @@ async def driver_return_detail(request: Request):
 
 
 def _mileage_status(session: dict, assignment: dict | None = None) -> dict:
+    if session.get("kind") == "loader":
+        return {"required": False, "available": False, "reason": "loader"}
     assignment = assignment if assignment is not None else _assignment_for_session(session)
     if assignment is None:
         return {"required": False, "available": False, "reason": "assignment_missing"}
@@ -534,31 +574,55 @@ async def driver_login(request: Request):
 
 async def driver_logout(request: Request):
     session, error = _session(request, mutate=True)
+    cookie_name = loader_sessions.SESSION_COOKIE if request.url.path.startswith("/api/crew/") else driver_sessions.SESSION_COOKIE
     if error:
         if error.status_code == 401:
-            error.delete_cookie(driver_sessions.SESSION_COOKIE, path="/")
+            error.delete_cookie(cookie_name, path="/")
         return error
-    token = request.cookies.get(driver_sessions.SESSION_COOKIE)
-    driver_sessions.destroy_session(token)
+    token = request.cookies.get(cookie_name)
+    if session.get("kind") == "loader":
+        loader_sessions.destroy_session(token)
+    else:
+        driver_sessions.destroy_session(token)
     response = JSONResponse({"ok": True})
-    response.delete_cookie(driver_sessions.SESSION_COOKIE, path="/")
+    response.delete_cookie(cookie_name, path="/")
     return response
+
+
+def _driver_available_vehicles(driver_id: str) -> list[dict]:
+    current = vehicle_trips.active_for_driver(driver_id)
+    sources = [current] if current else [item for item in driver_orders._snapshots(active_only=True) if item.get("driver_id") == driver_id]
+    vehicles = {item["vehicle_id"]: {"id": item["vehicle_id"], "name": item.get("vehicle_name", ""), "plate": item.get("vehicle_plate", "")}
+                for item in sources if item.get("vehicle_id")}
+    return list(vehicles.values())
+
+
+async def driver_select_vehicle(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    payload = await _json_payload(request)
+    vehicle_id = str((payload or {}).get("vehicle_id", ""))
+    if vehicle_id not in {item["id"] for item in _driver_available_vehicles(session["driver_id"])}:
+        return JSONResponse({"ok": False, "error": "Машина не назначена этому водителю"}, status_code=404)
+    driver_sessions.select_vehicle(request.cookies.get(driver_sessions.SESSION_COOKIE), vehicle_id)
+    return JSONResponse({"ok": True, "vehicle_id": vehicle_id})
 
 
 async def driver_me(request: Request):
     session, error = _session(request)
     if error:
         return error
-    driver = next(
-        (item for item in load_fleet().get("drivers", []) if item.get("id") == session["driver_id"]),
-        None,
-    )
+    driver = loader_by_id(session["driver_id"]) if session.get("kind") == "loader" else driver_by_id(session["driver_id"])
     if driver is None or not driver.get("active"):
         return JSONResponse({"ok": False, "error": "Профиль недоступен"}, status_code=401)
     assignment = _assignment_for_session(session)
     return JSONResponse({
         "ok": True,
         "driver": {"id": driver.get("id", ""), "name": driver.get("name", "")},
+        "role": session.get("kind", "driver"),
+        "vehicles": _loader_available_vehicles() if session.get("kind") == "loader" else _driver_available_vehicles(session["driver_id"]),
+        "vehicle_id": assignment.get("vehicle_id", "") if assignment else session.get("vehicle_id", ""),
         "csrf_token": session["csrf_token"],
         "assignment": _public_driver_assignment(assignment),
         "mileage": _mileage_status(session, assignment),
@@ -716,56 +780,62 @@ async def driver_complete_store(request: Request):
                 return JSONResponse(
                     {"ok": False, "error": "Рейс не связан с позициями заказа"}, status_code=409
                 )
-            if legacy_quantities:
-                record_measurements[position_id] = {
-                    "legacy_net_weight_kg": measurements[line_id]
-                }
-            else:
-                record_measurements[position_id] = measurements[line_id]
-        try:
-            save_store_shipment(
-                record_id,
-                str(assignment.get("route_key", "")),
-                str(store.get("order_record_destination_id", "")),
-                record_measurements,
-                operation_id,
-                {
-                    "kind": "driver",
-                    "id": str(session.get("driver_id", "")),
-                    "name": str(assignment.get("driver_name", "")),
-                },
+            record_measurements[position_id] = (
+                {"legacy_net_weight_kg": measurements[line_id]} if legacy_quantities else measurements[line_id]
             )
-        except OrderRecordNotFound as not_found:
-            return JSONResponse({"ok": False, "error": str(not_found)}, status_code=404)
-        except OrderRecordConflict as conflict:
-            return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
-        except OrderRecordError as invalid:
-            return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
-
     try:
-        result = driver_orders.complete_store(
-            driver_orders.sidecar_path(assignment["assignment_id"]),
-            store_id,
-            measurements,
-            operation_id,
-            payload.get("base_revision", -1),
-            photo,
-            legacy_quantities=legacy_quantities,
-        )
-    except DriverOrderConflict as conflict:
-        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
-    except DriverOrderNotFound as not_found:
+        with order_records._LOCK, driver_orders._LOCK:
+            latest = driver_orders.load_snapshot(assignment["assignment_id"])
+            if not any(op.get("operation_id") == operation_id for op in latest.get("operations", [])) and latest["revision"] != payload.get("base_revision", -1):
+                return JSONResponse({"ok": False, "error": "Заказ уже изменён на другом устройстве"}, status_code=409)
+            if record_id:
+                save_store_shipment(
+                    record_id,
+                    str(assignment.get("route_key", "")),
+                    str(store.get("order_record_destination_id", "")),
+                    record_measurements,
+                    operation_id,
+                    {
+                        "kind": "driver",
+                        "id": str(session.get("driver_id", "")),
+                        "name": str(assignment.get("driver_name", "")),
+                    },
+                    **({"loading_batch_id": assignment["loading_batch_id"]} if assignment.get("loading_batch_id") else {}),
+                )
+            result = driver_orders.complete_store(
+                driver_orders.sidecar_path(assignment["assignment_id"]),
+                store_id,
+                measurements,
+                operation_id,
+                payload.get("base_revision", -1),
+                photo,
+                legacy_quantities=legacy_quantities,
+            )
+    except (OrderRecordNotFound, DriverOrderNotFound) as not_found:
         return JSONResponse({"ok": False, "error": str(not_found)}, status_code=404)
-    except DriverOrderError as invalid:
+    except (OrderRecordConflict, DriverOrderConflict) as conflict:
+        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+    except (OrderRecordError, DriverOrderError) as invalid:
         return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
     return JSONResponse({"ok": True, "assignment": _public_driver_assignment(result)})
 
 
 def _owned_trip(session: dict, trip_id: str) -> dict:
     trip = vehicle_trips.load_trip(trip_id)
-    if trip["driver_id"] != str(session["driver_id"]):
+    if session.get("kind") == "loader":
+        if trip["vehicle_id"] != str(session.get("vehicle_id", "")):
+            raise vehicle_trips.TripNotFound("Рейс не найден")
+    elif trip["driver_id"] != str(session["driver_id"]):
         raise vehicle_trips.TripNotFound("Рейс не найден")
     return trip
+
+
+def _trip_actor(session: dict, trip: dict) -> dict:
+    if session.get("kind") == "loader":
+        loader = loader_by_id(session["loader_id"])
+        return {"kind": "loader", "id": session["loader_id"], "name": loader.get("name", "") if loader else "",
+                "vehicle_id": session["vehicle_id"]}
+    return {"kind": "driver", "id": session["driver_id"], "name": trip["driver_name"]}
 
 
 async def driver_trip_detail(request: Request):
@@ -791,7 +861,7 @@ async def driver_trip_complete(request: Request):
         payload = await _json_payload(request)
         if payload is None or payload.get("trip_id") != trip["id"] or payload.get("assignment_id") != trip["id"]:
             raise vehicle_trips.TripConflict("Операция относится к другому рейсу")
-        trip = vehicle_trips.complete_stop(trip["id"], request.path_params["stop_id"], payload, {"kind": "driver", "id": str(session["driver_id"]), "name": trip["driver_name"]})
+        trip = vehicle_trips.complete_stop(trip["id"], request.path_params["stop_id"], payload, _trip_actor(session, trip))
         return JSONResponse({"ok": True, "assignment": vehicle_trips.as_assignment(trip)})
     except vehicle_trips.TripNotFound as missing:
         return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
@@ -813,7 +883,7 @@ async def driver_trip_return(request: Request):
             payload = await _json_payload(request)
             if payload is None:
                 raise vehicle_trips.TripError("Некорректный запрос")
-            document = vehicle_trips.submit_return(trip["id"], payload, {"kind": "driver", "id": str(session["driver_id"]), "name": trip["driver_name"]})
+            document = vehicle_trips.submit_return(trip["id"], payload, _trip_actor(session, trip))
             result = {"ok": True, "document": document}
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except vehicle_trips.TripNotFound as missing:
@@ -821,6 +891,44 @@ async def driver_trip_return(request: Request):
     except vehicle_trips.TripConflict as conflict:
         return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
     except (vehicle_trips.TripError, goods_returns.GoodsReturnError, OrderRecordError) as invalid:
+        return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
+
+
+async def driver_trip_operate(request: Request):
+    session, error = _session(request, mutate=True)
+    if error:
+        return error
+    try:
+        trip = _owned_trip(session, request.path_params["trip_id"])
+        payload = await _json_payload(request)
+        if payload is None or payload.get("trip_id") != trip["id"]:
+            raise vehicle_trips.TripError("Операция относится к другому рейсу")
+        revision = payload.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise vehicle_trips.TripError("Укажите версию рейса")
+        operation_id = payload.get("operation_id")
+        actor = _trip_actor(session, trip)
+        action = request.path_params["action"]
+        if action == "resume":
+            mileage_error = _mileage_required_response(session, vehicle_trips.as_assignment(trip))
+            if mileage_error:
+                return mileage_error
+        if action == "arrive":
+            trip = vehicle_trips.arrive_at_base(trip["id"], revision, actor, operation_id)
+        elif action == "check":
+            trip = vehicle_trips.check_before_departure(trip["id"], revision, payload.get("amounts"), actor, operation_id)
+        elif action == "resume":
+            trip = vehicle_trips.resume_trip(trip["id"], revision, actor, operation_id)
+        elif action == "unload-all":
+            trip = vehicle_trips.unload_all(trip["id"], revision, payload.get("occurred_at"), payload.get("note", ""), actor, operation_id)
+        else:
+            return JSONResponse({"ok": False, "error": "Неизвестное действие"}, status_code=404)
+        return JSONResponse({"ok": True, "assignment": vehicle_trips.as_assignment(trip)})
+    except vehicle_trips.TripNotFound as missing:
+        return JSONResponse({"ok": False, "error": str(missing)}, status_code=404)
+    except vehicle_trips.TripConflict as conflict:
+        return JSONResponse({"ok": False, "error": str(conflict)}, status_code=409)
+    except (vehicle_trips.TripError, OrderRecordError) as invalid:
         return JSONResponse({"ok": False, "error": str(invalid)}, status_code=400)
 
 
@@ -1028,6 +1136,7 @@ custom_api = Starlette(routes=[
     Route("/api/driver/login", driver_login, methods=["POST"]),
     Route("/api/driver/logout", driver_logout, methods=["POST"]),
     Route("/api/driver/me", driver_me, methods=["GET"]),
+    Route("/api/driver/vehicle", driver_select_vehicle, methods=["POST"]),
     Route("/api/driver/mileage", driver_mileage_submit, methods=["POST"]),
     Route("/api/driver/order", driver_order, methods=["GET"]),
     Route("/api/driver/order/stores/{store_id}/complete", driver_complete_store, methods=["POST"]),
@@ -1035,6 +1144,17 @@ custom_api = Starlette(routes=[
     Route("/api/driver/trips/{trip_id}", driver_trip_detail, methods=["GET"]),
     Route("/api/driver/trips/{trip_id}/stops/{stop_id}/complete", driver_trip_complete, methods=["POST"]),
     Route("/api/driver/trips/{trip_id}/returns", driver_trip_return, methods=["GET", "POST"]),
+    Route("/api/driver/trips/{trip_id}/{action}", driver_trip_operate, methods=["POST"]),
+    Route("/api/driver/returns", driver_returns, methods=["GET"]),
+    Route("/api/crew/logout", driver_logout, methods=["POST"]),
+    Route("/api/crew/me", driver_me, methods=["GET"]),
+    Route("/api/crew/order", driver_order, methods=["GET"]),
+    Route("/api/crew/sync", driver_sync, methods=["POST"]),
+    Route("/api/crew/trips/{trip_id}", driver_trip_detail, methods=["GET"]),
+    Route("/api/crew/trips/{trip_id}/stops/{stop_id}/complete", driver_trip_complete, methods=["POST"]),
+    Route("/api/crew/trips/{trip_id}/returns", driver_trip_return, methods=["GET", "POST"]),
+    Route("/api/crew/trips/{trip_id}/{action}", driver_trip_operate, methods=["POST"]),
+    Route("/api/crew/returns", driver_returns, methods=["GET"]),
     Route("/api/driver/returns", driver_returns, methods=["GET"]),
     Route("/api/driver/returns/{assignment_id}", driver_return_detail, methods=["GET", "POST"]),
     Route("/api/loader/login", loader_login, methods=["POST"]),
@@ -1254,7 +1374,7 @@ class TemplateStoreView(TypedDict):
     selected: bool
 
 
-DISPATCH_STAGES = ["Все", "Ожидает загрузки", "Загрузка начата", "Готов к отгрузке", "Отгрузка идёт", "Отгрузка завершена"]
+DISPATCH_STAGES = ["Все", "Ожидает загрузки", "Загрузка начата", "Загружен частично", "Готов к отгрузке", "Отгрузка идёт", "Отгрузка завершена"]
 
 
 class DispatchStoreView(TypedDict):
@@ -1645,6 +1765,7 @@ class State(rx.State):
     today_shipping: int = 0
     today_completed: int = 0
     today_returns: int = 0
+    pending_trip_unloads: int = 0
     today_error: str = ""
 
     def toggle_sidebar(self):
@@ -1673,10 +1794,11 @@ class State(rx.State):
             trips = list_route_trip_summaries(datetime.now().astimezone().date().isoformat(), self.today_mode)
             self.today_waiting = sum(t["stage"] == "Ожидает загрузки" for t in trips)
             self.today_drafts = sum(t["stage"] == "Загрузка начата" for t in trips)
-            self.today_ready = sum(t["stage"] == "Готов к отгрузке" for t in trips)
+            self.today_ready = sum(t["stage"] in {"Готов к отгрузке", "Загружен частично"} for t in trips)
             self.today_shipping = sum(t["stage"] == "Отгрузка идёт" for t in trips)
             self.today_completed = sum(t["stage"] == "Отгрузка завершена" for t in trips)
             self.today_returns = sum(doc.get("status") == "submitted" for doc in goods_returns.list_returns())
+            self.pending_trip_unloads = sum(trip["status"] == "released_pending" for trip in vehicle_trips.list_trips())
         except (OrderRecordError, goods_returns.GoodsReturnError, OSError, ValueError) as error:
             self.today_error = f"Не удалось обновить обзор: {error}"
 
@@ -2788,7 +2910,8 @@ class State(rx.State):
     def dispatch_filtered_trips(self) -> list[DispatchTripView]:
         query = self.search_query.strip().casefold()
         return [trip for trip in self.dispatch_trips
-                if (self.dispatch_stage == "Все" or trip["stage"] == self.dispatch_stage)
+                if (self.dispatch_stage == "Все" or trip["stage"] == self.dispatch_stage
+                    or (self.dispatch_stage == "Готов к отгрузке" and trip["stage"] == "Загружен частично"))
                 and (not query or query in trip["search_text"])]
 
     @rx.var
@@ -5059,9 +5182,12 @@ def rail_item(item):
 
 
 def loading_rail_item():
-    return rx.el.button(design_icon("package", 18), rx.el.span("Загрузка и сверка", class_name="nav-text"),
-                        on_click=rx.redirect("/loading"), type="button", class_name="nav-item",
-                        title="Загрузка и сверка", aria_label="Загрузка и сверка")
+    return rx.fragment(
+        rx.el.a(design_icon("truck", 18), rx.el.span("Рейсы машин", class_name="nav-text"), href="/trips", class_name="nav-item", title="Рейсы машин"),
+        rx.el.button(design_icon("package", 18), rx.el.span("Загрузка и сверка", class_name="nav-text"),
+                     on_click=rx.redirect("/loading"), type="button", class_name="nav-item",
+                     title="Загрузка и сверка", aria_label="Загрузка и сверка"),
+    )
 
 
 def sidebar():
@@ -5629,6 +5755,10 @@ def overview_page():
     return design_page(
         design_heading("Сегодня", "Обзор рабочего дня", "Заказы, загрузка и отгрузка — всё в одном месте.",
                        design_button("Добавить заказ", State.set_page("Заказы"), "plus", primary=True)),
+        rx.cond(State.pending_trip_unloads > 0, rx.el.section(
+            rx.el.p("Выгрузки на бумаге, ожидающие внесения: ", State.pending_trip_unloads),
+            rx.el.a("Внести веса и сверить рейсы →", href="/trips", class_name="button button-secondary"),
+            class_name="pending-trip-note", role="status"), rx.fragment()),
         rx.el.section(
             rx.el.div(rx.el.span(design_icon("package"), class_name="summary-icon"),
                       rx.el.div(rx.el.h2("Обработано заказов"), rx.el.p("Сводка по обработке файлов")), class_name="summary-title"),
@@ -7097,6 +7227,7 @@ def _dispatch_stage_badge(stage):
         ("Отгрузка завершена", _pill(stage, ui.STATUS_GREEN_BG, ui.STATUS_GREEN_TEXT)),
         ("Отгрузка идёт", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
         ("Готов к отгрузке", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
+        ("Загружен частично", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
         ("Загрузка начата", _pill(stage, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
         _pill(stage, ui.STATUS_GRAY_BG, ui.STATUS_GRAY_TEXT),
     )
@@ -9232,6 +9363,7 @@ app.add_page(
     title="Водитель",
     meta=PWA_META,
 )
+app.add_page(driver_page, route="/crew", title="Кабинет машины", meta=PWA_META)
 app.add_page(
     loader_page,
     route="/loader",

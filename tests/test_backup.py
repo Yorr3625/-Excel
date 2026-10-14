@@ -148,6 +148,34 @@ def test_restore_rejects_invalid_json_before_changing_current_state(tmp_path):
     assert current.read_text(encoding="utf-8") == '{"create_logs": true}'
 
 
+def test_old_backup_without_driver_orders_manifest_does_not_delete_existing_sidecars(tmp_path):
+    identity = "a" * 24
+    relative = f"data/driver_orders/{identity}.json"
+    _write_json(tmp_path, relative, {"schema_version": 1, "assignment_id": identity})
+    archive = tmp_path / "legacy.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("manifest.json", json.dumps(_manifest(set())))
+
+    backup.restore_backup(archive, project_root=tmp_path, safety_backup=False)
+
+    assert json.loads((tmp_path / relative).read_text(encoding="utf-8"))["assignment_id"] == identity
+
+
+def test_backup_rejects_mismatched_driver_sidecar_before_replacement(tmp_path):
+    identity = "a" * 24
+    relative = f"data/driver_orders/{identity}.json"
+    _write_json(tmp_path, relative, {"schema_version": 1, "assignment_id": identity})
+    source = backup.create_backup(tmp_path / "archives", project_root=tmp_path)
+    assert backup.inspect_backup(source.path).valid
+    invalid = tmp_path / "invalid-driver.zip"
+    with zipfile.ZipFile(source.path) as original, zipfile.ZipFile(invalid, "w") as changed:
+        for name in original.namelist():
+            changed.writestr(name, json.dumps({"schema_version": 1, "assignment_id": "b" * 24}) if name == relative else original.read(name))
+    with pytest.raises(backup.BackupError, match="повреждён"):
+        backup.restore_backup(invalid, project_root=tmp_path, safety_backup=False)
+    assert json.loads((tmp_path / relative).read_text(encoding="utf-8"))["assignment_id"] == identity
+
+
 def test_backup_with_mail_config_marks_sensitive_contents(tmp_path):
     _write_json(tmp_path, "config/mail.json", {"email": "user@example.com", "app_password": "secret"})
 

@@ -127,7 +127,8 @@ def _comment(value: object) -> str:
 def _route_document(ledger: dict, assignment: dict) -> dict | None:
     return next((doc for doc in ledger["documents"]
                  if doc.get("order_record_id") == assignment.get("order_record_id")
-                 and doc.get("route_key") == assignment.get("route_key")), None)
+                 and doc.get("route_key") == assignment.get("route_key")
+                 and doc.get("loading_batch_id", "") == assignment.get("loading_batch_id", "")), None)
 
 
 def _owns(document: dict, assignment: dict) -> bool:
@@ -199,7 +200,7 @@ def _context(assignment: dict, ledger: dict) -> dict:
         return context
     try:
         record = order_records.load_order_record(context["order_record_id"])
-        balance = order_records.route_return_balance(record, context["route_key"])
+        balance = order_records.route_return_balance(record, context["route_key"], str(assignment.get("loading_batch_id", "")))
     except (order_records.OrderRecordError, OSError, ValueError, TypeError, KeyError):
         context["error"] = "Нет подтверждённой загрузки с надёжной связью с маршрутом"
         return context
@@ -322,6 +323,7 @@ def submit_return(assignment: dict, payload: dict, actor: dict) -> dict:
                 "id": uuid.uuid4().hex, "revision": 0, "version": 0,
                 "assignment_id": assignment["assignment_id"], "order_record_id": assignment["order_record_id"],
                 "route_key": assignment["route_key"], "route_label": context["route_label"],
+                "loading_batch_id": str(assignment.get("loading_batch_id", "")),
                 "driver_id": assignment["driver_id"], "driver_name": str(assignment.get("driver_name", "")),
                 "vehicle_plate": str(assignment.get("vehicle_plate", "")),
                 "order_number": str(record.get("order_number", "")), "history": [],

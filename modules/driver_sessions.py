@@ -44,6 +44,14 @@ def get_session(token: str | None) -> dict | None:
         return dict(session) if session else None
 
 
+def select_vehicle(token: str | None, vehicle_id: str) -> None:
+    with _LOCK:
+        _purge()
+        if token not in _SESSIONS:
+            raise ValueError("Сессия истекла")
+        _SESSIONS[token]["vehicle_id"] = vehicle_id
+
+
 def destroy_session(token: str | None) -> None:
     if token:
         with _LOCK:
