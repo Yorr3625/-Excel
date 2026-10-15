@@ -27,3 +27,13 @@ config/ai.json
 config/auth.json
 config/gdemoi.json
 config/backup.json
+config/*.save
+config/*.bak
+.runtime
+.vscode
+.idea
+tests
+ui-mockups
+docs/archive
+excel-prototype.html
+DESIGN_SIMPLIFICATION_PLAN.md

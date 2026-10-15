@@ -1,3 +1,4 @@
+from orders_dashboard.api import common as api_common
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -158,7 +159,7 @@ def test_dashboard_decision_checks_session_and_revision(trip):
 
 @pytest.mark.parametrize("changes", [{"active": False}, {"role": "loader"}])
 def test_return_api_revokes_disabled_or_changed_role(trip, monkeypatch, changes):
-    monkeypatch.setattr(dashboard, "driver_by_id", lambda identity: {**trip.driver, **changes})
+    monkeypatch.setattr(api_common, "driver_by_id", lambda identity: {**trip.driver, **changes})
     assert trip.client.get(trip.url).status_code == 401
     assert trip.client.post(trip.url, headers=trip.headers, json=trip.payload).status_code == 401
 

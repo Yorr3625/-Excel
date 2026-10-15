@@ -1,3 +1,6 @@
+from orders_dashboard.api import admin as api_admin
+from orders_dashboard.pages import orders as orders_view
+from orders_dashboard import components
 from datetime import datetime
 from types import SimpleNamespace
 import asyncio
@@ -11,11 +14,11 @@ from modules.weight_log import STAGE_LOADING, STAGE_STORE_SHIPMENT, STAGE_UNLOAD
 
 def test_orders_page_does_not_show_duplicate_route_drivers_panel(monkeypatch):
     order_content = object()
-    monkeypatch.setattr(dashboard, "design_heading", lambda *args: object())
-    monkeypatch.setattr(dashboard, "order_panel", lambda: order_content)
-    monkeypatch.setattr(dashboard, "design_page", lambda *children, **kwargs: children)
+    monkeypatch.setattr(orders_view, "design_heading", lambda *args: object())
+    monkeypatch.setattr(orders_view, "order_panel", lambda **kwargs: order_content)
+    monkeypatch.setattr(orders_view, "design_page", lambda *children, **kwargs: children)
     monkeypatch.setattr(
-        dashboard,
+        orders_view,
         "route_drivers_panel",
         lambda: (_ for _ in ()).throw(AssertionError("Блок водителей не должен отображаться")),
     )
@@ -403,9 +406,9 @@ def test_order_file_download_routes_require_dashboard_session(tmp_path, monkeypa
     invoice = tmp_path / "накладная.pdf"
     source.write_bytes(b"xlsx")
     invoice.write_bytes(b"pdf")
-    monkeypatch.setattr(dashboard, "resolve_order_for_download", lambda filename: source)
+    monkeypatch.setattr(api_admin, "resolve_order_for_download", lambda filename: source)
     monkeypatch.setattr(
-        dashboard,
+        api_admin,
         "resolve_linked_invoice_for_download",
         lambda order_file, filename: invoice,
     )
@@ -984,7 +987,7 @@ def test_web_order_processing_reports_driver_quantity_cell_without_traceback(mon
 
 def test_dashboard_login_creates_http_only_server_session(monkeypatch):
     dashboard.dashboard_sessions.reset_sessions()
-    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
+    monkeypatch.setattr(api_admin, "verify_credentials", lambda username, password: True)
     client = TestClient(dashboard.custom_api)
 
     response = client.post(
@@ -1003,7 +1006,7 @@ def test_dashboard_login_creates_http_only_server_session(monkeypatch):
 
 def test_dashboard_login_marks_cookie_secure_behind_https_proxy(monkeypatch):
     dashboard.dashboard_sessions.reset_sessions()
-    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
+    monkeypatch.setattr(api_admin, "verify_credentials", lambda username, password: True)
 
     response = TestClient(dashboard.custom_api).post(
         "/api/dashboard/login",
@@ -1016,7 +1019,7 @@ def test_dashboard_login_marks_cookie_secure_behind_https_proxy(monkeypatch):
 
 def test_dashboard_login_rejects_invalid_credentials(monkeypatch):
     dashboard.dashboard_sessions.reset_sessions()
-    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: False)
+    monkeypatch.setattr(api_admin, "verify_credentials", lambda username, password: False)
     client = TestClient(dashboard.custom_api)
 
     response = client.post(
@@ -1035,7 +1038,7 @@ def test_dashboard_login_hides_auth_configuration_errors(monkeypatch):
     def unavailable(username, password):
         raise dashboard.AuthConfigurationError("повреждено")
 
-    monkeypatch.setattr(dashboard, "verify_credentials", unavailable)
+    monkeypatch.setattr(api_admin, "verify_credentials", unavailable)
     response = TestClient(dashboard.custom_api).post(
         "/api/dashboard/login",
         json={"username": "admin", "password": "admin"},
@@ -1047,7 +1050,7 @@ def test_dashboard_login_hides_auth_configuration_errors(monkeypatch):
 
 def test_dashboard_logout_revokes_session_and_deletes_cookie(monkeypatch):
     dashboard.dashboard_sessions.reset_sessions()
-    monkeypatch.setattr(dashboard, "verify_credentials", lambda username, password: True)
+    monkeypatch.setattr(api_admin, "verify_credentials", lambda username, password: True)
     client = TestClient(dashboard.custom_api)
     client.post("/api/dashboard/login", json={"username": "admin", "password": "admin"})
     token = client.cookies.get(dashboard.dashboard_sessions.SESSION_COOKIE)
@@ -1232,7 +1235,7 @@ def test_delivery_difference_color_uses_one_unit_tolerance(monkeypatch):
 def test_delivery_rows_use_shared_difference_color(monkeypatch):
     differences = []
     monkeypatch.setattr(
-        dashboard,
+        components,
         "_delivery_difference_color",
         lambda difference: differences.append(difference) or dashboard.ui.INK,
     )

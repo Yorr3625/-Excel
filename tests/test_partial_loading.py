@@ -11,7 +11,7 @@ from starlette.testclient import TestClient
 
 from modules import backup, driver_orders, goods_returns, order_records, paths, vehicle_trips
 from orders_dashboard import loading_page
-import orders_dashboard.orders_dashboard as dashboard
+from orders_dashboard.api import driver as driver_api
 from orders_dashboard.orders_dashboard import custom_api
 
 
@@ -245,8 +245,8 @@ def test_driver_api_serves_only_released_stores_and_rejects_source_replays(route
     order_id, source = route
     _confirm(order_id, 0, 8)
     batch = _release(order_id)
-    monkeypatch.setattr(dashboard, "_session", lambda request, mutate=False: ({"driver_id": DRIVER["id"]}, None))
-    monkeypatch.setattr(dashboard, "_mileage_required_response", lambda session, assignment=None: None)
+    monkeypatch.setattr(driver_api, "_session", lambda request, mutate=False: ({"driver_id": DRIVER["id"]}, None))
+    monkeypatch.setattr(driver_api, "_mileage_required_response", lambda session, assignment=None: None)
     client = TestClient(custom_api)
 
     response = client.get("/api/driver/order")
@@ -396,7 +396,7 @@ def test_backup_waits_for_both_driver_shipment_writes(route, tmp_path, monkeypat
     store = batch["stores"][0]
     line = store["lines"][0]
     recorded, finish = threading.Event(), threading.Event()
-    save = dashboard.save_store_shipment
+    save = driver_api.save_store_shipment
 
     def paused_shipment(*args, **kwargs):
         result = save(*args, **kwargs)
@@ -404,9 +404,9 @@ def test_backup_waits_for_both_driver_shipment_writes(route, tmp_path, monkeypat
         assert finish.wait(10)
         return result
 
-    monkeypatch.setattr(dashboard, "save_store_shipment", paused_shipment)
-    monkeypatch.setattr(dashboard, "_session", lambda request, mutate=False: ({"driver_id": DRIVER["id"]}, None))
-    monkeypatch.setattr(dashboard, "_mileage_required_response", lambda session, assignment=None: None)
+    monkeypatch.setattr(driver_api, "save_store_shipment", paused_shipment)
+    monkeypatch.setattr(driver_api, "_session", lambda request, mutate=False: ({"driver_id": DRIVER["id"]}, None))
+    monkeypatch.setattr(driver_api, "_mileage_required_response", lambda session, assignment=None: None)
     client = TestClient(custom_api)
     with ThreadPoolExecutor(max_workers=2) as pool:
         response = pool.submit(client.post, f"/api/driver/order/stores/{store['store_id']}/complete", json={

@@ -1,3 +1,5 @@
+from orders_dashboard.api import common as api_common
+from orders_dashboard.api import driver as api_driver
 from pathlib import Path
 
 import pytest
@@ -138,10 +140,10 @@ def test_driver_api_links_shipment_to_loading_record(client, driver_api_fixture,
 
     ready = {"value": False}
     captured = {}
-    monkeypatch.setattr(dashboard, "load_order_record", lambda record_id: {"id": record_id})
-    monkeypatch.setattr(dashboard, "route_loading_ready", lambda record, route_key: ready["value"])
+    monkeypatch.setattr(api_common, "load_order_record", lambda record_id: {"id": record_id})
+    monkeypatch.setattr(api_common, "route_loading_ready", lambda record, route_key: ready["value"])
     monkeypatch.setattr(
-        dashboard,
+        api_common,
         "logistics_summary",
         lambda record: {
             "loading_ready": ready["value"],
@@ -155,7 +157,7 @@ def test_driver_api_links_shipment_to_loading_record(client, driver_api_fixture,
         captured["args"] = args
         return {"id": "record-1"}
 
-    monkeypatch.setattr(dashboard, "save_store_shipment", save_shipment)
+    monkeypatch.setattr(api_driver, "save_store_shipment", save_shipment)
     login = client.post("/api/driver/login", json={"driver_id": driver["id"], "pin": "1234"})
     csrf = login.json()["csrf_token"]
     submit_mileage(client, login)

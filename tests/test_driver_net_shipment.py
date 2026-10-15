@@ -1,3 +1,5 @@
+from orders_dashboard.api import common as api_common
+from orders_dashboard.api import driver as api_driver
 from decimal import Decimal
 
 import pytest
@@ -57,11 +59,11 @@ def test_net_api_links_registry_and_assignment_and_retries_idempotently(client, 
     line = store['lines'][0]
     line['order_record_position_id'] = 'position-test'
     driver_orders.save_snapshot(snapshot)
-    monkeypatch.setattr(dashboard, 'load_order_record', lambda _: {'id': 'record-test'})
-    monkeypatch.setattr(dashboard, 'route_loading_ready', lambda *_: True)
-    monkeypatch.setattr(dashboard, 'logistics_summary', lambda _: {'loading_ready': True, 'shipment_status': 'ready_for_shipment'})
+    monkeypatch.setattr(api_common, 'load_order_record', lambda _: {'id': 'record-test'})
+    monkeypatch.setattr(api_common, 'route_loading_ready', lambda *_: True)
+    monkeypatch.setattr(api_common, 'logistics_summary', lambda _: {'loading_ready': True, 'shipment_status': 'ready_for_shipment'})
     captured = []
-    monkeypatch.setattr(dashboard, 'save_store_shipment', lambda *args: captured.append(args) or {})
+    monkeypatch.setattr(api_driver, 'save_store_shipment', lambda *args: captured.append(args) or {})
     login = client.post('/api/driver/login', json={'driver_id': driver['id'], 'pin': '1234'})
     assert submit_mileage(client, login).status_code == 200
     headers = {'x-driver-csrf': login.json()['csrf_token']}

@@ -1,3 +1,4 @@
+from orders_dashboard.api import common as api_common
 import pytest
 
 from modules import driver_orders, fleet, loader_sessions, vehicle_trips as trips
@@ -118,7 +119,7 @@ def test_loader_shared_trip_requires_selected_vehicle_and_keeps_actor(client, tr
     response = client.post('/api/loader/login', json={'loader_id': loader['id'], 'pin': '1234'})
     assert response.status_code == 200
     headers = {'x-loader-csrf': response.json()['csrf_token']}
-    monkeypatch.setattr(dashboard, '_loader_available_vehicles', lambda: [{'id': trip['vehicle_id']}])
+    monkeypatch.setattr(api_common, '_loader_available_vehicles', lambda: [{'id': trip['vehicle_id']}])
     assert client.get('/api/crew/me').status_code == 409
     assert client.post('/api/loader/vehicle', headers=headers, json={'vehicle_id': trip['vehicle_id']}).status_code == 200
     data = client.get('/api/crew/me').json()
@@ -135,6 +136,6 @@ def test_loader_shared_trip_requires_selected_vehicle_and_keeps_actor(client, tr
     saved = trips.load_trip(trip['id'])
     assert saved['stops'][0]['completed_by']['id'] == loader['id']
     assert saved['history'][-1]['actor']['kind'] == 'loader'
-    monkeypatch.setattr(dashboard, '_loader_available_vehicles', lambda: [{'id': 'other'}])
+    monkeypatch.setattr(api_common, '_loader_available_vehicles', lambda: [{'id': 'other'}])
     assert client.post('/api/loader/vehicle', headers=headers, json={'vehicle_id': 'other'}).status_code == 200
     assert client.get(f"/api/crew/trips/{trip['id']}").status_code == 404
