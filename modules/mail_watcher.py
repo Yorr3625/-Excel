@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from modules.order_validator import ALLOWED_SUFFIXES, validate_order_file
-from modules.paths import CONFIG_DIR, DATA_DIR, INVOICES_FOLDER, ORDERS_FOLDER
+from modules.paths import CONFIG_DIR, DATA_DIR, INVOICES_FOLDER, ORDERS_FOLDER, UPLOADS_FOLDER
 
 
 MAIL_CONFIG_FILE = CONFIG_DIR / "mail.json"
@@ -490,7 +490,12 @@ def resolve_order_for_download(order_file: str) -> Path:
     for item in load_mail_items():
         if item.get("kind") == KIND_ORDERS and item.get("file") == order_file:
             return _resolve_stored_attachment(item, ORDERS_FOLDER, ALLOWED_SUFFIXES)
-    raise MailDownloadError("Файл недоступен.")
+    candidate = UPLOADS_FOLDER / order_file
+    if candidate.is_symlink():
+        raise MailDownloadError("Файл недоступен.")
+    return _resolve_stored_attachment(
+        {"file": order_file, "path": str(candidate)}, UPLOADS_FOLDER, ALLOWED_SUFFIXES
+    )
 
 
 def resolve_linked_invoice_for_download(order_file: str, invoice_file: str) -> Path:

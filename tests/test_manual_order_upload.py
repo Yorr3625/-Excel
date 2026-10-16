@@ -6,7 +6,14 @@ from types import SimpleNamespace
 from openpyxl import Workbook, load_workbook
 from starlette.datastructures import UploadFile
 
+import pytest
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.testclient import TestClient
+
 import orders_dashboard.orders_dashboard as dashboard
+from modules import dashboard_sessions, mail_watcher
+from orders_dashboard.api.admin import download_order_source_file
 
 
 def upload_state():
@@ -25,11 +32,14 @@ def test_manual_excel_upload_saves_bytes_and_updates_selected_file(tmp_path, mon
     book.save(content)
     content.seek(0)
     monkeypatch.setattr(dashboard.rx, "get_upload_dir", lambda: tmp_path)
+    monkeypatch.setattr(mail_watcher, "UPLOADS_FOLDER", tmp_path)
+    monkeypatch.setattr(mail_watcher, "load_mail_items", lambda: [])
     monkeypatch.setattr(dashboard, "was_processed", lambda name: None)
     state = upload_state()
     asyncio.run(dashboard.State.handle_upload.fn(state, [UploadFile(content, filename="заказ.xlsx")]))
     saved = tmp_path / "заказ.xlsx"
     assert saved.exists()
+    assert mail_watcher.resolve_order_for_download(saved.name) == saved.resolve()
     loaded = load_workbook(saved)
     assert loaded.active.cell(2, 2).value == 12
     loaded.close()
@@ -38,6 +48,35 @@ def test_manual_excel_upload_saves_bytes_and_updates_selected_file(tmp_path, mon
     assert state.status == "Файл загружен: заказ.xlsx"
     assert state.order_mail_metadata is None
     assert state.output_file == state.log_file == state.error_text == ""
+
+
+def test_manual_order_source_download_requires_login(tmp_path, monkeypatch):
+    monkeypatch.setattr(mail_watcher, "UPLOADS_FOLDER", tmp_path)
+    monkeypatch.setattr(mail_watcher, "load_mail_items", lambda: [])
+    source = tmp_path / "ручной заказ.xlsx"
+    source.write_bytes(b"original uploaded workbook")
+    client = TestClient(Starlette(routes=[
+        Route("/orders/{filename}", download_order_source_file, methods=["GET"]),
+    ]))
+    assert client.get("/orders/ручной заказ.xlsx").status_code == 401
+    token = dashboard_sessions.create_session()
+    try:
+        client.cookies.set(dashboard_sessions.SESSION_COOKIE, token)
+        response = client.get("/orders/ручной заказ.xlsx")
+        assert response.status_code == 200
+        assert response.content == source.read_bytes()
+        assert "attachment" in response.headers["content-disposition"]
+    finally:
+        dashboard_sessions.destroy_session(token)
+
+
+@pytest.mark.parametrize("filename", ["../outside.xlsx", "nested/order.xlsx", "", "secret.json", "missing.xlsx"])
+def test_manual_order_download_rejects_unavailable_files(tmp_path, monkeypatch, filename):
+    monkeypatch.setattr(mail_watcher, "UPLOADS_FOLDER", tmp_path)
+    monkeypatch.setattr(mail_watcher, "load_mail_items", lambda: [])
+    (tmp_path / "secret.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(mail_watcher.MailDownloadError):
+        mail_watcher.resolve_order_for_download(filename)
 
 
 def test_manual_upload_without_selection_has_clear_status():
