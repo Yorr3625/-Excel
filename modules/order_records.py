@@ -359,8 +359,8 @@ def _normalize_route_loading(value: object) -> dict:
     value = value if isinstance(value, dict) else {}
     status = str(value.get("status", "new"))
     return {
-        "mode": "stores" if value.get("mode") == "stores" else "route",
-        "status": status if status in {"new", "draft", "partial", "loaded"} else "new",
+        "mode": value.get("mode") if value.get("mode") in {"stores", "simple"} else "route",
+        "status": status if status in {"new", "draft", "counted", "weight_draft", "partial", "loaded"} else "new",
         "last_saved_at": str(value.get("last_saved_at", "")),
         "last_saved_by": _actor(value.get("last_saved_by")),
         "confirmed_at": str(value.get("confirmed_at", "")),
@@ -395,7 +395,7 @@ def _legacy_loading_ready(record: dict) -> bool:
 
 def route_loading_mode(record: dict, route_key: str) -> str:
     state = ((record.get("loading") or {}).get("route_states") or {}).get(route_key, {})
-    return "stores" if state.get("mode") == "stores" else "route"
+    return state.get("mode") if state.get("mode") in {"stores", "simple"} else "route"
 
 
 def _store_loading_destinations(record: dict, route_key: str) -> list[dict]:
@@ -568,6 +568,19 @@ def _store_measurement_ready(measurement: object) -> bool:
         return False
 
 
+def _simple_weight_ready(line: dict) -> bool:
+    measurement = line.get("measurement") or {}
+    try:
+        boxes = _integer_quantity(line.get("confirmed_box_count"), "Количество ящиков")
+        validated = _validated_loading_measurement(measurement, require_zero_reason=True)
+        return (
+            boxes == validated["box_count"]
+            and _decimal(measurement.get("net_weight_kg"), "Нетто") == _decimal(validated["net_weight_kg"], "Нетто")
+        )
+    except (OrderRecordError, KeyError):
+        return False
+
+
 def route_loading_ready(record: dict, route_key: str) -> bool:
     lines = _route_lines(record, route_key)
     if not lines:
@@ -583,6 +596,8 @@ def route_loading_ready(record: dict, route_key: str) -> bool:
             and all(_store_measurement_ready((position.get("loading") or {}).get("measurement")) for position in destination.get("positions", []))
             for destination in destinations
         )
+    if route_loading_mode(record, route_key) == "simple":
+        return state.get("status") == "loaded" and all(_simple_weight_ready(line) for line in lines)
     return state.get("status") == "loaded" and all(
         _loading_measurement_complete(line.get("measurement")) for line in lines
     )
@@ -1205,6 +1220,8 @@ def list_route_trip_summaries(processed_date: str, mode: str) -> list[dict]:
                 stage = "Готов к отгрузке"
             elif batches or loading_status == "partial":
                 stage = "Загружен частично"
+            elif loading_status in {"counted", "weight_draft"} and route_loading_mode(record, route_key) == "simple":
+                stage = "Ящики учтены, ожидается взвешивание"
             elif loading_status == "draft":
                 stage = "Загрузка начата"
             else:
@@ -1339,7 +1356,7 @@ def loading_mode_locked(record: dict, route_key: str) -> bool:
 
 
 def set_route_loading_mode(order_record_id: str, revision: int, route_key: str, mode: str) -> dict:
-    if mode not in {"route", "stores"}:
+    if mode not in {"route", "stores", "simple"}:
         raise OrderRecordError("Некорректный режим загрузки")
     with _LOCK:
         payload = _read_payload()
@@ -1392,6 +1409,8 @@ def change_loading_weighing(order_record_id: str, revision: int, route_key: str,
         record = _find_record(payload, order_record_id)
         _check_loading_revision(record, revision)
         state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) == "simple":
+            raise OrderRecordConflict("В простом режиме взвешивания вводятся после подтверждения ящиков")
         if state["status"] == "loaded":
             raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
         store_state = None
@@ -1518,6 +1537,8 @@ def save_loading_draft(
         route_state = _route_state(record, route_key)
         if route_loading_mode(record, route_key) == "stores":
             raise OrderRecordConflict("В этом режиме загрузка подтверждается отдельно по магазинам")
+        if route_loading_mode(record, route_key) == "simple":
+            raise OrderRecordConflict("Используйте отдельный ввод ящиков или фактического веса")
         if route_state["status"] == "loaded":
             raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
         line = next(
@@ -1560,6 +1581,8 @@ def confirm_route_loading(
         route_state = _route_state(record, route_key)
         if route_loading_mode(record, route_key) == "stores":
             raise OrderRecordConflict("В этом режиме загрузка подтверждается отдельно по магазинам")
+        if route_loading_mode(record, route_key) == "simple":
+            raise OrderRecordConflict("Сначала подтвердите ящики, затем фактический вес")
         if route_state["status"] == "loaded":
             raise OrderRecordConflict("Загрузка маршрута уже подтверждена")
         lines = _route_lines(record, route_key)
@@ -1581,6 +1604,115 @@ def confirm_route_loading(
                 "confirmed_by": _actor(actor),
             }
         )
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def _simple_loading_actor(actor: dict) -> dict:
+    if not isinstance(actor, dict) or actor.get("kind") not in {"loader", "dashboard"} or not actor.get("id"):
+        raise OrderRecordError("Нет доступа к загрузке")
+    return _actor(actor)
+
+
+def _simple_loading_line(record: dict, route_key: str, line_id: str) -> dict:
+    line = next((item for item in _route_lines(record, route_key) if item.get("id") == line_id), None)
+    if line is None:
+        raise OrderRecordNotFound("Позиция не найдена в маршруте")
+    return line
+
+
+def save_simple_box_count_draft(order_record_id: str, route_key: str, line_id: str, boxes: object, actor: dict) -> dict:
+    actor = _simple_loading_actor(actor)
+    box_count = _draft_value(boxes, "box_count")
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) != "simple" or state["status"] not in {"new", "draft"}:
+            raise OrderRecordConflict("Подсчёт ящиков уже завершён или выбран другой режим")
+        line = _simple_loading_line(record, route_key, line_id)
+        line["measurement"] = _empty_measurement(box_count)
+        state.update(status="draft", last_saved_at=_now(), last_saved_by=actor)
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def confirm_simple_box_counts(order_record_id: str, revision: int, route_key: str, actor: dict) -> dict:
+    actor = _simple_loading_actor(actor)
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        _check_loading_revision(record, revision)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) != "simple" or state["status"] not in {"new", "draft"}:
+            raise OrderRecordConflict("Подсчёт ящиков уже завершён или выбран другой режим")
+        route_lines = _route_lines(record, route_key)
+        if not route_lines:
+            raise OrderRecordNotFound("В маршруте отсутствуют позиции загрузки")
+        for line in route_lines:
+            measurement = line.get("measurement") or {}
+            if any(str(measurement.get(field, "")).strip() for field in ("tare_weight_per_box_kg", "gross_weight_kg", "net_weight_kg")):
+                raise OrderRecordConflict("Фактический вес вводится после подтверждения ящиков")
+            boxes = _integer_quantity(measurement.get("box_count", ""), "Количество ящиков")
+            line["confirmed_box_count"] = boxes
+            line["measurement"] = _empty_measurement(boxes)
+        stamp = _now()
+        state.update(status="counted", last_saved_at=stamp, last_saved_by=actor,
+                     confirmed_at=stamp, confirmed_by=actor)
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def save_simple_weight_draft(order_record_id: str, route_key: str, line_id: str, field: str, value: object, actor: dict) -> dict:
+    actor = _simple_loading_actor(actor)
+    if field not in {"tare_weight_per_box_kg", "gross_weight_kg", "zero_reason"}:
+        raise OrderRecordConflict("Подтверждённое количество ящиков изменить нельзя")
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) != "simple" or state["status"] not in {"counted", "weight_draft"}:
+            raise OrderRecordConflict("Взвешивание недоступно до подтверждения ящиков или уже завершено")
+        line = _simple_loading_line(record, route_key, line_id)
+        count = _integer_quantity(line.get("confirmed_box_count"), "Количество ящиков")
+        measurement = line.get("measurement") or {}
+        if str(measurement.get("box_count", "")) != count or "weighings" in measurement:
+            raise OrderRecordConflict("Количество ящиков изменилось")
+        line["measurement"] = _edit_loading_measurement(measurement, field, value, "")
+        state.update(status="weight_draft", last_saved_at=_now(), last_saved_by=actor)
+        record["revision"] += 1
+        _refresh_overall_loading_status(record)
+        _atomic_write(payload)
+        return deepcopy(record)
+
+
+def confirm_simple_weight(order_record_id: str, revision: int, route_key: str, actor: dict) -> dict:
+    actor = _simple_loading_actor(actor)
+    with _LOCK:
+        payload = _read_payload()
+        record = _find_record(payload, order_record_id)
+        _check_loading_revision(record, revision)
+        state = _route_state(record, route_key)
+        if route_loading_mode(record, route_key) != "simple" or state["status"] not in {"counted", "weight_draft"}:
+            raise OrderRecordConflict("Взвешивание недоступно до подтверждения ящиков или уже завершено")
+        route_lines = _route_lines(record, route_key)
+        if not route_lines:
+            raise OrderRecordNotFound("В маршруте отсутствуют позиции загрузки")
+        for line in route_lines:
+            count = _integer_quantity(line.get("confirmed_box_count"), "Количество ящиков")
+            measurement = line.get("measurement") or {}
+            if str(measurement.get("box_count", "")) != count or "weighings" in measurement:
+                raise OrderRecordConflict("Количество ящиков изменилось")
+            line["measurement"] = _validated_loading_measurement(measurement, require_zero_reason=True)
+        stamp = _now()
+        state.update(status="loaded", last_saved_at=stamp, last_saved_by=actor,
+                     confirmed_at=stamp, confirmed_by=actor)
         record["revision"] += 1
         _refresh_overall_loading_status(record)
         _atomic_write(payload)

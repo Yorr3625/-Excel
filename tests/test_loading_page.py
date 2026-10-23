@@ -350,3 +350,23 @@ def test_loading_page_renders_accessible_sort_control_and_stable_product_keys():
     for label in loading_page.LOADING_SORT_OPTIONS.values():
         assert json.dumps(label) in rendered
     assert "sorted_loading_rows" in str(loading_page._store_loading_reconciliation())
+
+
+def test_simple_mode_page_renders_separate_box_and_weight_steps():
+    mode = str(loading_page._loading_mode_control())
+    simple = str(loading_page._simple_loading_table())
+    page = str(loading_page.loading_page())
+
+    assert json.dumps("Простой · по ящикам") in mode
+    assert "choose_loading_mode" in mode and "mode_locked" in mode
+    assert json.dumps("Подтвердить ящики") in simple
+    assert json.dumps("Указать фактический вес") in simple
+    assert json.dumps("Подтвердить фактический вес") in simple
+    assert "confirm_simple_boxes" in simple and "confirm_simple_route_weight" in simple
+    assert "simple_boxes_confirmed" in simple and "route_is_ready" in simple
+    assert "simple-loading-sort" in simple and "sorted_loading_rows" in simple
+    assert "set_context_measurement_field" in simple
+    assert json.dumps("Добавить взвешивание") not in simple
+    assert json.dumps("Загружено нетто") not in simple
+    assert "loading_mode_rx_state_?.valueOf?.() === \"simple\"" in page
+    assert "_simple_loading_table" not in page  # The conditional contains rendered markup, not a Python function reference.

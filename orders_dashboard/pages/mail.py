@@ -137,9 +137,11 @@ def mail_item_row(item, *, State):
     return rx.el.article(
         rx.el.div(
             rx.el.div(rx.cond(item["is_invoice"], design_icon("file_pdf", 18),
-                              rx.cond(item["has_file"], design_icon("file_spreadsheet", 18), design_icon("mail", 18))),
-                      rx.el.h3(item["file"]), class_name="mail-card-title"),
-            rx.cond(item["subject"] != "", rx.el.p(item["subject"], class_name="mail-subject"), rx.fragment()),
+                              rx.cond(item["has_attachment"], design_icon("file_spreadsheet", 18), design_icon("mail", 18))),
+                      rx.el.h3(rx.cond(item["has_attachment"], item["file"],
+                                       rx.cond(item["subject"] != "", item["subject"], "Письмо без вложений"))),
+                      class_name="mail-card-title"),
+            rx.cond(item["has_attachment"] & (item["subject"] != ""), rx.el.p(item["subject"], class_name="mail-subject"), rx.fragment()),
             rx.el.dl(rx.el.div(rx.el.dt("Отправитель"), rx.el.dd(item["sender"])),
                      rx.el.div(rx.el.dt("Получено"), rx.el.dd(item["received"])),
                      rx.el.div(rx.el.dt("Источник"), rx.el.dd(item["source"])),
@@ -229,6 +231,10 @@ def mail_page(*, State):
                         State.mail_last_check,
                         color=muted(),
                         font_size="12px",
+                    ),
+                    rx.text(
+                        "Проверяются все письма выбранной почтовой папки, включая старые и письма от новых отправителей. Первая проверка может занять время.",
+                        color=muted(), font_size="12px",
                     ),
                     rx.cond(
                         State.mail_error != "",
@@ -382,14 +388,27 @@ def mail_page(*, State):
                     ),
                 ),
                 rx.cond(
-                    State.mail_items.length() > 0,
+                    State.mail_result_count > 0,
                     design_mail_panel("mail-inbox",
                         panel_title("mail", "Письма и вложения"),
+                        rx.text("Найдено записей: ", State.mail_result_count, color=muted(), font_size="13px"),
                         rx.vstack(
                             rx.foreach(State.mail_items, lambda item: mail_item_row(item, State=State)),
                             spacing="3",
                             width="100%",
                             class_name="mail-card-grid",
+                        ),
+                        rx.cond(
+                            State.mail_page_count > 1,
+                            rx.hstack(
+                                secondary_button("← Новее", on_click=State.set_mail_page(State.mail_page - 1),
+                                                 disabled=State.mail_page <= 1),
+                                rx.text("Страница ", State.mail_page, " из ", State.mail_page_count),
+                                secondary_button("Старее →", on_click=State.set_mail_page(State.mail_page + 1),
+                                                 disabled=State.mail_page >= State.mail_page_count),
+                                align="center", wrap="wrap", spacing="3", width="100%",
+                            ),
+                            rx.box(),
                         ),
                     ),
                     rx.el.p("Нет сообщений по выбранным фильтрам", class_name="mail-empty", role="status"),

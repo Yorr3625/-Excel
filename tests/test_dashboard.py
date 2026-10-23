@@ -59,7 +59,7 @@ def test_refresh_mail_config_is_registered_and_loads_state(monkeypatch):
     assert state.mail_email == "orders@example.com"
     assert state.mail_app_password == ""
     assert state.mail_interval == 15
-    assert state.mail_sources == ["Все", "Основной склад"]
+    assert state.mail_sources == ["Все", "Основной склад", "Другие"]
     assert state.mail_source == "Все"
     assert state.mail_error_log == ["ошибка"]
     assert reload_calls == [True]
@@ -179,6 +179,7 @@ def test_accountant_category_filter_separates_uncategorized_items(monkeypatch):
         mail_source="Бухгалтер",
         mail_category="Все",
         mail_kind_filter="Все сообщения",
+        mail_page=1,
     )
     state._filter_mail_items = dashboard.State._filter_mail_items.__get__(state)
     state._set_mail_categories = dashboard.State._set_mail_categories.__get__(state)
@@ -198,7 +199,7 @@ def test_accountant_category_filter_separates_uncategorized_items(monkeypatch):
         "Краймери",
         "Без категории",
     ]
-    assert [item["category"] for item in state.mail_all_items] == [
+    assert [item["category"] for item in state.mail_items] == [
         "Парус",
         "Краймери",
         "Молоко",
@@ -223,6 +224,72 @@ def test_accountant_category_filter_separates_uncategorized_items(monkeypatch):
     ]
 
 
+def test_partial_mail_sync_keeps_saved_orders_visible_and_reports_error(monkeypatch):
+    monkeypatch.setattr(dashboard, "load_mail_error_log", lambda: [])
+    reloaded = []
+    state = SimpleNamespace(
+        _reload_mail_items=lambda: reloaded.append(True), mail_new_orders_count=0,
+        mail_notification="", mail_status="", mail_error="",
+    )
+    dashboard.State._apply_mail_result(state, {
+        "ok": False, "error": "Соединение прервано", "items": [
+            {"kind": "orders", "verdict": {"ok": True}},
+        ],
+    })
+    assert reloaded == [True]
+    assert state.mail_error == "Соединение прервано"
+    assert "сохранено записей: 1" in state.mail_status
+    assert state.mail_new_orders_count == 1
+
+
+def test_mail_all_shows_other_senders_and_pages_full_history(monkeypatch):
+    from orders_dashboard.pages import mail as mail_view
+
+    items = [
+        {
+            "source_name": "Другие" if index % 2 else "Бухгалтер",
+            "sender": f"Отправитель {index} <sender{index}@example.com>",
+            "subject": f"Письмо {index}",
+            "received_at": f"2026-10-20T12:{index % 60:02d}:00+03:00",
+            "received_display": "20.10.2026 12:00",
+            "kind": "orders" if index == 119 else "message",
+            "file": "заказ.xlsx" if index == 119 else "",
+            "verdict": {"ok": True, "mode": "Город"} if index == 119 else {},
+        }
+        for index in range(120)
+    ]
+    # Distinct timestamps keep the order deterministic across pages.
+    for index, item in enumerate(items):
+        item["received_at"] = f"2026-10-{(index // 24) + 1:02d}T{index % 24:02d}:00:00+03:00"
+    monkeypatch.setattr(dashboard, "load_mail_config", lambda: {})
+    monkeypatch.setattr(dashboard, "mail_sources_config", lambda config=None: [])
+    monkeypatch.setattr(dashboard, "load_mail_items", lambda: items)
+    state = SimpleNamespace(
+        mail_source="Все", mail_sources=["Все", "Бухгалтер", "Другие"], mail_category="Все",
+        mail_categories=["Все"], mail_kind_filter="Все сообщения", mail_page=1,
+        _mail_item_for_view=dashboard.State._mail_item_for_view,
+    )
+    state._set_mail_categories = dashboard.State._set_mail_categories.__get__(state)
+    state._filter_mail_items = dashboard.State._filter_mail_items.__get__(state)
+    state._filter_mail_items()
+    assert (state.mail_result_count, state.mail_page_count, len(state.mail_items)) == (120, 3, 50)
+    assert state.mail_items[0]["subject"] == "Письмо 119"
+    dashboard.State.set_mail_page.fn(state, 3)
+    assert len(state.mail_items) == 20
+    assert {item["subject"] for item in state.mail_items} == {f"Письмо {index}" for index in range(20)}
+    dashboard.State.set_mail_source.fn(state, "Другие")
+    assert (state.mail_page, state.mail_result_count, len(state.mail_items)) == (1, 60, 50)
+    assert all(item["source"] == "Другие" for item in state.mail_items)
+    dashboard.State.set_mail_kind_filter.fn(state, "Только заказы")
+    assert [item["subject"] for item in state.mail_items] == ["Письмо 119"]
+    dashboard.State.set_mail_source.fn(state, "Все")
+    assert state.mail_kind_filter == "Все сообщения" and state.mail_category == "Все"
+    assert state.mail_result_count == 120
+    assert not hasattr(state, "mail_all_items")
+    rendered = str(mail_view.mail_page(State=dashboard.State))
+    assert "set_mail_page" in rendered and "mail_result_count" in rendered
+
+
 def test_format_history_timestamp_uses_short_date_and_relative_label():
     now = datetime(2026, 10, 5, 12, 0)
 
@@ -238,7 +305,8 @@ def test_format_history_timestamp_uses_short_date_and_relative_label():
     assert dashboard.format_history_timestamp("неверная дата", now) == ("неверная дата", "")
 
 
-def test_history_order_details_keep_processed_time_label():
+def test_history_order_details_keep_processed_time_label(monkeypatch):
+    monkeypatch.setattr(dashboard, "latest_record_ids_by_source_filename", lambda: {})
     refreshes = []
     state = SimpleNamespace(
         invoice_search="старый поиск",

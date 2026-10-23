@@ -444,6 +444,7 @@ SIDEBAR_HOVER = ui.STATUS_GRAY_BG
 SIDEBAR_SURFACE_ALT = ui.PAGE
 ROUTE_BACKUPS_FILE = paths.ROUTE_BACKUPS_FILE
 MAX_ROUTE_BACKUPS = 20
+MAIL_PAGE_SIZE = 50
 VOLUME_ROUTE_KEYS = [f"route_{i}" for i in range(1, MAX_ROUTES + 1)]
 WEIGHT_STORE_PLACEHOLDER = "— выберите магазин —"
 # Чат-помощник сейчас работает только через Claude — ChatGPT в списке
@@ -874,7 +875,7 @@ class State(rx.State):
         try:
             trips = list_route_trip_summaries(datetime.now().astimezone().date().isoformat(), self.today_mode)
             self.today_waiting = sum(t["stage"] == "Ожидает загрузки" for t in trips)
-            self.today_drafts = sum(t["stage"] == "Загрузка начата" for t in trips)
+            self.today_drafts = sum(t["stage"] in {"Загрузка начата", "Ящики учтены, ожидается взвешивание"} for t in trips)
             self.today_ready = sum(t["stage"] in {"Готов к отгрузке", "Загружен частично"} for t in trips)
             self.today_shipping = sum(t["stage"] == "Отгрузка идёт" for t in trips)
             self.today_completed = sum(t["stage"] == "Отгрузка завершена" for t in trips)
@@ -977,7 +978,9 @@ class State(rx.State):
     mail_new_orders_count: int = 0
     mail_notification: str = ""
     mail_items: list[dict] = []
-    mail_all_items: list[dict] = []
+    mail_result_count: int = 0
+    mail_page: int = 1
+    mail_page_count: int = 1
     mail_sources: list[str] = ["Все"]
     mail_source: str = "Все"
     mail_categories: list[str] = ["Все"]
@@ -991,6 +994,8 @@ class State(rx.State):
     processed_file_status: str = ""
     order_details_open: bool = False
     selected_order: str = ""
+    selected_order_processed_path: str = ""
+    selected_order_processed_name: str = ""
     selected_order_time: str = ""
     selected_order_time_label: str = "Обработан"
     selected_order_date_relation: str = ""
@@ -1457,7 +1462,7 @@ class State(rx.State):
         self.mail_interval = max(int(config.get("check_interval_minutes", 10)), 1)
         source_configs = mail_sources_config(config)
         self.mail_sources = ["Все"] + list(dict.fromkeys(
-            item["name"] for item in source_configs
+            [item["name"] for item in source_configs] + ["Другие"]
         ))
 
         if self.mail_source not in self.mail_sources:
@@ -1520,6 +1525,7 @@ class State(rx.State):
             "is_order": kind == KIND_ORDERS and bool(verdict.get("ok")),
             "is_invoice": kind == KIND_INVOICES,
             "has_file": bool(item.get("path")),
+            "has_attachment": bool(item.get("file")),
             "reason": verdict.get("reason", ""),
             "mode": verdict.get("mode", ""),
             "matches": verdict.get("matches", 0),
@@ -1533,65 +1539,76 @@ class State(rx.State):
             ),
         }
 
-    def _filter_mail_items(self):
-        items = self.mail_all_items
-
-        if self.mail_source != "Все":
-            items = [item for item in items if item["source"] == self.mail_source]
-
-        if self.mail_category != "Все":
-            if self.mail_category == INVOICE_CATEGORY_UNCATEGORIZED:
-                items = [
-                    item
-                    for item in items
-                    if (
-                        item["is_invoice"] and not item["category"]
-                    ) or item["kind"] == KIND_MESSAGE
-                ]
-            else:
-                items = [
-                    item
-                    for item in items
-                    if item["is_invoice"] and item["category"] == self.mail_category
-                ]
-
-        if self.mail_kind_filter == "Только заказы":
-            items = [item for item in items if item["is_order"]]
-        elif self.mail_kind_filter == "Только непривязанные накладные":
-            items = [
-                item
-                for item in items
-                if item["is_invoice"] and not item["order_file"]
-            ]
-
-        self.mail_items = items
-
-    def _reload_mail_items(self, source_configs=None):
-        source_configs = source_configs or mail_sources_config(load_mail_config())
+    def _filter_mail_items(self, source_configs=None):
+        if source_configs is None:
+            source_configs = mail_sources_config(load_mail_config())
         category_rules = {
             source["name"]: source.get("categories") or []
             for source in source_configs
         }
-        self.mail_all_items = [
-            self._mail_item_for_view(
-                item,
-                category_rules.get(item.get("source_name"), []),
-            )
+        items = [
+            (item, self._mail_item_for_view(item, category_rules.get(item.get("source_name"), [])))
             for item in load_mail_items()
         ]
-        self._filter_mail_items()
+        if self.mail_source != "Все":
+            items = [(original, view) for original, view in items if view["source"] == self.mail_source]
+        if self.mail_category != "Все":
+            if self.mail_category == INVOICE_CATEGORY_UNCATEGORIZED:
+                items = [(original, view) for original, view in items
+                         if (view["is_invoice"] and not view["category"]) or view["kind"] == KIND_MESSAGE]
+            else:
+                items = [(original, view) for original, view in items
+                         if view["is_invoice"] and view["category"] == self.mail_category]
+        if self.mail_kind_filter == "Только заказы":
+            items = [(original, view) for original, view in items if view["is_order"]]
+        elif self.mail_kind_filter == "Только непривязанные накладные":
+            items = [(original, view) for original, view in items if view["is_invoice"] and not view["order_file"]]
+
+        def received_at(pair):
+            try:
+                return datetime.fromisoformat(str(pair[0].get("received_at", ""))).timestamp()
+            except (OSError, TypeError, ValueError, OverflowError):
+                return 0
+
+        items.sort(key=received_at, reverse=True)
+        self.mail_result_count = len(items)
+        self.mail_page_count = max(1, (len(items) + MAIL_PAGE_SIZE - 1) // MAIL_PAGE_SIZE)
+        self.mail_page = max(1, min(self.mail_page, self.mail_page_count))
+        start = (self.mail_page - 1) * MAIL_PAGE_SIZE
+        self.mail_items = [view for _, view in items[start:start + MAIL_PAGE_SIZE]]
+
+    def _reload_mail_items(self, source_configs=None):
+        self._filter_mail_items(source_configs)
 
     def set_mail_source(self, source: str):
+        if source not in self.mail_sources:
+            return
         self.mail_source = source
+        if source == "Все":
+            self.mail_kind_filter = "Все сообщения"
+            self.mail_category = "Все"
+        self.mail_page = 1
         self._set_mail_categories()
         self._filter_mail_items()
 
     def set_mail_category(self, value: str):
+        if value not in self.mail_categories:
+            return
         self.mail_category = value
+        self.mail_page = 1
         self._filter_mail_items()
 
     def set_mail_kind_filter(self, value: str):
+        if value not in {"Все сообщения", "Только заказы", "Только непривязанные накладные"}:
+            return
         self.mail_kind_filter = value
+        self.mail_page = 1
+        self._filter_mail_items()
+
+    def set_mail_page(self, page: int):
+        if type(page) is not int or not 1 <= page <= self.mail_page_count:
+            return
+        self.mail_page = page
         self._filter_mail_items()
 
     def _apply_mail_result(self, result: dict):
@@ -1599,14 +1616,13 @@ class State(rx.State):
 
         self.mail_error_log = load_mail_error_log()
 
-        if not result["ok"]:
-            self.mail_error = result["error"]
-            self.mail_status = "Проверка не удалась"
-            return
-
-        self.mail_error = ""
         self._reload_mail_items()
         found = result["items"]
+        if not result["ok"]:
+            self.mail_error = result["error"]
+            self.mail_status = f"Проверка не завершена · сохранено записей: {len(found)}" if found else "Проверка не удалась"
+        else:
+            self.mail_error = ""
         suitable = sum(
             1
             for item in found
@@ -1621,6 +1637,9 @@ class State(rx.State):
                 f"Новых заказов: {self.mail_new_orders_count}. "
                 "Они готовы к обработке."
             )
+
+        if not result["ok"]:
+            return
 
         if not found:
             self.mail_status = "Новых писем нет"
@@ -1815,12 +1834,22 @@ class State(rx.State):
         try:
             path = resolve_order_for_download(self.selected_order)
         except MailDownloadError:
-            self.order_detail_status = "Файл заказа больше недоступен"
+            self.order_detail_status = "Исходный файл заказа больше недоступен"
             return
         return rx.download(
             url=f"/api/order-files/orders/{quote(path.name, safe='')}",
             filename=path.name,
         )
+
+    def download_order_processed_file(self):
+        try:
+            path = resolve_processed_file(self.selected_order_processed_path)
+            ticket = create_download_ticket(self.selected_order_processed_path)
+        except ProcessedFileError:
+            self.order_detail_status = "Обработанный файл больше недоступен. Обновите историю файлов."
+            return
+        self.order_detail_status = ""
+        return rx.download(url=f"/api/processed-files/download/{ticket}", filename=path.name)
 
     def download_linked_invoice_file(self, filename: str):
         try:
@@ -1844,6 +1873,18 @@ class State(rx.State):
         date_relation: str = "",
     ):
         self.selected_order = filename
+        self.selected_order_processed_path = ""
+        self.selected_order_processed_name = ""
+        if time_label == "Обработан":
+            try:
+                record_id = latest_record_ids_by_source_filename().get(filename, "")
+                if record_id:
+                    relative_path = str(load_order_record(record_id).get("output_relative_path", ""))
+                    result = resolve_processed_file(relative_path)
+                    self.selected_order_processed_path = relative_path
+                    self.selected_order_processed_name = result.name
+            except (OrderRecordError, ProcessedFileError, OSError):
+                pass
         self.selected_order_time = displayed_at
         self.selected_order_time_label = time_label
         self.selected_order_date_relation = date_relation
@@ -1992,7 +2033,8 @@ class State(rx.State):
         query = self.search_query.strip().casefold()
         return [trip for trip in self.dispatch_trips
                 if (self.dispatch_stage == "Все" or trip["stage"] == self.dispatch_stage
-                    or (self.dispatch_stage == "Готов к отгрузке" and trip["stage"] == "Загружен частично"))
+                    or (self.dispatch_stage == "Готов к отгрузке" and trip["stage"] == "Загружен частично")
+                    or (self.dispatch_stage == "Загрузка начата" and trip["stage"] == "Ящики учтены, ожидается взвешивание"))
                 and (not query or query in trip["search_text"])]
 
     @rx.var

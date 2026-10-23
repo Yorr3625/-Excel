@@ -11,15 +11,16 @@ import imaplib
 import json
 import os
 import re
+import tempfile
 import time
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import TypedDict
 
-from modules.order_validator import ALLOWED_SUFFIXES, validate_order_file
+from modules.order_validator import ALLOWED_SUFFIXES, MAX_FILE_MB, validate_order_file
 from modules.paths import CONFIG_DIR, DATA_DIR, INVOICES_FOLDER, ORDERS_FOLDER, UPLOADS_FOLDER
 
 
@@ -32,9 +33,7 @@ MAIL_ERROR_LOG_FILE = DATA_DIR / "mail_errors.json"
 MAIL_CHECK_LOCK_FILE = DATA_DIR / "mail_check.lock"
 
 SEEN_LIMIT = 500
-MAIL_ITEMS_LIMIT = 1000
 MAIL_ERROR_LOG_LIMIT = 50
-DEFAULT_CACHE_DAYS = 14
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_SECONDS = 5.0
 PDF_SUFFIXES = (".pdf",)
@@ -91,8 +90,6 @@ class MailErrorEntry(TypedDict):
     error: str
 
 
-_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
 DEFAULT_CONFIG = {
     "enabled": False,
     "imap_server": "imap.gmail.com",
@@ -101,8 +98,6 @@ DEFAULT_CONFIG = {
     "app_password": "",
     "sources": [],
     "folder": "INBOX",
-    "since_days": 14,
-    "cache_days": DEFAULT_CACHE_DAYS,
     "check_interval_minutes": 10,
     "retry_attempts": DEFAULT_RETRY_ATTEMPTS,
     "retry_delay_seconds": DEFAULT_RETRY_DELAY_SECONDS,
@@ -149,9 +144,6 @@ def save_mail_credentials(email_addr: str, app_password: str) -> tuple[bool, str
 
         if template_sources:
             config["sources"] = template_sources
-
-    if not sources(config):
-        return False, "Не настроены отправители заказов и накладных"
 
     config.update({
         "enabled": True,
@@ -221,7 +213,6 @@ def is_configured(config: dict | None = None) -> bool:
         config.get("enabled")
         and config.get("email")
         and config.get("app_password")
-        and sources(config)
     )
 
 
@@ -234,7 +225,21 @@ def _read_json(path: Path, default):
 
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def _safe_error_text(error: object, config: dict | None = None) -> str:
@@ -488,7 +493,7 @@ def resolve_order_for_download(order_file: str) -> Path:
         raise MailDownloadError("Файл недоступен.")
 
     for item in load_mail_items():
-        if item.get("kind") == KIND_ORDERS and item.get("file") == order_file:
+        if item.get("kind") == KIND_ORDERS and item.get("file") == order_file and item.get("path"):
             return _resolve_stored_attachment(item, ORDERS_FOLDER, ALLOWED_SUFFIXES)
     candidate = UPLOADS_FOLDER / order_file
     if candidate.is_symlink():
@@ -617,33 +622,7 @@ def split_invoice_candidates(
 
 
 def _save_mail_items(items: list[dict]) -> None:
-    _write_json(MAIL_ITEMS_FILE, items[:MAIL_ITEMS_LIMIT])
-
-
-def _prune_mail_items(items: list[dict], days: int) -> list[dict]:
-    """Удаляет устаревший почтовый кеш, сохраняя привязанные накладные."""
-
-    cutoff = datetime.now().astimezone() - timedelta(days=max(days, 1))
-    kept = []
-
-    for item in items:
-        if item.get("order_file"):
-            kept.append(item)
-            continue
-
-        try:
-            received = datetime.fromisoformat(item.get("received_at", ""))
-            if received.tzinfo is None:
-                received = received.astimezone()
-        except (TypeError, ValueError):
-            # Старые записи без машиночитаемой даты не удаляем автоматически.
-            kept.append(item)
-            continue
-
-        if received >= cutoff:
-            kept.append(item)
-
-    return kept
+    _write_json(MAIL_ITEMS_FILE, items)
 
 
 def _mailbox_cache_key(config: dict, uidvalidity: str) -> str:
@@ -653,15 +632,6 @@ def _mailbox_cache_key(config: dict, uidvalidity: str) -> str:
         str(config.get("folder") or "INBOX"),
         uidvalidity,
     ])
-
-
-def _load_uid_cache(cache_key: str) -> set[str]:
-    cache = _read_json(MAIL_UID_CACHE_FILE, {})
-
-    if cache.get("mailbox") != cache_key:
-        return set()
-
-    return {str(value) for value in cache.get("uids", [])}
 
 
 def _save_uid_cache(cache_key: str, uids: set[str]) -> None:
@@ -684,13 +654,13 @@ def _uidvalidity(imap) -> str:
     return "unknown"
 
 
-def _search_uids(imap, since: str, email_addr: str):
-    """Ищет стабильные UID; старые тестовые IMAP-адаптеры поддерживаются."""
+def _search_uids(imap):
+    """Ищет все UID выбранной папки; старые IMAP-адаптеры поддерживаются."""
 
     if hasattr(imap, "uid"):
-        return imap.uid("SEARCH", None, "SINCE", since, "FROM", f'"{email_addr}"')
+        return imap.uid("SEARCH", None, "ALL")
 
-    return imap.search(None, "SINCE", since, "FROM", f'"{email_addr}"')
+    return imap.search(None, "ALL")
 
 
 def _fetch_message(imap, uid):
@@ -711,26 +681,24 @@ def _message_bytes(data) -> bytes | None:
 def link_invoice(path: str, order_file: str) -> bool:
     """Привязывает PDF-накладную к заказу по имени обработанного файла."""
 
-    items = load_mail_items()
-
-    for item in items:
-        if item.get("path") == path and item.get("kind") == KIND_INVOICES:
-            item["order_file"] = order_file
-            _save_mail_items(items)
-            return True
-
+    with _mail_check_lock():
+        items = load_mail_items()
+        for item in items:
+            if item.get("path") == path and item.get("kind") == KIND_INVOICES:
+                item["order_file"] = order_file
+                _save_mail_items(items)
+                return True
     return False
 
 
 def unlink_invoice(path: str) -> bool:
-    items = load_mail_items()
-
-    for item in items:
-        if item.get("path") == path and item.get("kind") == KIND_INVOICES:
-            item["order_file"] = ""
-            _save_mail_items(items)
-            return True
-
+    with _mail_check_lock():
+        items = load_mail_items()
+        for item in items:
+            if item.get("path") == path and item.get("kind") == KIND_INVOICES:
+                item["order_file"] = ""
+                _save_mail_items(items)
+                return True
     return False
 
 
@@ -766,11 +734,6 @@ def _unique_path(folder: Path, filename: str) -> Path:
     return path
 
 
-def _search_date(days: int) -> str:
-    day = datetime.now() - timedelta(days=max(days, 1))
-    return f"{day.day:02d}-{_MONTHS[day.month - 1]}-{day.year}"
-
-
 def _received_at(message) -> tuple[str, str]:
     """Возвращает ISO-время и короткое отображение даты письма."""
 
@@ -799,7 +762,7 @@ def _attachments(message, suffixes=ALLOWED_SUFFIXES) -> list[tuple[str, bytes]]:
 
         payload = part.get_payload(decode=True)
 
-        if payload:
+        if payload is not None:
             found.append((_safe_name(filename), payload))
 
     return found
@@ -853,12 +816,28 @@ def _mail_check_lock():
 _mail_check_lock = contextmanager(_mail_check_lock)
 
 
+def _source_for_sender(message, configured: dict[str, dict[str, dict]]) -> dict[str, dict]:
+    address = parseaddr(_decode(message.get("From", "")))[1].casefold()
+    return configured.get(address, {})
+
+
+def _same_stored_attachment(item: dict, kind: str, filename: str) -> bool:
+    if item.get("kind") != kind:
+        return False
+    stored = str(item.get("file", ""))
+    if stored == filename:
+        return True
+    name = Path(filename)
+    return bool(re.fullmatch(
+        rf"{re.escape(name.stem)} \(\d+\){re.escape(name.suffix)}", stored
+    ))
+
+
 def _check_mail_unlocked(config: dict | None = None) -> dict:
-    """Обновляет локальный кеш писем и скачивает только ещё не виденные UID."""
+    """Проверяет всю выбранную папку, сохраняя прогресс при долгой загрузке."""
 
     config = config or load_mail_config()
     result = {"ok": False, "error": "", "items": [], "retryable": False}
-
     if not is_configured(config):
         result["error"] = "Почта не настроена — заполните config/mail.json"
         append_mail_error("Проверка почты", result["error"], config)
@@ -866,122 +845,143 @@ def _check_mail_unlocked(config: dict | None = None) -> dict:
 
     seen = _load_seen()
     new_seen = list(seen)
-    cache_days = int(config.get("cache_days", DEFAULT_CACHE_DAYS))
-    stored_items = _prune_mail_items(load_mail_items(), cache_days)
-    stored_message_ids = {
-        item.get("message_id") for item in stored_items if item.get("message_id")
-    }
+    seen_ids = set(seen)
+    stored_items = load_mail_items()
+    configured = {}
+    for source in sources(config):
+        configured.setdefault(source["email"].casefold(), {})[source["kind"]] = source
+    unknown_source = {"name": "Другие", "email": "", "person": ""}
+    legacy_by_message = {}
+    known_uids = set()
+    cache_key = ""
+    completed_uids = set()
+    changed = 0
+
+    def checkpoint():
+        nonlocal changed
+        if not cache_key:
+            return
+        if changed:
+            _save_mail_items(stored_items)
+            changed = 0
+        _save_uid_cache(cache_key, completed_uids)
+        if new_seen != seen:
+            _save_seen(new_seen)
 
     try:
         with imaplib.IMAP4_SSL(config["imap_server"], int(config["imap_port"])) as imap:
             imap.login(config["email"], config["app_password"])
-            imap.select(config.get("folder") or "INBOX", readonly=True)
-
-            since_days = min(int(config.get("since_days", cache_days)), cache_days)
-            since = _search_date(since_days)
+            status, _ = imap.select(config.get("folder") or "INBOX", readonly=True)
+            if status != "OK":
+                raise imaplib.IMAP4.error("Сервер не открыл папку почты")
             cache_key = _mailbox_cache_key(config, _uidvalidity(imap))
-            cached_uids = _load_uid_cache(cache_key)
-            active_uids = set()
-            uid_sources = {}
+            for item in stored_items:
+                if item.get("mailbox") == cache_key and item.get("uid"):
+                    known_uids.add(str(item["uid"]))
+                elif not item.get("uid") and item.get("message_id"):
+                    legacy_by_message.setdefault(str(item["message_id"]), []).append(item)
 
-            for source in sources(config):
-                status, data = _search_uids(imap, since, source["email"])
-
-                if status != "OK" or not data:
-                    continue
-
-                for uid in data[0].split():
-                    uid_value = uid.decode() if isinstance(uid, bytes) else str(uid)
-                    uid_key = f'{source["email"]}|{source.get("kind", KIND_ORDERS)}|{uid_value}'
-                    active_uids.add(uid_key)
-
-                    if uid_key not in cached_uids:
-                        uid_sources[uid] = (source, uid_key)
-
+            status, data = _search_uids(imap)
+            if status != "OK":
+                raise imaplib.IMAP4.error("Сервер не вернул список писем")
+            active_uids = [
+                (uid, uid.decode() if isinstance(uid, bytes) else str(uid))
+                for uid in ((data[0] or b"").split() if data else [])
+            ]
+            completed_uids = {value for _, value in active_uids if value in known_uids}
             ORDERS_FOLDER.mkdir(parents=True, exist_ok=True)
             INVOICES_FOLDER.mkdir(parents=True, exist_ok=True)
-            completed_uids = cached_uids & active_uids
+            failed_fetches = 0
 
-            for uid, (source, uid_key) in uid_sources.items():
+            for uid, uid_value in active_uids:
+                if uid_value in known_uids:
+                    continue
                 status, data = _fetch_message(imap, uid)
                 raw_message = _message_bytes(data)
-
                 if status != "OK" or raw_message is None:
+                    failed_fetches += 1
                     continue
-
                 message = email.message_from_bytes(raw_message)
-                uid_value = uid.decode() if isinstance(uid, bytes) else str(uid)
                 message_id = message.get("Message-ID") or f"uid:{uid_value}"
-
-                # Если запись уже есть в локальном кеше, вложение скачивать повторно
-                # не нужно. UID всё равно запоминаем для быстрых следующих проверок.
-                if message_id in stored_message_ids:
-                    completed_uids.add(uid_key)
-                    continue
-
-                base = _base_item(message, source, message_id)
-                kind = source.get("kind", KIND_ORDERS)
-                suffixes = PDF_SUFFIXES if kind == KIND_INVOICES else ALLOWED_SUFFIXES
-                attachments = _attachments(message, suffixes)
+                existing = legacy_by_message.pop(message_id, [])
+                if existing:
+                    for item in existing:
+                        item.update(uid=uid_value, mailbox=cache_key)
+                    changed += 1
+                sender_sources = _source_for_sender(message, configured)
+                order_source = sender_sources.get(KIND_ORDERS) or sender_sources.get(KIND_INVOICES) or unknown_source
+                invoice_source = sender_sources.get(KIND_INVOICES)
                 letter_items = []
+                used_existing = set()
+                attachments = [(KIND_ORDERS, filename, payload, order_source)
+                               for filename, payload in _attachments(message)]
+                if invoice_source:
+                    attachments.extend((KIND_INVOICES, filename, payload, invoice_source)
+                                       for filename, payload in _attachments(message, PDF_SUFFIXES))
 
-                for filename, payload in attachments:
-                    folder = INVOICES_FOLDER if kind == KIND_INVOICES else ORDERS_FOLDER
-                    path = _unique_path(folder, filename)
-                    path.write_bytes(payload)
-
-                    item = {
-                        **base,
-                        "file": path.name,
-                        "path": str(path),
-                        "kind": kind,
-                    }
-
-                    if kind == KIND_ORDERS:
-                        item["verdict"] = validate_order_file(path)
-
+                for kind, filename, payload, source in attachments:
+                    matched = next((item for item in existing if id(item) not in used_existing
+                                    and _same_stored_attachment(item, kind, filename)), None)
+                    if matched is not None:
+                        used_existing.add(id(matched))
+                        continue
+                    item = {**_base_item(message, source, message_id), "uid": uid_value,
+                            "mailbox": cache_key, "file": filename, "path": "", "kind": kind}
+                    if kind == KIND_ORDERS and len(payload) > MAX_FILE_MB * 1024 * 1024:
+                        item["verdict"] = {"ok": False, "reason": f"Файл слишком большой (более {MAX_FILE_MB} МБ)"}
+                    else:
+                        folder = ORDERS_FOLDER if kind == KIND_ORDERS else INVOICES_FOLDER
+                        path = _unique_path(folder, filename)
+                        path.write_bytes(payload)
+                        item.update(file=path.name, path=str(path))
+                        if kind == KIND_ORDERS:
+                            item["verdict"] = validate_order_file(path)
                     letter_items.append(item)
 
-                if not letter_items:
-                    letter_items.append({
-                        **base,
-                        "file": "",
-                        "path": "",
-                        "kind": KIND_MESSAGE,
-                    })
-
-                result["items"].extend(letter_items)
-                stored_items = letter_items + stored_items
-                stored_message_ids.add(message_id)
-                completed_uids.add(uid_key)
-
-                if message_id not in new_seen:
+                if letter_items:
+                    placeholders = {id(item) for item in existing if item.get("kind") == KIND_MESSAGE}
+                    if placeholders:
+                        stored_items = [item for item in stored_items if id(item) not in placeholders]
+                        changed += 1
+                if not letter_items and not existing:
+                    letter_items.append({**_base_item(message, order_source, message_id),
+                                         "uid": uid_value, "mailbox": cache_key,
+                                         "file": "", "path": "", "kind": KIND_MESSAGE})
+                if letter_items:
+                    stored_items = letter_items + stored_items
+                    result["items"] = letter_items + result["items"]
+                    changed += 1
+                known_uids.add(uid_value)
+                completed_uids.add(uid_value)
+                if message_id not in seen_ids:
                     new_seen.append(message_id)
+                    seen_ids.add(message_id)
+                if changed >= 100:
+                    checkpoint()
 
-            _save_uid_cache(cache_key, completed_uids)
+            checkpoint()
+            if failed_fetches:
+                result["error"] = f"Не удалось загрузить писем: {failed_fetches}. Повторите проверку."
+                result["retryable"] = True
+                append_mail_error("Проверка почты", result["error"], config)
+                return result
 
-    except imaplib.IMAP4.error as error:
+    except (imaplib.IMAP4.error, OSError, TimeoutError, TypeError, ValueError) as error:
+        try:
+            checkpoint()
+        except OSError:
+            pass
         safe_error = _safe_error_text(error, config)
-        result["error"] = f"Почтовый сервер отказал: {safe_error}"
-        result["retryable"] = _imap_error_is_retryable(error)
+        if isinstance(error, imaplib.IMAP4.error):
+            result["error"] = f"Почтовый сервер отказал: {safe_error}"
+            result["retryable"] = _imap_error_is_retryable(error)
+        elif isinstance(error, (OSError, TimeoutError)):
+            result["error"] = f"Не удалось подключиться к почте: {safe_error}"
+            result["retryable"] = True
+        else:
+            result["error"] = f"Некорректные настройки почты: {safe_error}"
         append_mail_error("Проверка почты", result["error"], config)
         return result
-    except (OSError, TimeoutError) as error:
-        safe_error = _safe_error_text(error, config)
-        result["error"] = f"Не удалось подключиться к почте: {safe_error}"
-        result["retryable"] = True
-        append_mail_error("Проверка почты", result["error"], config)
-        return result
-    except (TypeError, ValueError) as error:
-        safe_error = _safe_error_text(error, config)
-        result["error"] = f"Некорректные настройки почты: {safe_error}"
-        append_mail_error("Проверка почты", result["error"], config)
-        return result
-
-    _save_mail_items(stored_items)
-
-    if new_seen != seen:
-        _save_seen(new_seen)
 
     result["ok"] = True
     return result
@@ -1000,9 +1000,12 @@ def check_mail_with_retry(config: dict | None = None) -> dict:
     config = config or load_mail_config()
     max_attempts, delay = _retry_settings(config)
     result = {"ok": False, "error": "", "items": [], "retryable": False}
+    found = []
 
     for attempt in range(1, max_attempts + 1):
         result = check_mail(config)
+        found.extend(result["items"])
+        result["items"] = list(found)
         result["attempts"] = attempt
 
         if result.get("ok") or not result.get("retryable") or attempt == max_attempts:

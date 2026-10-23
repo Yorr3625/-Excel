@@ -213,7 +213,7 @@ def overview_page(*, State):
             rx.cond(State.today_error != "", rx.el.p(State.today_error, role="alert"),
                 rx.el.div(
                     _today_action("Ожидают загрузки", State.today_waiting, State.open_today_stage("Ожидает загрузки"), "Загрузка ещё не начата", "clock", "01 / Загрузка"),
-                    _today_action("Загрузка начата", State.today_drafts, State.open_today_stage("Загрузка начата"), "Черновики, ожидающие подтверждения", "package", "02 / Подготовка"),
+                    _today_action("Загрузка начата", State.today_drafts, State.open_today_stage("Загрузка начата"), "Черновики и ящики в ожидании взвешивания", "package", "02 / Подготовка"),
                     _today_action("Готовы к отгрузке", State.today_ready, State.open_today_stage("Готов к отгрузке"), "Загрузка подтверждена", "circle_check", "03 / Готовность"),
                     _today_action("Отгрузка идёт", State.today_shipping, State.open_today_stage("Отгрузка идёт"), "Есть подтверждённые позиции отгрузки", "truck", "04 / Отгрузка"),
                     _today_action("Отгрузка завершена", State.today_completed, State.open_today_stage("Отгрузка завершена"), "Все магазины рейса завершены", "circle_check", "05 / Завершение"),

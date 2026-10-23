@@ -20,6 +20,8 @@ from modules.order_records import (
     ZERO_REASON_OPTIONS,
     calculate_net_weight,
     confirm_route_loading,
+    confirm_simple_box_counts,
+    confirm_simple_weight,
     confirm_store_loading,
     loading_line_net_weight,
     loading_batches,
@@ -38,6 +40,8 @@ from modules.order_records import (
     logistics_summary,
     route_loading_ready,
     save_loading_draft,
+    save_simple_box_count_draft,
+    save_simple_weight_draft,
 )
 from orders_dashboard import theme as ui
 
@@ -369,6 +373,8 @@ class LoadingState(rx.State):
     store_confirmed_count: int = 0
     store_confirmed_net_kg: str = "0"
     route_is_ready: bool = False
+    simple_boxes_confirmed: bool = False
+    simple_box_total: str = "0"
     _last_weighing_request: str = ""
     partial_has_batches: bool = False
     partial_send_stores: list[dict] = []
@@ -414,7 +420,7 @@ class LoadingState(rx.State):
             self.select_store(ids[(ids.index(self.selected_store_id) + 1) % len(ids)])
 
     def choose_loading_mode(self, label: str):
-        mode = {"Общая загрузка": "route", "По магазинам": "stores"}.get(label)
+        mode = {"Общая загрузка": "route", "По магазинам": "stores", "Простой · по ящикам": "simple"}.get(label)
         if mode is None or not self.selected_order_id:
             return
         try:
@@ -467,6 +473,12 @@ class LoadingState(rx.State):
         try:
             if destination_id:
                 record = save_store_loading_draft(order_id, route_key, destination_id, position_id, field, value, self.principal, weighing_id)
+            elif self.loading_mode == "simple":
+                record = (
+                    save_simple_box_count_draft(order_id, route_key, position_id, value, self.principal)
+                    if field == "box_count" else
+                    save_simple_weight_draft(order_id, route_key, position_id, field, value, self.principal)
+                )
             else:
                 record = save_loading_draft(order_id, route_key, position_id, field, value, self.principal, weighing_id)
         except OrderRecordError as error:
@@ -474,6 +486,11 @@ class LoadingState(rx.State):
             self.status = str(error)
             return
         self._patch_loading_measurement(record, route_key, destination_id, position_id)
+        if self.loading_mode == "simple" and route_key == self.selected_route_key:
+            self.simple_box_total = _format_number(sum((
+                Decimal((line.get("measurement") or {}).get("box_count") or "0")
+                for line in record["loading_lines"] if line.get("route_key") == route_key
+            ), Decimal(0)))
         self.status = "Черновик сохранён"
 
     def change_context_weighing(self, order_id: str, route_key: str, destination_id: str,
@@ -596,6 +613,8 @@ class LoadingState(rx.State):
         self.store_confirmed_count = 0
         self.store_confirmed_net_kg = "0"
         self.route_is_ready = False
+        self.simple_boxes_confirmed = False
+        self.simple_box_total = "0"
         self.partial_has_batches = False
         self.partial_send_stores = []
         self.partial_send_net_kg = "0"
@@ -667,6 +686,12 @@ class LoadingState(rx.State):
         }
         self.loading_mode = route_loading_mode(record, selected_route_key)
         self.mode_locked = loading_mode_locked(record, selected_route_key)
+        route_state = ((record.get("loading") or {}).get("route_states") or {}).get(selected_route_key, {})
+        self.simple_boxes_confirmed = self.loading_mode == "simple" and route_state.get("status") in {"counted", "weight_draft", "loaded"}
+        self.simple_box_total = _format_number(sum((
+            Decimal((line.get("measurement") or {}).get("box_count") or "0")
+            for line in record.get("loading_lines", []) if line.get("route_key") == selected_route_key
+        ), Decimal(0))) if self.loading_mode == "simple" else "0"
         self.stores_available = store_loading_available(record, selected_route_key)
         self.store_cards = _store_loading_cards(record, selected_route_key) if self.loading_mode == "stores" else []
         self.store_confirmed_count = sum(item["status"] == "loaded" for item in self.store_cards)
@@ -783,6 +808,38 @@ class LoadingState(rx.State):
         self._refresh_options()
         self._apply_record(self.selected_order_id)
         self.status = "Данные рейса обновлены"
+
+    def confirm_simple_boxes(self):
+        if not self.selected_order_id or self.loading_mode != "simple" or self.simple_boxes_confirmed:
+            return
+        try:
+            confirm_simple_box_counts(
+                self.selected_order_id, int(self.selected_record["revision"]), self.selected_route_key, self.principal
+            )
+        except OrderRecordError as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.status = str(error)
+            return
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.save_completed = True
+        self.status = "Ящики подтверждены. Фактический вес пока неизвестен; отгрузка водителем недоступна."
+        self._refresh_options()
+
+    def confirm_simple_route_weight(self):
+        if not self.selected_order_id or self.loading_mode != "simple" or not self.simple_boxes_confirmed or self.route_is_ready:
+            return
+        try:
+            confirm_simple_weight(
+                self.selected_order_id, int(self.selected_record["revision"]), self.selected_route_key, self.principal
+            )
+        except OrderRecordError as error:
+            self._apply_record(self.selected_order_id, self.selected_route_key)
+            self.status = str(error)
+            return
+        self._apply_record(self.selected_order_id, self.selected_route_key)
+        self.save_completed = True
+        self.status = "Фактический вес подтверждён. Водитель может начать отгрузку."
+        self._refresh_options()
 
     def save_loading(self):
         if not self.selected_order_id:
@@ -976,6 +1033,93 @@ def _weighing_controls(part):
     )
 
 
+def _simple_loading_table():
+    return rx.vstack(
+        rx.heading("Простая загрузка · по ящикам", size="3"),
+        rx.text("Укажите количество ящиков каждого товара на весь маршрут. План в кг приведён только для справки: вес загруженного товара сейчас неизвестен.", class_name="loading-panel-description"),
+        rx.hstack(
+            rx.el.label("Сортировка товаров", html_for="simple-loading-sort"),
+            rx.el.select(
+                *[rx.el.option(label, value=value) for value, label in LOADING_SORT_OPTIONS.items()],
+                id="simple-loading-sort", value=LoadingState.loading_sort,
+                on_change=LoadingState.set_loading_sort,
+                aria_label="Сортировка товаров в простой загрузке", class_name="loading-store-mode",
+            ),
+            width="100%", wrap="wrap", align="center", spacing="3",
+        ),
+        rx.cond(
+            LoadingState.simple_boxes_confirmed,
+            rx.heading("Указать фактический вес", size="3"),
+            rx.box(),
+        ),
+        rx.foreach(LoadingState.sorted_loading_rows, lambda row: rx.vstack(
+            rx.hstack(
+                rx.text(row["name"], class_name="loading-product-name"), rx.spacer(),
+                rx.text("План: ", row["planned_kg"], " кг"), width="100%", wrap="wrap",
+            ),
+            rx.el.label(
+                rx.text("Загружено, ящиков", class_name="loading-mobile-label"),
+                rx.debounce_input(
+                    rx.el.input(
+                        value=row["box_count"],
+                        on_change=lambda value: LoadingState.set_context_measurement_field(
+                            row["order_id"], row["route_key"], row["destination_id"], row["id"], "box_count", value
+                        ),
+                        type="text", input_mode="numeric", disabled=LoadingState.simple_boxes_confirmed,
+                        aria_label=row["name"].to(str) + ": загружено ящиков", class_name="loading-amount-input",
+                        key=row["order_id"].to(str) + ":" + row["route_key"].to(str) + ":" + row["id"].to(str) + ":simple:boxes",
+                    ),
+                    debounce_timeout=350, force_notify_on_blur=True, force_notify_by_enter=True,
+                ),
+                class_name="loading-measurement-control",
+            ),
+            rx.cond(
+                LoadingState.simple_boxes_confirmed,
+                rx.foreach(row["weighings"].to(list[dict]), lambda part: rx.vstack(
+                    rx.hstack(
+                        _measurement_control(part, "tare_weight_per_box_kg", "Тара, кг/ящик"),
+                        _measurement_control(part, "gross_weight_kg", "Брутто, кг"),
+                        rx.text("Предварительное нетто: ", rx.cond(part["preview_net_weight_kg"] != "", part["preview_net_weight_kg"].to(str) + " кг", "—")),
+                        width="100%", align="center", wrap="wrap", spacing="3",
+                    ),
+                    rx.cond(
+                        part["needs_zero_reason"],
+                        rx.hstack(
+                            rx.text("Причина нулевой позиции"),
+                            rx.cond(LoadingState.is_read_only, rx.text(part["zero_reason"]), rx.select(
+                                list(ZERO_REASON_OPTIONS), value=part["zero_reason"],
+                                on_change=lambda value: LoadingState.set_context_measurement_field(
+                                    part["order_id"], part["route_key"], part["destination_id"], part["id"], "zero_reason", value
+                                ), placeholder="Укажите причину",
+                            )), wrap="wrap",
+                        ), rx.box(),
+                    ),
+                    align="start", width="100%", spacing="2", key=part["id"].to(str),
+                )), rx.box(),
+            ),
+            class_name="loading-weighing-product", width="100%", align="start", spacing="3", key=row["id"].to(str),
+        )),
+        rx.text("Всего ящиков: ", LoadingState.simple_box_total, class_name="loading-table-total"),
+        rx.cond(
+            LoadingState.simple_boxes_confirmed,
+            rx.vstack(
+                rx.cond(
+                    LoadingState.route_is_ready,
+                    rx.text("Фактический вес подтверждён. Водитель может начать отгрузку.", class_name="loading-message loading-message-success"),
+                    rx.vstack(
+                        rx.text("Подсчёт ящиков завершён. Вес ещё не указан — отгрузка водителем и рейс машины недоступны.", class_name="loading-panel-description"),
+                        rx.button("Подтвердить фактический вес", on_click=LoadingState.confirm_simple_route_weight, class_name="loading-primary"),
+                        align="start", width="100%", spacing="2",
+                    ),
+                ),
+                width="100%", align="start", spacing="2",
+            ),
+            rx.button("Подтвердить ящики", on_click=LoadingState.confirm_simple_boxes, class_name="loading-primary"),
+        ),
+        width="100%", align="start", spacing="3",
+    )
+
+
 def _loading_table():
     return rx.vstack(
         rx.heading("Загрузка", size="3"),
@@ -1109,14 +1253,16 @@ def _loading_mode_control():
             rx.el.select(
                 rx.el.option("Общая загрузка", value="Общая загрузка"),
                 rx.el.option("По магазинам", value="По магазинам", disabled=~LoadingState.stores_available),
-                value=rx.cond(LoadingState.loading_mode == "stores", "По магазинам", "Общая загрузка"),
+                rx.el.option("Простой · по ящикам", value="Простой · по ящикам"),
+                value=rx.cond(LoadingState.loading_mode == "simple", "Простой · по ящикам",
+                              rx.cond(LoadingState.loading_mode == "stores", "По магазинам", "Общая загрузка")),
                 on_change=LoadingState.choose_loading_mode, disabled=LoadingState.mode_locked,
                 aria_label="Режим загрузки", class_name="loading-store-mode",
             ),
             align="center", wrap="wrap", spacing="3", width="100%",
         ),
         rx.cond(LoadingState.mode_locked, rx.text("Режим зафиксирован: загрузка уже начата.", class_name="loading-panel-description"), rx.box()),
-        rx.cond(~LoadingState.stores_available, rx.text("Для этого заказа нет точных связей товаров с магазинами. Доступна общая загрузка.", class_name="loading-panel-description"), rx.box()),
+        rx.cond(~LoadingState.stores_available, rx.text("Для этого заказа нет точных связей товаров с магазинами. Доступны общая и простая загрузка.", class_name="loading-panel-description"), rx.box()),
         align="start", spacing="2", width="100%",
     )
 
@@ -1255,20 +1401,24 @@ def loading_page():
                         rx.vstack(
                             _loading_mode_control(),
                             rx.cond(LoadingState.loading_mode == "stores", _store_loading_selector(), rx.box()),
-                            _loading_table(),
+                            rx.cond(LoadingState.loading_mode == "simple", _simple_loading_table(), _loading_table()),
                             rx.cond(
-                                LoadingState.loading_mode == "stores",
-                                rx.hstack(
-                                    rx.cond(LoadingState.is_read_only,
-                                            rx.text("Загрузка магазина подтверждена — доступен просмотр.", class_name="loading-message loading-message-success"),
-                                            rx.button("Подтвердить загрузку магазина", on_click=LoadingState.confirm_selected_store, class_name="loading-primary")),
-                                    rx.button("Следующий магазин", on_click=LoadingState.next_store, disabled=LoadingState.store_cards.length() < 2, class_name="loading-secondary"),
-                                    align="center", width="100%", wrap="wrap", spacing="3",
-                                ),
+                                LoadingState.loading_mode == "simple",
+                                rx.box(),
                                 rx.cond(
-                                    LoadingState.is_read_only,
-                                    rx.text("Загрузка маршрута подтверждена. Отгрузку по магазинам вводит водитель этого маршрута.", class_name="loading-message loading-message-success"),
-                                    rx.button("Подтвердить загрузку маршрута", on_click=LoadingState.save_loading, class_name="loading-primary"),
+                                    LoadingState.loading_mode == "stores",
+                                    rx.hstack(
+                                        rx.cond(LoadingState.is_read_only,
+                                                rx.text("Загрузка магазина подтверждена — доступен просмотр.", class_name="loading-message loading-message-success"),
+                                                rx.button("Подтвердить загрузку магазина", on_click=LoadingState.confirm_selected_store, class_name="loading-primary")),
+                                        rx.button("Следующий магазин", on_click=LoadingState.next_store, disabled=LoadingState.store_cards.length() < 2, class_name="loading-secondary"),
+                                        align="center", width="100%", wrap="wrap", spacing="3",
+                                    ),
+                                    rx.cond(
+                                        LoadingState.is_read_only,
+                                        rx.text("Загрузка маршрута подтверждена. Отгрузку по магазинам вводит водитель этого маршрута.", class_name="loading-message loading-message-success"),
+                                        rx.button("Подтвердить загрузку маршрута", on_click=LoadingState.save_loading, class_name="loading-primary"),
+                                    ),
                                 ),
                             ),
                             rx.cond(LoadingState.loading_mode == "stores", _partial_loading_control(), rx.box()),

@@ -558,6 +558,7 @@ def _dispatch_stage_badge(stage):
         ("Отгрузка идёт", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
         ("Готов к отгрузке", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
         ("Загружен частично", _pill(stage, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
+        ("Ящики учтены, ожидается взвешивание", _pill(stage, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
         ("Загрузка начата", _pill(stage, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
         _pill(stage, ui.STATUS_GRAY_BG, ui.STATUS_GRAY_TEXT),
     )

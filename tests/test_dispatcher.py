@@ -50,6 +50,39 @@ def test_loading_stage_is_route_scoped(records, state, stage):
     assert trips[0]["shipped_net_kg"] == "—"
 
 
+def test_counted_simple_route_is_filtered_as_waiting_for_weight(records, monkeypatch):
+    record = records[0]
+    record["loading"]["route_states"]["route_1"] = {"mode": "simple", "status": "counted"}
+    trip = order_records.list_route_trip_summaries(DAY, "Область")[0]
+    assert trip["stage"] == "Ящики учтены, ожидается взвешивание"
+    assert not trip["loading_ready"] and trip["loaded_net_kg"] == "—"
+
+    monkeypatch.setattr(dashboard.driver_orders, "route_assignment_summaries", lambda pairs: [])
+    monkeypatch.setattr(dashboard.goods_returns, "list_returns", lambda: [])
+    state = harness()
+    state.dispatch_trips = dashboard._dispatch_trips(DAY, "Область")
+    state.dispatch_stage = "Готов к отгрузке"
+    assert not state.dispatch_filtered_trips
+    state.dispatch_stage = "Загрузка начата"
+    assert [item["stage"] for item in state.dispatch_filtered_trips] == [trip["stage"]]
+    state.dispatch_stage = trip["stage"]
+    assert len(state.dispatch_filtered_trips) == 1
+
+
+def test_today_overview_counts_waiting_weight_as_preparation_not_ready(monkeypatch):
+    monkeypatch.setattr(dashboard, "list_route_trip_summaries", lambda day, mode: [
+        {"stage": "Ящики учтены, ожидается взвешивание"},
+        {"stage": "Готов к отгрузке"},
+    ])
+    monkeypatch.setattr(dashboard.goods_returns, "list_returns", lambda: [])
+    monkeypatch.setattr(dashboard.vehicle_trips, "list_trips", lambda: [])
+    state = SimpleNamespace(today_mode="Город", today_error="")
+    dashboard.State.load_today_overview.fn(state)
+    assert state.today_drafts == 1
+    assert state.today_ready == 1
+    assert not state.today_error
+
+
 def test_partial_store_is_not_completed_and_zero_shipment_is_a_fact(records):
     positions = records[0]["routes"][0]["destinations"][0]["positions"]
     positions[0]["shipment"] = {"status": "completed", "measurement": measurement("90")}

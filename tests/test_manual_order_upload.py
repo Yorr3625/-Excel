@@ -1,4 +1,5 @@
 import asyncio
+import json
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 import orders_dashboard.orders_dashboard as dashboard
-from modules import dashboard_sessions, mail_watcher
+from modules import dashboard_sessions, mail_watcher, order_records, paths
 from orders_dashboard.api.admin import download_order_source_file
 
 
@@ -48,6 +49,88 @@ def test_manual_excel_upload_saves_bytes_and_updates_selected_file(tmp_path, mon
     assert state.status == "Файл загружен: заказ.xlsx"
     assert state.order_mail_metadata is None
     assert state.output_file == state.log_file == state.error_text == ""
+
+
+def test_order_details_offer_processed_and_source_as_distinct_downloads(tmp_path, monkeypatch):
+    source_folder = tmp_path / "uploads"
+    source_folder.mkdir()
+    source = source_folder / "заказ.xlsx"
+    original = Workbook()
+    original.active.title = "Исходный"
+    original.active.append(["Дыня", 5])
+    original.save(source)
+    original.close()
+
+    result = tmp_path / "processed" / "20.10.26" / "заказ_обработан_12-00-00.xlsx"
+    result.parent.mkdir(parents=True)
+    processed = Workbook()
+    processed.active.title = "Маршрут №4"
+    processed.active.append(["Товар", "Сумма", "ФМ 47"])
+    processed.active.append(["Дыня", "", 5])
+    processed.save(result)
+    processed.close()
+
+    monkeypatch.setattr(paths, "PROCESSED_FOLDER", result.parent.parent)
+    monkeypatch.setattr(paths, "ORDER_RECORDS_FILE", tmp_path / "order_records.json")
+    monkeypatch.setattr(mail_watcher, "UPLOADS_FOLDER", source_folder)
+    monkeypatch.setattr(mail_watcher, "load_mail_items", lambda: [])
+    order_records.create_processed_order_record(result, source.name, "Клиент", "Город")
+    state = SimpleNamespace(_refresh_order_invoices=lambda: None)
+    state._show_order_details = dashboard.State._show_order_details.__get__(state)
+    dashboard.State.open_order_details.fn(state, source.name, "20.10.26 12:00")
+
+    assert state.selected_order_processed_path == f"20.10.26/{result.name}"
+    assert state.selected_order_processed_name == result.name
+    downloads = []
+    monkeypatch.setattr(dashboard.rx, "download", lambda **kwargs: downloads.append(kwargs))
+    dashboard.State.download_order_processed_file.fn(state)
+    dashboard.State.download_order_source_file.fn(state)
+
+    client = TestClient(dashboard.custom_api)
+    token = dashboard_sessions.create_session()
+    try:
+        client.cookies.set(dashboard_sessions.SESSION_COOKIE, token)
+        result_response = client.get(downloads[0]["url"])
+        source_response = client.get(downloads[1]["url"])
+    finally:
+        dashboard_sessions.destroy_session(token)
+    assert result_response.status_code == source_response.status_code == 200
+    assert result_response.content == result.read_bytes() != source_response.content
+    assert source_response.content == source.read_bytes()
+    assert downloads[0]["filename"] == result.name
+    assert downloads[1]["filename"] == source.name
+    processed_copy = load_workbook(BytesIO(result_response.content))
+    source_copy = load_workbook(BytesIO(source_response.content))
+    assert processed_copy.sheetnames == ["Маршрут №4"]
+    assert source_copy.sheetnames == ["Исходный"]
+    processed_copy.close()
+    source_copy.close()
+
+    dashboard.State._show_order_details(state, source.name, "20.10.26 11:00", "Получен")
+    assert state.selected_order_processed_path == ""
+    assert state.selected_order_processed_name == ""
+
+
+def test_order_details_labels_downloads_unambiguously():
+    rendered = str(dashboard.order_details_drawer())
+    assert json.dumps("Скачать обработанный") in rendered
+    assert json.dumps("Скачать исходный") in rendered
+    assert "download_order_processed_file" in rendered
+    assert "download_order_source_file" in rendered
+
+
+def test_missing_processed_result_is_reported_without_serving_source(monkeypatch):
+    state = SimpleNamespace(selected_order_processed_path="20.10.26/missing.xlsx", order_detail_status="")
+    monkeypatch.setattr(dashboard, "resolve_processed_file", lambda relative: (_ for _ in ()).throw(
+        dashboard.ProcessedFileError("Файл не найден")
+    ))
+    downloads = []
+    monkeypatch.setattr(dashboard.rx, "download", lambda **kwargs: downloads.append(kwargs))
+
+    dashboard.State.download_order_processed_file.fn(state)
+
+    assert "Обработанный файл больше недоступен" in state.order_detail_status
+    assert downloads == []
 
 
 def test_manual_order_source_download_requires_login(tmp_path, monkeypatch):

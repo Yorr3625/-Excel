@@ -14,6 +14,8 @@ def _isolated(tmp_path, monkeypatch):
         "MAIL_EXAMPLE_CONFIG_FILE",
         tmp_path / "mail.example.json",
     )
+    monkeypatch.setattr(mail_watcher, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(mail_watcher, "MAIL_CHECK_LOCK_FILE", tmp_path / "mail_check.lock")
     monkeypatch.setattr(mail_watcher, "SEEN_FILE", tmp_path / "mail_seen.json")
     monkeypatch.setattr(mail_watcher, "MAIL_ITEMS_FILE", tmp_path / "mail_items.json")
     monkeypatch.setattr(mail_watcher, "MAIL_UID_CACHE_FILE", tmp_path / "mail_uid_cache.json")
@@ -179,7 +181,6 @@ def test_save_credentials_keeps_existing_key_when_edit_field_is_empty():
         {"enabled": False},
         {"email": ""},
         {"app_password": ""},
-        {"senders": []},
     ],
 )
 def test_incomplete_config_is_not_ready(overrides):
@@ -216,15 +217,6 @@ def test_unique_path_does_not_overwrite_existing_order(tmp_path):
 
     assert path.name == "заказ (2).xlsx"
     assert (folder / "заказ.xlsx").read_text(encoding="utf-8") == "первый"
-
-
-def test_search_date_uses_english_month():
-    """IMAP не понимает названия месяцев в локали системы."""
-
-    date = mail_watcher._search_date(1)
-    month = date.split("-")[1]
-
-    assert month in mail_watcher._MONTHS
 
 
 def test_seen_ids_survive_roundtrip():
@@ -466,6 +458,16 @@ def test_mail_retry_stops_after_success(monkeypatch):
     assert sleeps == [0.25, 0.25]
 
 
+def test_mail_retry_reports_orders_saved_before_connection_recovery(monkeypatch):
+    attempts = iter((
+        {"ok": False, "error": "обрыв", "items": [{"file": "первый.xlsx"}], "retryable": True},
+        {"ok": True, "error": "", "items": [{"file": "второй.xlsx"}], "retryable": False},
+    ))
+    monkeypatch.setattr(mail_watcher, "check_mail", lambda config: next(attempts))
+    result = mail_watcher.check_mail_with_retry(_config(retry_delay_seconds=0))
+    assert result["ok"] and [item["file"] for item in result["items"]] == ["первый.xlsx", "второй.xlsx"]
+
+
 def test_mail_retry_does_not_repeat_permanent_error(monkeypatch):
     calls = []
 
@@ -649,19 +651,172 @@ def test_seen_letter_missing_from_cache_is_restored(monkeypatch, _stores_for_val
     assert mail_watcher.load_mail_items()[0]["message_id"] == message_id
 
 
-def test_mail_cache_removes_old_messages_but_keeps_linked_invoices():
-    now = datetime.now().astimezone()
-    recent = (now - timedelta(days=2)).isoformat()
-    old = (now - timedelta(days=30)).isoformat()
-    items = [
-        {"message_id": "recent", "received_at": recent, "order_file": ""},
-        {"message_id": "old", "received_at": old, "order_file": ""},
-        {"message_id": "linked", "received_at": old, "order_file": "заказ.xlsx"},
-    ]
+def test_mail_cache_retains_full_history_without_item_limit():
+    old = (datetime.now().astimezone() - timedelta(days=365)).isoformat()
+    items = [{"message_id": str(index), "received_at": old, "order_file": ""} for index in range(1005)]
+    mail_watcher._save_mail_items(items)
+    assert mail_watcher.load_mail_items() == items
 
-    kept = mail_watcher._prune_mail_items(items, 14)
 
-    assert [item["message_id"] for item in kept] == ["recent", "linked"]
+def test_searches_entire_inbox_and_detects_orders_from_unknown_senders(monkeypatch, _stores_for_validation):
+    old = _letter_with_attachment("потерянный заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
+                                  sender="Неизвестный <NEW@example.com>", subject="Пересланное письмо")
+    old["Date"] = "Mon, 05 Jan 2026 09:30:00 +0300"
+    plain = _letter_with_attachment("чужой.xlsx", b"not a workbook", sender="other@example.com")
+    plain.replace_header("Message-ID", "<other@example.com>")
+
+    class InboxIMAP(_FakeIMAP):
+        def search(self, charset, *criteria):
+            assert criteria == ("ALL",)
+            return super().search(charset, *criteria)
+
+    fake = InboxIMAP([old, plain])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+    config = _config(senders=[], sources=[])
+    first = mail_watcher.check_mail(config)
+    second = mail_watcher.check_mail(config)
+
+    assert first["ok"] and len(first["items"]) == 2
+    assert fake.search_calls == 2 and fake.fetch_calls == 2 and fake.readonly_used
+    assert second["items"] == []
+    order = next(item for item in first["items"] if item["file"].startswith("потерянный"))
+    assert order["source_name"] == "Другие"
+    assert order["verdict"]["ok"] and order["verdict"]["mode"] == "Область"
+    assert order["subject"] == "Пересланное письмо"
+    assert not next(item for item in first["items"] if item["file"] == "чужой.xlsx")["verdict"]["ok"]
+    assert [item["file"] for item in mail_watcher.load_mail_items()] == [item["file"] for item in first["items"]]
+
+
+def test_unknown_plain_letter_is_visible_and_duplicate_message_ids_are_distinct(monkeypatch):
+    from email.message import EmailMessage
+
+    plain = EmailMessage()
+    plain["From"] = "Unknown <outside@example.com>"
+    plain["Message-ID"] = "<shared@example.com>"
+    plain["Subject"] = "Перенос заказа"
+    plain.set_content("Без вложений")
+    copy = EmailMessage()
+    copy["From"] = "another@example.com"
+    copy["Message-ID"] = "<shared@example.com>"
+    copy["Subject"] = "Другое письмо с тем же Message-ID"
+    copy.set_content("Нет файлов")
+    fake = _FakeIMAP([plain, copy])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+    config = _config(senders=[], sources=[])
+    result = mail_watcher.check_mail(config)
+    assert result["ok"]
+    assert len(result["items"]) == 2
+    assert all(item["kind"] == mail_watcher.KIND_MESSAGE for item in result["items"])
+    assert {item["subject"] for item in mail_watcher.load_mail_items()} == {
+        "Перенос заказа", "Другое письмо с тем же Message-ID",
+    }
+    assert all(item["source_name"] == "Другие" for item in result["items"])
+    assert mail_watcher.check_mail(config)["items"] == []
+    assert fake.fetch_calls == 2
+
+
+def test_invoice_source_with_excel_still_detects_order(monkeypatch, _stores_for_validation):
+    letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
+                                     sender="Бухгалтер <ZOSYA-C@mail.ru>")
+    letter.add_attachment(b"%PDF-1.4 invoice", maintype="application", subtype="pdf", filename="акт.pdf")
+    fake = _FakeIMAP([letter])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+    config = _config(senders=[], sources=[{"email": "zosya-c@mail.ru", "name": "Бухгалтер", "kind": "invoices"}])
+    result = mail_watcher.check_mail(config)
+    assert result["ok"]
+    assert {item["kind"] for item in result["items"]} == {mail_watcher.KIND_ORDERS, mail_watcher.KIND_INVOICES}
+    assert next(item for item in result["items"] if item["kind"] == mail_watcher.KIND_ORDERS)["verdict"]["ok"]
+    assert {item["source_name"] for item in result["items"]} == {"Бухгалтер"}
+
+
+def test_partially_failed_full_sync_resumes_without_duplicate_files(monkeypatch, _stores_for_validation):
+    first = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
+    second = _letter_with_attachment("ещё.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
+
+    class InterruptedIMAP(_FakeIMAP):
+        def fetch(self, uid, spec):
+            if uid == b"2":
+                raise mail_watcher.imaplib.IMAP4.abort("Connection closed")
+            return super().fetch(uid, spec)
+
+    broken = InterruptedIMAP([first, second])
+    working = _FakeIMAP([first, second])
+    clients = iter((broken, working))
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: next(clients))
+    assert not mail_watcher.check_mail(_config())["ok"]
+    assert len(mail_watcher.load_mail_items()) == 1
+    result = mail_watcher.check_mail(_config())
+    assert result["ok"] and len(result["items"]) == 1
+    assert len(mail_watcher.load_mail_items()) == 2
+    assert sorted(path.name for path in mail_watcher.ORDERS_FOLDER.iterdir()) == ["ещё.xlsx", "заказ.xlsx"]
+
+
+def test_legacy_uid_cache_and_items_reconcile_without_duplicate_attachments(monkeypatch, _stores_for_validation):
+    letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]))
+    fake = _FakeIMAP([letter])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+    config = _config()
+    assert mail_watcher.check_mail(config)["ok"]
+    saved = mail_watcher.load_mail_items()
+    saved[0].pop("uid", None)
+    saved[0].pop("mailbox", None)
+    mail_watcher._save_mail_items(saved)
+    key = mail_watcher._mailbox_cache_key(config, "12345")
+    mail_watcher._save_uid_cache(key, {"boss@example.com|orders|1"})
+
+    result = mail_watcher.check_mail(config)
+    assert result["ok"] and result["items"] == []
+    assert len(mail_watcher.load_mail_items()) == 1
+    assert [path.name for path in mail_watcher.ORDERS_FOLDER.iterdir()] == ["заказ.xlsx"]
+    assert mail_watcher.load_mail_items()[0]["uid"] == "1"
+    assert fake.fetch_calls == 2
+
+
+def test_empty_excel_attachment_is_listed_as_invalid_order(monkeypatch):
+    letter = _letter_with_attachment("пустой.xlsx", b"", sender="outside@example.com")
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: _FakeIMAP([letter]))
+    item = mail_watcher.check_mail(_config(senders=[], sources=[]))["items"][0]
+    assert item["file"] == "пустой.xlsx"
+    assert not item["verdict"]["ok"] and item["verdict"]["reason"] == "Файл пустой"
+
+
+def test_oversize_unknown_excel_is_listed_without_filling_order_storage(monkeypatch):
+    letter = _letter_with_attachment("большой.xlsx", b"some data", sender="outside@example.com")
+    monkeypatch.setattr(mail_watcher, "MAX_FILE_MB", 0)
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: _FakeIMAP([letter]))
+    item = mail_watcher.check_mail(_config(senders=[], sources=[]))["items"][0]
+    assert item["kind"] == mail_watcher.KIND_ORDERS
+    assert not item["verdict"]["ok"] and "слишком большой" in item["verdict"]["reason"]
+    assert item["path"] == "" and not list(mail_watcher.ORDERS_FOLDER.iterdir())
+
+
+def test_legacy_invoice_letter_adds_previously_ignored_excel(monkeypatch, _stores_for_validation):
+    letter = _letter_with_attachment("заказ.xlsx", _order_xlsx_bytes(["фм 10", "фм 14", "фм 17"]),
+                                     sender="zosya-c@mail.ru")
+    letter.add_attachment(b"%PDF-1.4 invoice", maintype="application", subtype="pdf", filename="акт.pdf")
+    mail_watcher.INVOICES_FOLDER.mkdir()
+    pdf = mail_watcher.INVOICES_FOLDER / "акт.pdf"
+    pdf.write_bytes(b"%PDF-1.4 invoice")
+    mail_watcher._save_mail_items([{
+        "message_id": letter["Message-ID"], "kind": mail_watcher.KIND_INVOICES,
+        "source_name": "Бухгалтер", "file": pdf.name, "path": str(pdf), "order_file": "",
+    }])
+    fake = _FakeIMAP([letter])
+    monkeypatch.setattr(mail_watcher.imaplib, "IMAP4_SSL", lambda *a, **kw: fake)
+    config = _config(senders=[], sources=[{"email": "zosya-c@mail.ru", "name": "Бухгалтер", "kind": "invoices"}])
+    result = mail_watcher.check_mail(config)
+    assert result["ok"]
+    assert len(result["items"]) == 1 and result["items"][0]["kind"] == mail_watcher.KIND_ORDERS
+    assert result["items"][0]["verdict"]["ok"]
+    assert len(mail_watcher.load_mail_items()) == 2
+    assert [path.name for path in mail_watcher.INVOICES_FOLDER.iterdir()] == ["акт.pdf"]
+
+
+def test_configured_mailbox_can_have_no_sources():
+    assert mail_watcher.is_configured(_config(senders=[], sources=[]))
+    ok, _ = mail_watcher.save_mail_credentials("me@gmail.com", "app key")
+    assert ok and mail_watcher.is_configured(mail_watcher.load_mail_config())
+    assert mail_watcher.sources(mail_watcher.load_mail_config()) == []
 
 
 def test_letter_without_attachment_is_kept_as_message(monkeypatch, _stores_for_validation):

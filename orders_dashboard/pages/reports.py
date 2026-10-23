@@ -675,6 +675,30 @@ def order_invoice_row(item, linked: bool, *, State):
     )
 
 
+def order_processed_file_row(*, State):
+    return rx.vstack(
+        rx.hstack(
+            fa_icon(tag="file_spreadsheet", size=16, color=ui.STATUS_GREEN_TEXT),
+            rx.text(State.selected_order_processed_name, color=text(), font_size="13px", font_weight=ui.FONT_WEIGHT_SEMIBOLD),
+            width="100%",
+            align="center",
+        ),
+        rx.text("Обработанный файл заказа", color=muted(), font_size="12px"),
+        secondary_button(
+            "Скачать обработанный",
+            on_click=State.download_order_processed_file,
+            width="190px",
+        ),
+        align="start",
+        spacing="2",
+        width="100%",
+        padding="14px",
+        border=f"1px solid {border()}",
+        border_radius="10px",
+        background=surface_alt(),
+    )
+
+
 def order_source_file_row(*, State):
     return rx.vstack(
         rx.hstack(
@@ -685,9 +709,9 @@ def order_source_file_row(*, State):
         ),
         rx.text("Исходный файл заказа", color=muted(), font_size="12px"),
         secondary_button(
-            "Скачать",
+            "Скачать исходный",
             on_click=State.download_order_source_file,
-            width="120px",
+            width="160px",
         ),
         align="start",
         spacing="2",
@@ -757,7 +781,16 @@ def order_details_drawer(*, State):
                 rx.cond(
                     State.order_detail_tab == "Накладные",
                     rx.vstack(
-                        rx.heading("Файл заказа", color=text(), size="4"),
+                        rx.heading("Файлы заказа", color=text(), size="4"),
+                        rx.cond(
+                            State.selected_order_processed_path != "",
+                            order_processed_file_row(State=State),
+                            rx.cond(
+                                State.selected_order_time_label == "Обработан",
+                                rx.text("Связанный обработанный файл не найден. Проверьте список готовых файлов в Истории.", color=muted(), font_size="12px"),
+                                rx.box(),
+                            ),
+                        ),
                         order_source_file_row(State=State),
                         rx.divider(),
                         rx.heading("Привязанные накладные", color=text(), size="4"),
