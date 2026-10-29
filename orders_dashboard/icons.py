@@ -56,6 +56,10 @@ TABLER_ICON_MAP = {
     "refresh_cw": "IconRefresh",
     "undo_2": "IconArrowBackUp",
     "user": "IconUser",
+    "users": "IconUsers",
+    "calendar_check": "IconCalendarCheck",
+    "pencil": "IconPencil",
+    "trash": "IconTrash",
 }
 
 

@@ -51,6 +51,7 @@ DRIVER_DOCUMENTS_FOLDER = DATA_DIR / "driver_documents"
 DRIVER_ORDERS_FOLDER = DATA_DIR / "driver_orders"
 DRIVER_ORDERS_INDEX_FILE = DRIVER_ORDERS_FOLDER / "index.json"
 DRIVER_MILEAGE_FILE = DATA_DIR / "driver_mileage.json"
+ATTENDANCE_FILE = DATA_DIR / "attendance.json"
 GDEMOI_FILE = CONFIG_DIR / "gdemoi.json"
 
 

@@ -386,6 +386,41 @@ html[data-theme="dark"] .dashboard-design.app label[for="theme-dark"] { backgrou
 
 .dashboard-design.app.login-app { --control-height: 44px; --control-radius: 8px; position: relative; isolation: isolate; display: flex; flex-direction: column; min-height: 100vh; min-height: 100svh; background: var(--canvas); }
 .dashboard-design .animated-gradient { position: absolute; inset: 0; z-index: -1; background: linear-gradient(45deg, #667eea 0%, #764ba2 50%, #f093fb 100%); background-size: 200% 200%; animation: dashboard-gradient-shift 8s ease alternate infinite; overflow: hidden; }
+.dashboard-design .personnel-page > * { grid-column: 1 / -1; min-width: 0; }
+.dashboard-design .personnel-toolbar, .dashboard-design .personnel-inline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dashboard-design .personnel-toolbar { justify-content: space-between; }
+.dashboard-design .personnel-field { display: grid; gap: 7px; font-size: 12px; color: var(--secondary); min-width: 0; }
+.dashboard-design .personnel-field input, .dashboard-design .personnel-select, .dashboard-design .personnel-search { min-height: 40px; width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--surface); color: var(--ink); font: inherit; }
+.dashboard-design .personnel-search { width: min(100%, 300px); }
+.dashboard-design .personnel-board { display: grid; grid-auto-flow: column; grid-auto-columns: 274px; gap: 16px; overflow-x: auto; align-items: stretch; padding-bottom: 12px; }
+.dashboard-design .personnel-column { display: flex; flex-direction: column; gap: 16px; min-height: 520px; padding: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--card-radius); box-shadow: var(--shadow); min-width: 0; }
+.dashboard-design .personnel-unassigned { background: var(--surface-muted); }
+.dashboard-design .personnel-column h2, .dashboard-design .personnel-panel h2 { font-size: 14px; font-weight: 600; margin: 0; }
+.dashboard-design .personnel-column-title, .dashboard-design .personnel-column-actions, .dashboard-design .personnel-person { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.dashboard-design .personnel-column-actions { justify-content: space-between; margin-top: 10px; }
+.dashboard-design .personnel-count { white-space: nowrap; margin-left: auto; padding: 3px 8px; border-radius: var(--radius-pill); background: var(--accent-soft); color: var(--accent); font-size: 12px; }
+.dashboard-design .personnel-plate { padding: 4px 8px; border-radius: 6px; background: var(--surface-muted); font-size: 12px; overflow-wrap: anywhere; }
+.dashboard-design .personnel-icon-button { display: grid; place-items: center; width: 30px; height: 32px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; color: var(--secondary); }
+.dashboard-design .personnel-icon-button:hover { background: var(--surface-muted); }
+.dashboard-design .personnel-column-members { display: grid; gap: 10px; }
+.dashboard-design .personnel-employee-card { display: grid; gap: 12px; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--control-radius); }
+.dashboard-design .personnel-avatar { display: grid; place-items: center; width: 34px; height: 34px; flex-shrink: 0; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; }
+.dashboard-design .personnel-identity { display: grid; justify-items: start; gap: 5px; min-width: 0; }
+.dashboard-design .personnel-identity strong { font-size: 12px; overflow-wrap: anywhere; }
+.dashboard-design .personnel-select { font-size: 12px; }
+.dashboard-design .personnel-empty, .dashboard-design .personnel-message { font-size: 12px; color: var(--secondary); }
+.dashboard-design .personnel-vehicle-info { margin: auto 0 0; padding-top: 16px; border-top: 1px solid var(--border); display: grid; gap: 14px; font-size: 12px; }
+.dashboard-design .personnel-vehicle-info dt { color: var(--secondary); margin-bottom: 5px; }
+.dashboard-design .personnel-vehicle-info dd { margin: 0; overflow-wrap: anywhere; }
+.dashboard-design .personnel-add-column { display: flex; align-items: center; justify-content: center; gap: 12px; flex-direction: column; min-height: 300px; border: 1px dashed var(--accent-border); border-radius: var(--card-radius); background: transparent; color: var(--accent); cursor: pointer; }
+.dashboard-design .personnel-panel { padding: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--card-radius); }
+.dashboard-design .personnel-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+@media (max-width: 767px) {
+  .dashboard-design .personnel-board { grid-auto-flow: row; grid-template-columns: minmax(0, 1fr); grid-auto-columns: auto; overflow: visible; }
+  .dashboard-design .personnel-column { min-height: auto; }
+  .dashboard-design .personnel-form { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-design .personnel-add-column { min-height: 100px; }
+}
 .dashboard-design .animated-gradient::after { content: ''; position: absolute; inset: 0; background: rgb(246 247 249 / 72%); }
 html[data-theme="dark"] .dashboard-design.login-app .animated-gradient::after { background: rgb(19 22 25 / 78%); }
 @keyframes dashboard-gradient-shift {

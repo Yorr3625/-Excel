@@ -237,6 +237,27 @@ def driver_avatar(initials, assigned=True, label=""):
     )
 
 
+def employee_avatar(initials):
+    return rx.el.span(initials, class_name="personnel-avatar", aria_hidden=True)
+
+
+def employee_role_pill(role):
+    return rx.match(
+        role,
+        ("loader", _pill("Грузчик", ui.STATUS_GREEN_BG, ui.STATUS_GREEN_TEXT)),
+        ("expeditor", _pill("Экспедитор", ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
+        _pill("Водитель", ui.PURPLE_BG, ui.PURPLE_DARK),
+    )
+
+
+def personnel_field(label, name, value="", input_type="text", **props):
+    return rx.el.label(
+        rx.el.span(label),
+        rx.el.input(name=name, default_value=value, type=input_type, **props),
+        class_name="personnel-field",
+    )
+
+
 def table_container(*children):
     return rx.box(
         *children,
@@ -252,6 +273,8 @@ def navigation_icon(name, size=19):
     return rx.match(
         name,
         ("layout_dashboard", fa_icon(tag="layout_dashboard", size=size)),
+        ("truck", fa_icon(tag="truck", size=size)),
+        ("calendar_check", fa_icon(tag="calendar_check", size=size)),
         ("package", fa_icon(tag="package", size=size)),
         ("route", fa_icon(tag="route", size=size)),
         ("file_spreadsheet", fa_icon(tag="file_spreadsheet", size=size)),

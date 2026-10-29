@@ -153,7 +153,7 @@ def update_vehicle(
     raise FleetError("Транспорт не найден")
 
 
-ROLES = {"driver", "loader"}
+ROLES = {"driver", "loader", "expeditor"}
 
 
 def employee_role(employee: dict) -> str:

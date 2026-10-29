@@ -509,11 +509,13 @@ def fleet_drivers_tab(*, State):
             fleet_text_field("Телефон", State.fleet_driver_phone, lambda value: State.set_fleet_driver_field("phone", value)),
             rx.vstack(
                 rx.text("Роль", color=muted(), font_size="12px"),
-                rx.select(
-                    ["driver", "loader"],
+                rx.el.select(
+                    rx.el.option("Водитель", value="driver"),
+                    rx.el.option("Экспедитор", value="expeditor"),
+                    rx.el.option("Грузчик", value="loader"),
                     value=State.fleet_driver_role,
                     on_change=lambda value: State.set_fleet_driver_field("role", value),
-                    width="100%",
+                    class_name="personnel-select",
                 ),
                 spacing="1", align="start", width="100%",
             ),

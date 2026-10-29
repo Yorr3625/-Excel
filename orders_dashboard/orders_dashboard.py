@@ -184,6 +184,12 @@ from orders_dashboard.pages.mail import (
     mail_page as _view_mail_page,
     mail_setup_hint as _view_mail_setup_hint,
 )
+from orders_dashboard.pages.assignments import (
+    assignments_page as _view_assignment_page,
+    EmployeeView,
+    VehicleColumn,
+    employee_view,
+)
 
 from pathlib import Path
 from typing import TypedDict
@@ -309,6 +315,7 @@ from modules.mail_watcher import (
     split_invoice_candidates,
     unlink_invoice,
 )
+from modules import attendance
 from modules.pipeline import detect_mode, process_order as run_pipeline
 from modules.fleet import (
     FleetError,
@@ -1122,6 +1129,21 @@ class State(rx.State):
     help_chat_busy: bool = False
     help_chat_status: str = ""
 
+    personnel_date: str = ""
+    assignment_search: str = ""
+    assignment_columns: list[VehicleColumn] = []
+    assignment_unassigned: list[EmployeeView] = []
+    assignment_vehicle_options: list[dict[str, str]] = []
+    assignment_vehicle_id: str = ""
+    assignment_vehicle_name: str = ""
+    assignment_vehicle_plate: str = ""
+    assignment_vehicle_route: str = ""
+    assignment_vehicle_departure: str = "08:00"
+    assignment_vehicle_capacity: str = "4"
+    assignment_delete_id: str = ""
+    assignment_form_open: bool = False
+    assignment_status: str = ""
+
     @rx.var
     def current_group(self) -> str:
         if self.current_page == "Маршруты" and self.routes_editor_open:
@@ -1235,6 +1257,144 @@ class State(rx.State):
                 continue
         return format_decimal(total)
 
+    def load_assignment_page(self):
+        if not self.personnel_date:
+            self.personnel_date = datetime.now().astimezone().date().isoformat()
+        try:
+            data = load_fleet()
+            vehicles = [item for item in data["vehicles"] if item.get("active")]
+            vehicle_map = {item["id"]: item for item in vehicles}
+            assignments = attendance.load_assignments(self.personnel_date)
+            records = attendance.load_records(self.personnel_date)
+            settings = attendance.load_vehicle_settings(self.personnel_date)
+            search = self.assignment_search.strip().casefold()
+            employees = [
+                item for item in data["drivers"] if item.get("active")
+                and records.get(item["id"], {}).get("status") != "absent"
+            ]
+            visible = [item for item in employees if not search or search in item["name"].casefold()]
+            self.assignment_unassigned = [
+                employee_view(item) for item in visible if assignments.get(item["id"]) not in vehicle_map
+            ]
+            self.assignment_columns = []
+            for vehicle in vehicles:
+                assigned = [item for item in employees if assignments.get(item["id"]) == vehicle["id"]]
+                config = settings.get(vehicle["id"], {})
+                capacity = config.get("capacity", 4)
+                self.assignment_columns.append({
+                    "id": vehicle["id"], "name": vehicle["name"], "plate": vehicle["plate"],
+                    "count_label": f"{len(assigned)} / {capacity}",
+                    "employees": [employee_view(item) for item in assigned if not search or search in item["name"].casefold()],
+                    "route": config.get("route", "") or "Маршрут не указан",
+                    "departure": config.get("departure", "08:00"),
+                })
+            self.assignment_vehicle_options = [{"id": "", "label": "Не распределён"}] + [
+                {"id": item["id"], "label": f"{item['name']} · {item['plate']}"} for item in vehicles
+            ]
+        except (attendance.AttendanceError, OSError) as error:
+            self.assignment_status = str(error)
+
+    def set_personnel_date(self, value: str):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            self.assignment_status = "Укажите корректную дату"
+            return
+        self.personnel_date = value
+        self.load_assignment_page()
+
+    def set_assignment_search(self, value: str):
+        self.assignment_search = value
+        self.load_assignment_page()
+
+    def assign_employee(self, employee_id: str, vehicle_id: str):
+        try:
+            data = load_fleet()
+            if not any(item["id"] == employee_id and item.get("active") for item in data["drivers"]):
+                raise attendance.AttendanceError("Сотрудник не найден или неактивен")
+            if vehicle_id and not any(item["id"] == vehicle_id and item.get("active") for item in data["vehicles"]):
+                raise attendance.AttendanceError("Машина не найдена или неактивна")
+            if vehicle_id and attendance.load_records(self.personnel_date).get(employee_id, {}).get("status") == "absent":
+                raise attendance.AttendanceError("Отсутствующего сотрудника нельзя назначить")
+            attendance.assign_employee(employee_id, vehicle_id, self.personnel_date)
+            self.assignment_status = "Назначение сохранено"
+            self.load_assignment_page()
+        except (attendance.AttendanceError, OSError) as error:
+            self.assignment_status = str(error)
+
+    def clear_assignment_vehicle_form(self):
+        self.assignment_vehicle_id = ""
+        self.assignment_vehicle_name = ""
+        self.assignment_vehicle_plate = ""
+        self.assignment_vehicle_route = ""
+        self.assignment_vehicle_departure = "08:00"
+        self.assignment_vehicle_capacity = "4"
+        self.assignment_form_open = True
+        self.assignment_status = ""
+
+    def close_assignment_vehicle_form(self):
+        self.assignment_form_open = False
+
+    def edit_assignment_vehicle(self, vehicle_id: str):
+        try:
+            vehicle = next((item for item in load_fleet()["vehicles"] if item["id"] == vehicle_id), None)
+            if not vehicle:
+                raise attendance.AttendanceError("Машина не найдена")
+            config = attendance.load_vehicle_settings(self.personnel_date).get(vehicle_id, {})
+            self.assignment_vehicle_id = vehicle_id
+            self.assignment_vehicle_name = vehicle["name"]
+            self.assignment_vehicle_plate = vehicle["plate"]
+            self.assignment_vehicle_route = config.get("route", "")
+            self.assignment_vehicle_departure = config.get("departure", "08:00")
+            self.assignment_vehicle_capacity = str(config.get("capacity", 4))
+            self.assignment_form_open = True
+        except (attendance.AttendanceError, OSError) as error:
+            self.assignment_status = str(error)
+
+    def save_assignment_vehicle(self, form: dict):
+        try:
+            capacity = int(form.get("capacity", "4"))
+            departure = form.get("departure", "08:00")
+            datetime.strptime(departure, "%H:%M")
+            if capacity < 1:
+                raise ValueError
+        except (ValueError, TypeError):
+            self.assignment_status = "Укажите время выезда и количество мест от 1"
+            return
+        try:
+            if self.assignment_vehicle_id:
+                vehicle = next((item for item in load_fleet()["vehicles"] if item["id"] == self.assignment_vehicle_id), None)
+                if not vehicle:
+                    raise FleetError("Машина не найдена")
+                vehicle = update_vehicle(
+                    vehicle["id"], form.get("name", ""), form.get("plate", ""),
+                    vehicle.get("odometer_km", 0), vehicle.get("description", ""),
+                    vehicle.get("notes", ""), vehicle.get("active", True), vehicle.get("tracker_id", ""),
+                )
+            else:
+                vehicle = add_vehicle(form.get("name", ""), form.get("plate", ""))
+            attendance.save_vehicle_settings(vehicle["id"], form.get("route", ""), departure, capacity, self.personnel_date)
+            self.assignment_form_open = False
+            self.assignment_status = "Машина сохранена"
+            self.load_assignment_page()
+        except (FleetError, attendance.AttendanceError, OSError) as error:
+            self.assignment_status = str(error)
+
+    def ask_delete_assignment_vehicle(self, vehicle_id: str):
+        self.assignment_delete_id = vehicle_id
+
+    def cancel_delete_assignment_vehicle(self):
+        self.assignment_delete_id = ""
+
+    def delete_assignment_vehicle(self):
+        try:
+            delete_vehicle(self.assignment_delete_id)
+            self.assignment_delete_id = ""
+            self.assignment_status = "Машина удалена; сотрудники возвращены в свободный список"
+            self.load_assignment_page()
+        except (FleetError, OSError) as error:
+            self.assignment_status = str(error)
+
     def set_page(self, page: str):
         self.mobile_menu_open = False
         if getattr(self, "routes_editor_open", False) and page != "Маршруты" and self.route_editor_baseline != self.route_stores:
@@ -1267,6 +1427,8 @@ class State(rx.State):
                 self.init_tracking()
         elif page == "Водители и транспорт":
             self.load_fleet()
+        elif page == "Распределение по машинам":
+            self.load_assignment_page()
         elif page == "Сданный товар":
             self.load_delivery_report()
         elif page == "Возвраты":
@@ -3613,7 +3775,7 @@ class State(rx.State):
                 **driver,
                 "login": driver.get("login") or driver.get("id", ""),
                 "role": employee_role(driver),
-                "role_label": "Грузчик" if employee_role(driver) == "loader" else "Водитель",
+                "role_label": {"driver": "Водитель", "loader": "Грузчик", "expeditor": "Экспедитор"}[employee_role(driver)],
                 "default_vehicle": vehicles_by_id.get(driver.get("default_vehicle_id", ""), {}).get("plate", "—"),
             }
             for driver in data["drivers"]
@@ -3993,6 +4155,7 @@ class State(rx.State):
 
 
 _dispatch_overview = partial(_view__dispatch_overview, State=State)
+_assignment_page = partial(_view_assignment_page, State=State)
 _dispatch_route_button = partial(_view__dispatch_route_button, State=State)
 _routes_editor = partial(_view__routes_editor, State=State)
 _template_dialogs = partial(_view__template_dialogs, State=State)
@@ -4067,6 +4230,7 @@ def main_content():
         ("Почта", mail_page()),
         ("Маршруты", routes_page()),
         ("Водители и транспорт", fleet_page()),
+        ("Распределение по машинам", _assignment_page()),
         ("Сданный товар", delivery_page()),
         ("Возвраты", returns_page()),
         ("Вес", weight_page()),
