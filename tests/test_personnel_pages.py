@@ -67,4 +67,50 @@ def test_expeditor_reuses_roster_without_driver_access(personnel):
 
 def test_assignment_components_compile():
     dashboard._assignment_page()
+    dashboard._attendance_page()
     dashboard.main_content()
+
+
+def test_attendance_counts_real_marks_not_search_results(personnel):
+    state, vehicle, employee = personnel
+    state.attendance_search = "нет совпадений"
+    state.attendance_message = ""
+    attendance.update_record(employee["id"], "present", "08:25", "Пробки", state.personnel_date)
+    dashboard.State.load_attendance_page.fn(state)
+    assert state.attendance_total == 1
+    assert state.attendance_present == 0
+    assert state.attendance_late == 1
+    assert all(group["rows"] == [] for group in state.attendance_groups)
+    state.attendance_search = ""
+    dashboard.State.load_attendance_page.fn(state)
+    row = state.attendance_groups[1]["rows"][0]
+    assert row["delay"] == "+25 мин"
+    assert row["comment"] == "Пробки"
+
+
+def test_unmarked_and_historical_inactive_employee(personnel):
+    state, vehicle, employee = personnel
+    state.attendance_search = ""
+    state.attendance_message = ""
+    dashboard.State.load_attendance_page.fn(state)
+    assert state.attendance_present == 0
+    assert state.attendance_groups[3]["count"] == 1
+    attendance.update_record(employee["id"], "present", "07:55", value=state.personnel_date, vehicle_name="Архивная машина")
+    fleet.update_driver(employee["id"], employee["name"], "", 5, False, "", "", "")
+    dashboard.State.load_attendance_page.fn(state)
+    assert state.attendance_total == 1
+    assert state.attendance_groups[0]["rows"][0]["vehicle"] == "Архивная машина"
+
+
+def test_mark_absent_preserves_comment_and_frees_assignment(personnel):
+    state, vehicle, employee = personnel
+    state.attendance_message = ""
+    state.load_attendance_page = lambda: None
+    state._save_employee_attendance = dashboard.State._save_employee_attendance.__get__(state)
+    attendance.assign_employee(employee["id"], vehicle["id"], state.personnel_date)
+    attendance.update_record(employee["id"], "present", "07:55", "Больничный", state.personnel_date)
+    dashboard.State.mark_attendance.fn(state, employee["id"], "absent")
+    record = attendance.load_records(state.personnel_date)[employee["id"]]
+    assert record["comment"] == "Больничный"
+    assert record["status"] == "absent"
+    assert attendance.load_assignments(state.personnel_date) == {}

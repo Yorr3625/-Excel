@@ -42,6 +42,7 @@ TABLER_ICON_MAP = {
     "send": "IconSend",
     "warehouse": "IconBuildingWarehouse",
     "search": "IconSearch",
+    "chevron_left": "IconChevronLeft",
     "chevron_right": "IconChevronRight",
     "chevron_down": "IconChevronDown",
     "arrow_right": "IconArrowRight",

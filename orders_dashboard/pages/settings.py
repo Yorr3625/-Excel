@@ -14,6 +14,7 @@ from orders_dashboard.components import (
     page_shell,
     panel_shell,
     panel_title,
+    personnel_field,
     primary_button,
     secondary_button,
     segmented_control,
@@ -292,6 +293,14 @@ def backup_page(*, State):
 def settings_page(*, State):
     return page_shell(
         topbar("Настройки", "Поведение программы при обработке заказов."),
+        panel_shell(
+            panel_title("clock", "Рабочая смена"),
+            rx.el.form(
+                personnel_field("Начало смены", "shift_start", State.shift_start, "time", required=True),
+                rx.el.button("Сохранить начало смены", type="submit", class_name="button button-primary"),
+                on_submit=State.save_shift_start, class_name="personnel-inline",
+            ),
+        ),
         rx.vstack(
             *[
                 settings_toggle_row(

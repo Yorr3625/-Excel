@@ -386,6 +386,31 @@ html[data-theme="dark"] .dashboard-design.app label[for="theme-dark"] { backgrou
 
 .dashboard-design.app.login-app { --control-height: 44px; --control-radius: 8px; position: relative; isolation: isolate; display: flex; flex-direction: column; min-height: 100vh; min-height: 100svh; background: var(--canvas); }
 .dashboard-design .animated-gradient { position: absolute; inset: 0; z-index: -1; background: linear-gradient(45deg, #667eea 0%, #764ba2 50%, #f093fb 100%); background-size: 200% 200%; animation: dashboard-gradient-shift 8s ease alternate infinite; overflow: hidden; }
+.dashboard-design .attendance-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.dashboard-design .attendance-group { padding: 0 16px 8px; border: 1px solid var(--border); border-radius: var(--card-radius); background: var(--surface); }
+.dashboard-design .attendance-group summary { display: flex; align-items: center; gap: 10px; padding: 14px 0; cursor: pointer; font-size: 14px; }
+.dashboard-design .attendance-group summary::before { content: '›'; transform: rotate(0); }
+.dashboard-design .attendance-group[open] summary::before { transform: rotate(90deg); }
+.dashboard-design .attendance-row { display: grid; grid-template-columns: minmax(160px, 1.4fr) minmax(95px, .8fr) minmax(100px, 1fr) 110px 100px minmax(90px, 1fr) 32px; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); font-size: 12px; }
+.dashboard-design .attendance-row > * { min-width: 0; overflow-wrap: anywhere; justify-self: start; }
+.dashboard-design .attendance-table-heading { border: 0; padding-inline: 16px; color: var(--secondary); }
+.dashboard-design .attendance-name strong { font-weight: 500; }
+.dashboard-design .attendance-arrival { display: grid; gap: 4px; }
+.dashboard-design .attendance-delay { color: var(--status-amber-text); }
+.dashboard-design .attendance-comment { color: var(--secondary); }
+@media (max-width: 1199px) {
+  .dashboard-design .attendance-row { grid-template-columns: minmax(160px, 1fr) 110px 110px 32px; }
+  .dashboard-design .attendance-row > :nth-child(3), .dashboard-design .attendance-row > :nth-child(6) { grid-column: 1 / -1; }
+  .dashboard-design .attendance-row > :nth-child(7) { grid-column: 4; grid-row: 1; }
+  .dashboard-design .attendance-table-heading { display: none; }
+}
+@media (max-width: 767px) {
+  .dashboard-design .attendance-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-design .attendance-row { grid-template-columns: minmax(0, 1fr) auto 32px; }
+  .dashboard-design .attendance-row > :nth-child(7) { grid-column: 3; grid-row: 1; }
+  .dashboard-design .attendance-row > :nth-child(4) { grid-column: 1; }
+  .dashboard-design .attendance-row > :nth-child(5) { grid-column: 2; }
+}
 .dashboard-design .personnel-page > * { grid-column: 1 / -1; min-width: 0; }
 .dashboard-design .personnel-toolbar, .dashboard-design .personnel-inline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .dashboard-design .personnel-toolbar { justify-content: space-between; }

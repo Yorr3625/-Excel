@@ -184,6 +184,7 @@ from orders_dashboard.pages.mail import (
     mail_page as _view_mail_page,
     mail_setup_hint as _view_mail_setup_hint,
 )
+from orders_dashboard.pages.attendance import attendance_page as _view_attendance_page, AttendanceGroup, attendance_row_view
 from orders_dashboard.pages.assignments import (
     assignments_page as _view_assignment_page,
     EmployeeView,
@@ -1143,6 +1144,19 @@ class State(rx.State):
     assignment_delete_id: str = ""
     assignment_form_open: bool = False
     assignment_status: str = ""
+    shift_start: str = "08:00"
+    attendance_search: str = ""
+    attendance_total: int = 0
+    attendance_present: int = 0
+    attendance_late: int = 0
+    attendance_absent: int = 0
+    attendance_groups: list[AttendanceGroup] = []
+    attendance_message: str = ""
+    attendance_edit_id: str = ""
+    attendance_edit_name: str = ""
+    attendance_edit_status: str = "present"
+    attendance_edit_time: str = ""
+    attendance_edit_comment: str = ""
 
     @rx.var
     def current_group(self) -> str:
@@ -1301,7 +1315,11 @@ class State(rx.State):
             self.assignment_status = "Укажите корректную дату"
             return
         self.personnel_date = value
-        self.load_assignment_page()
+        self.attendance_edit_id = ""
+        if self.current_page == "Посещаемость":
+            self.load_attendance_page()
+        else:
+            self.load_assignment_page()
 
     def set_assignment_search(self, value: str):
         self.assignment_search = value
@@ -1395,6 +1413,93 @@ class State(rx.State):
         except (FleetError, OSError) as error:
             self.assignment_status = str(error)
 
+    def load_attendance_page(self):
+        if not self.personnel_date:
+            self.personnel_date = datetime.now().astimezone().date().isoformat()
+        try:
+            data = load_fleet()
+            records = attendance.load_records(self.personnel_date)
+            assignments = attendance.load_assignments(self.personnel_date)
+            vehicles = {item["id"]: f"{item['name']} · {item['plate']}" for item in data["vehicles"]}
+            self.shift_start = attendance.load_shift_start()
+            employees = [item for item in data["drivers"] if item.get("active") or item["id"] in records]
+            rows = [attendance_row_view(item, records.get(item["id"], {}), vehicles.get(assignments.get(item["id"], ""), ""), self.shift_start) for item in employees]
+            self.attendance_total = len(rows)
+            self.attendance_present = sum(row["status"] == "present" for row in rows)
+            self.attendance_late = sum(row["status"] == "late" for row in rows)
+            self.attendance_absent = sum(row["status"] == "absent" for row in rows)
+            search = self.attendance_search.strip().casefold()
+            self.attendance_groups = [
+                {"title": title, "count": sum(row["status"] == status for row in rows),
+                 "rows": [row for row in rows if row["status"] == status and (not search or search in row["name"].casefold())]}
+                for status, title in (("present", "Пришли"), ("late", "Опоздали"), ("absent", "Отсутствуют"), ("unmarked", "Не отмечены"))
+            ]
+        except (attendance.AttendanceError, OSError) as error:
+            self.attendance_message = str(error)
+
+    def set_attendance_search(self, value: str):
+        self.attendance_search = value
+        self.load_attendance_page()
+
+    def change_attendance_date(self, days: int):
+        current = datetime.strptime(self.personnel_date, "%Y-%m-%d").date()
+        self.personnel_date = (current + timedelta(days=days)).isoformat()
+        self.attendance_edit_id = ""
+        self.attendance_message = ""
+        self.load_attendance_page()
+
+    def _save_employee_attendance(self, employee_id: str, status: str, arrived_at: str, comment: str):
+        data = load_fleet()
+        if not any(item["id"] == employee_id for item in data["drivers"]):
+            raise attendance.AttendanceError("Сотрудник не найден")
+        vehicle_id = attendance.load_assignments(self.personnel_date).get(employee_id, "")
+        vehicle = next((item for item in data["vehicles"] if item["id"] == vehicle_id), None)
+        vehicle_name = f"{vehicle['name']} · {vehicle['plate']}" if vehicle else None
+        attendance.update_record(employee_id, status, arrived_at, comment, self.personnel_date, vehicle_name)
+
+    def mark_attendance(self, employee_id: str, status: str):
+        try:
+            previous = attendance.load_records(self.personnel_date).get(employee_id, {})
+            arrived_at = datetime.now().astimezone().strftime("%H:%M") if status in {"present", "late"} else ""
+            self._save_employee_attendance(employee_id, status, arrived_at, previous.get("comment", ""))
+            self.attendance_message = "Отметка сохранена"
+            self.load_attendance_page()
+        except (attendance.AttendanceError, OSError) as error:
+            self.attendance_message = str(error)
+
+    def edit_attendance(self, employee_id: str):
+        try:
+            employee = next((item for item in load_fleet()["drivers"] if item["id"] == employee_id), None)
+            if not employee:
+                raise attendance.AttendanceError("Сотрудник не найден")
+            record = attendance.load_records(self.personnel_date).get(employee_id, {})
+            self.attendance_edit_id = employee_id
+            self.attendance_edit_name = employee["name"]
+            self.attendance_edit_status = "present" if record.get("status") == "late" else record.get("status", "present")
+            self.attendance_edit_time = record.get("arrived_at", "") or datetime.now().astimezone().strftime("%H:%M")
+            self.attendance_edit_comment = record.get("comment", "")
+        except (attendance.AttendanceError, OSError) as error:
+            self.attendance_message = str(error)
+
+    def close_attendance_editor(self):
+        self.attendance_edit_id = ""
+
+    def save_attendance_record(self, form: dict):
+        try:
+            self._save_employee_attendance(self.attendance_edit_id, form.get("status", "unmarked"), form.get("arrived_at", ""), form.get("comment", ""))
+            self.attendance_edit_id = ""
+            self.attendance_message = "Отметка сохранена"
+            self.load_attendance_page()
+        except (attendance.AttendanceError, OSError) as error:
+            self.attendance_message = str(error)
+
+    def save_shift_start(self, form: dict):
+        try:
+            self.shift_start = attendance.save_shift_start(form.get("shift_start", ""))
+            self.settings_status = "Начало смены сохранено. Исторические отметки не изменены."
+        except (attendance.AttendanceError, OSError) as error:
+            self.settings_status = str(error)
+
     def set_page(self, page: str):
         self.mobile_menu_open = False
         if getattr(self, "routes_editor_open", False) and page != "Маршруты" and self.route_editor_baseline != self.route_stores:
@@ -1429,6 +1534,8 @@ class State(rx.State):
             self.load_fleet()
         elif page == "Распределение по машинам":
             self.load_assignment_page()
+        elif page == "Посещаемость":
+            self.load_attendance_page()
         elif page == "Сданный товар":
             self.load_delivery_report()
         elif page == "Возвраты":
@@ -2590,6 +2697,10 @@ class State(rx.State):
         data = load_settings()
         self.settings_data = {key: bool(data.get(key, False)) for key in SETTINGS_LABELS}
         self.settings_status = ""
+        try:
+            self.shift_start = attendance.load_shift_start()
+        except attendance.AttendanceError as error:
+            self.settings_status = str(error)
 
     def toggle_setting(self, key: str, value: bool):
         self.settings_data = {**self.settings_data, key: value}
@@ -4156,6 +4267,7 @@ class State(rx.State):
 
 _dispatch_overview = partial(_view__dispatch_overview, State=State)
 _assignment_page = partial(_view_assignment_page, State=State)
+_attendance_page = partial(_view_attendance_page, State=State)
 _dispatch_route_button = partial(_view__dispatch_route_button, State=State)
 _routes_editor = partial(_view__routes_editor, State=State)
 _template_dialogs = partial(_view__template_dialogs, State=State)
@@ -4231,6 +4343,7 @@ def main_content():
         ("Маршруты", routes_page()),
         ("Водители и транспорт", fleet_page()),
         ("Распределение по машинам", _assignment_page()),
+        ("Посещаемость", _attendance_page()),
         ("Сданный товар", delivery_page()),
         ("Возвраты", returns_page()),
         ("Вес", weight_page()),
@@ -4388,6 +4501,8 @@ app.add_page(
     on_load=State.load_dashboard,
     meta=PWA_META,
 )
+app.add_page(dashboard, route="/assignments", title="Распределение по машинам", on_load=[State.load_dashboard, State.set_page("Распределение по машинам")], meta=PWA_META)
+app.add_page(dashboard, route="/attendance", title="Посещаемость", on_load=[State.load_dashboard, State.set_page("Посещаемость")], meta=PWA_META)
 app.add_page(
     login_page,
     route="/login",

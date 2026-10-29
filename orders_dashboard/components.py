@@ -191,6 +191,9 @@ def status_pill(status):
 
     return rx.match(
         status,
+        ("Пришёл", _pill(status, ui.STATUS_GREEN_BG, ui.STATUS_GREEN_TEXT)),
+        ("Опоздал", _pill(status, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
+        ("Отсутствует", _pill(status, ui.STATUS_RED_BG, ui.STATUS_RED_TEXT)),
         ("В работе", _pill(status, ui.STATUS_BLUE_BG, ui.STATUS_BLUE_TEXT)),
         ("В пути", _pill(status, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
         ("Требует внимания", _pill(status, ui.STATUS_AMBER_BG, ui.STATUS_AMBER_TEXT)),
