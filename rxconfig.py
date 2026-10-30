@@ -26,7 +26,7 @@ for _dir in (
 
 os.environ.setdefault(
     "REFLEX_HOT_RELOAD_EXCLUDE_PATHS",
-    ":".join(str(_dir) for _dir in (paths.CONFIG_DIR, paths.DATA_DIR)),
+    os.pathsep.join(str(_dir) for _dir in (paths.CONFIG_DIR, paths.DATA_DIR)),
 )
 
 # По умолчанию Reflex складывает загруженные файлы в uploaded_files/ в
