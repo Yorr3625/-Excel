@@ -1033,7 +1033,7 @@ class State(rx.State):
     route_driver_names: list[str] = ["----", "Азер", "Фарид", "Раван", "----", "----", "----", "----"]
     route_drivers_status: str = ""
 
-    fleet_tab: str = "Водители"
+    fleet_tab: str = "Сотрудники"
     fleet_drivers: list[dict] = []
     fleet_vehicles: list[dict] = []
     fleet_driver_options: list[str] = [""]
@@ -1501,6 +1501,14 @@ class State(rx.State):
             self.settings_status = str(error)
 
     def set_page(self, page: str):
+        internal_fleet_tabs = {
+            "Водители и транспорт": "Сотрудники",
+            "Распределение по машинам": "Распределение",
+            "Посещаемость": "Посещаемость",
+        }
+        if page in internal_fleet_tabs:
+            self.fleet_tab = internal_fleet_tabs[page]
+            page = "Водители и транспорт"
         self.mobile_menu_open = False
         if getattr(self, "routes_editor_open", False) and page != "Маршруты" and self.route_editor_baseline != self.route_stores:
             self.route_editor_pending_action = "page"
@@ -1532,6 +1540,10 @@ class State(rx.State):
                 self.init_tracking()
         elif page == "Водители и транспорт":
             self.load_fleet()
+            if self.fleet_tab == "Распределение":
+                self.load_assignment_page()
+            elif self.fleet_tab == "Посещаемость":
+                self.load_attendance_page()
         elif page == "Распределение по машинам":
             self.load_assignment_page()
         elif page == "Посещаемость":
@@ -3893,8 +3905,14 @@ class State(rx.State):
         ]
 
     def set_fleet_tab(self, value: str):
+        if value not in {"Сотрудники", "Машины", "Распределение", "Посещаемость"}:
+            return
         self.fleet_tab = value
         self.fleet_status = ""
+        if value == "Распределение":
+            self.load_assignment_page()
+        elif value == "Посещаемость":
+            self.load_attendance_page()
 
     def set_fleet_driver_field(self, field: str, value: str):
         if field in {"login", "name", "phone", "rating", "hired_on", "notes", "default_vehicle", "pin", "role"}:

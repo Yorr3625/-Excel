@@ -99,8 +99,6 @@ NAV_GROUPS = [
     {'label': 'Рейсы', 'icon': 'route', 'target': 'Маршруты', 'section': 'Работа'},
     {'label': 'Возвраты', 'icon': 'package', 'target': 'Возвраты', 'section': 'Работа'},
     {'label': 'Накладные', 'icon': 'file_spreadsheet', 'target': 'OCR накладных', 'section': 'Работа'},
-    {'label': 'Посещаемость', 'icon': 'calendar_check', 'target': 'Посещаемость', 'section': 'Справочники'},
-    {'label': 'Распределение по машинам', 'icon': 'truck', 'target': 'Распределение по машинам', 'section': 'Справочники'},
     {'label': 'Шаблоны маршрутов', 'icon': 'list', 'target': 'Шаблоны маршрутов', 'section': 'Справочники'},
     {'label': 'Водители и транспорт', 'icon': 'truck', 'target': 'Водители и транспорт', 'section': 'Справочники'},
     {'label': 'Учёт веса', 'icon': 'scale', 'target': 'Вес', 'section': 'Дополнительно'},

@@ -29,6 +29,8 @@ from orders_dashboard.components import (
 from orders_dashboard.icons import fa_icon
 import reflex as rx
 from orders_dashboard import theme as ui
+from orders_dashboard.pages.assignments import assignments_page
+from orders_dashboard.pages.attendance import attendance_page
 
 
 def version_page(*, State):
@@ -600,22 +602,41 @@ def fleet_page(*, State):
     return page_shell(
         topbar(
             "Водители и транспорт",
-            "Локальный справочник для назначения рейсов. Технические GPS-ключи маршрутов не изменяются.",
+            "Сотрудники, машины, распределение экипажей и посещаемость в одном разделе.",
         ),
         rx.vstack(
-            segmented_control(["Водители", "Транспорт"], State.fleet_tab, State.set_fleet_tab),
-            rx.cond(State.fleet_tab == "Водители", fleet_drivers_tab(State=State), fleet_vehicles_tab(State=State)),
+            segmented_control(
+                ["Сотрудники", "Машины", "Распределение", "Посещаемость"],
+                State.fleet_tab,
+                State.set_fleet_tab,
+            ),
+            rx.match(
+                State.fleet_tab,
+                ("Сотрудники", fleet_drivers_tab(State=State)),
+                ("Машины", fleet_vehicles_tab(State=State)),
+                ("Распределение", assignments_page(State=State)),
+                ("Посещаемость", attendance_page(State=State)),
+                fleet_drivers_tab(State=State),
+            ),
             rx.cond(
-                State.fleet_delete_pending_id != "",
-                rx.hstack(
-                    rx.text("Удалить карточку без возможности восстановления?", color=ui.STATUS_RED_TEXT, font_size="13px"),
-                    rx.button("Удалить", on_click=State.confirm_delete_fleet_item, color_scheme="red", size="2"),
-                    secondary_button("Отмена", on_click=State.cancel_delete_fleet_item),
-                    spacing="3", align="center", wrap="wrap",
+                (State.fleet_tab == "Сотрудники") | (State.fleet_tab == "Машины"),
+                rx.cond(
+                    State.fleet_delete_pending_id != "",
+                    rx.hstack(
+                        rx.text("Удалить карточку без возможности восстановления?", color=ui.STATUS_RED_TEXT, font_size="13px"),
+                        rx.button("Удалить", on_click=State.confirm_delete_fleet_item, color_scheme="red", size="2"),
+                        secondary_button("Отмена", on_click=State.cancel_delete_fleet_item),
+                        spacing="3", align="center", wrap="wrap",
+                    ),
+                    rx.box(),
                 ),
                 rx.box(),
             ),
-            rx.cond(State.fleet_status != "", rx.text(State.fleet_status, color=muted(), font_size="13px"), rx.box()),
+            rx.cond(
+                State.fleet_status != "",
+                rx.text(State.fleet_status, color=muted(), font_size="13px"),
+                rx.box(),
+            ),
             width="100%", spacing="4", align="start",
         ),
     )
