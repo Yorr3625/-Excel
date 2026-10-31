@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl unzip \
+    && apt-get install --yes --no-install-recommends ca-certificates curl unzip tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
